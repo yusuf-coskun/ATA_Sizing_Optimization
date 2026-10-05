@@ -1,0 +1,31 @@
+import numpy as np
+ 
+def generate_fuselage_geometry(D_range, L_range):
+    
+    D_grid, L_grid = np.meshgrid(D_range, L_range)
+    
+    D_array = D_grid.flatten()
+    L_array = L_grid.flatten()
+    
+    
+    valid_mask = L_array 
+    
+    gecerli_D = D_array[valid_mask]
+    gecerli_L = L_array[valid_mask]
+    
+    
+    fuselage_volume_array = np.pi * ((gecerli_D / 2) ** 2) * gecerli_L
+    fuselage_surface_area_array = np.pi * gecerli_D * gecerli_L
+   
+    tail_arm_array = gecerli_L * 0.55
+    
+    return gecerli_D, gecerli_L, fuselage_volume_array, fuselage_surface_area_array, tail_arm_array
+
+
+D_secenekleri = np.linspace(0.1, 0.3, 20)  
+L_secenekleri = np.linspace(1.0, 4, 50)   
+
+# Fonksiyonu çalıştır
+D_arr, L_arr, Volume_arr, Surface_Area_arr, Tail_Arm_arr = generate_fuselage_geometry(D_secenekleri, L_secenekleri)
+
+return gecerli_D, gecerli_L, fuselage_volume_array, fuselage_surface_area_array, tail_arm_array
