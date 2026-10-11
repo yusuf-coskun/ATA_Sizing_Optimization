@@ -1,0 +1,52 @@
+import numpy as np
+from govde_boyutlandirma import generate_fuselage_geometry # Sadece bu import eklendi
+
+class Sabitler:
+    MAX_DIMENSION_M = 4.0  # Uçağın hiçbir boyutu (kanat açıklığı dahil) 4 metreyi geçemez[cite: 19]
+    MAX_MTOM_KG = 10.0     # Maksimum Kalkış Ağırlığı[cite: 18]
+    
+    # Konvansiyonel Kuyruk Hacim Katsayıları
+    V_HT = 0.20  # Yatay Kuyruk Hacim Katsayısı
+    V_VT = 0.05  # Dikey Kuyruk Hacim Katsayısı
+
+def generate_wing_tail_geometry(W_S_range, AR_range, tail_arm_array, weight_kg=Sabitler.MAX_MTOM_KG):
+    """
+    Gövde modülünden gelen 'tail_arm_array' ile belirlenen Kanat Yüklemesi ve 
+    Açıklık Oranı (AR) aralıklarını 3 Boyutlu uzayda çaprazlar.
+    İstenilen Kanat Alanı, Kök Veter ve Kuyruk Alanlarını (S_HT, S_VT) döndürür.
+    """
+    # 1. Uzay Taraması: Gövdeden gelen adaylarla, kanat olasılıklarını çaprazla (3D Meshgrid)
+    W_S_grid, AR_grid, Tail_Arm_grid = np.meshgrid(W_S_range, AR_range, tail_arm_array)
+    
+    W_S_arr = W_S_grid.flatten()
+    AR_arr = AR_grid.flatten()
+    L_tail_arr = Tail_Arm_grid.flatten()
+    
+    # 2. Kanat Boyutlandırması
+    # S = W / (W/S) formülünden Kanat Alanı (m^2)
+    S_arr = weight_kg / W_S_arr
+    
+    # AR = b^2 / S formülünden Kanat Açıklığı (b)
+    b_arr = np.sqrt(AR_arr * S_arr)
+    
+    # Dikdörtgen kanat için: Kök Veter (Root Chord) = S / b = MAC (Ortalama Aerodinamik Veter)
+    c_root_arr = S_arr / b_arr
+    
+    # 3. Kural Filtrelemesi: Kanat açıklığı 4 metreyi geçemez[cite: 19]
+    valid_mask = b_arr <= Sabitler.MAX_DIMENSION_M
+    
+    # Geçersiz (4m'yi aşan) adayları çöpe atıyoruz
+    gecerli_S = S_arr[valid_mask]
+    gecerli_b = b_arr[valid_mask]
+    gecerli_c_root = c_root_arr[valid_mask]
+    gecerli_L_tail = L_tail_arr[valid_mask]
+    
+    # 4. Kuyruk Boyutlandırması (Konvansiyonel Tail Arm Formülleri)[cite: 1]
+    # V_HT = (S_HT * L_tail) / (S * c_MAC) -> S_HT = (V_HT * S * c_MAC) / L_tail
+    S_HT_arr = (Sabitler.V_HT * gecerli_S * gecerli_c_root) / gecerli_L_tail
+    
+    # V_VT = (S_VT * L_tail) / (S * b)     -> S_VT = (V_VT * S * b) / L_tail
+    S_VT_arr = (Sabitler.V_VT * gecerli_S * gecerli_b) / gecerli_L_tail
+    
+    # Sadece Kanat Alanı (S), Kök Veter (c_root), Yatay Kuyruk (S_HT) ve Dikey Kuyruk (S_VT) alanlarını döndür
+    return gecerli_S, gecerli_c_root, S_HT_arr, S_VT_arr
