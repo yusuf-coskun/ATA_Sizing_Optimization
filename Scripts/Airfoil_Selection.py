@@ -40,7 +40,7 @@ def get_airfoil_links():
                         airfoils.add(airfoil_name)
         except requests.RequestException:
             continue
-        time.sleep(0.3)
+        time.sleep(0.1)
     return sorted(list(airfoils))
 
 def download_dat(airfoil_name, folder="airfoils"):
@@ -52,7 +52,7 @@ def download_dat(airfoil_name, folder="airfoils"):
         response = requests.get(dat_url, headers=HEADERS, timeout=10)
         with open(filepath, 'w') as f:
             f.write(response.text)
-        time.sleep(0.5)
+        time.sleep(0.1)
     return filepath
 
 def run_xfoil(dat_filepath, polar_filepath):
