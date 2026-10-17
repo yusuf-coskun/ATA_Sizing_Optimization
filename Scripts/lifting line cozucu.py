@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import csv
 import re
+import sys
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Paket ve fonksiyon importu
+# Script ve proje ana dizinini tanimla (nereden calistirilirsa calistirilsin hata vermez)
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from kanat_boyutlandirma import tum_adaylari_uret
 
 
@@ -32,7 +40,9 @@ def xfoil_veya_csv_oku(dosya_yolu: Path) -> tuple[np.ndarray, np.ndarray]:
                     cls.append(float(row[c_col]))
                 except (ValueError, TypeError):
                     continue
-            return np.array(alphas), np.array(cls)
+            if alphas:
+                sirali = np.argsort(alphas)
+                return np.array(alphas)[sirali], np.array(cls)[sirali]
 
     # XFOIL .txt / .pol veya boslukla ayrilmis format
     for satir in satirlar:
@@ -54,32 +64,48 @@ def xfoil_veya_csv_oku(dosya_yolu: Path) -> tuple[np.ndarray, np.ndarray]:
                 continue
 
     if not alphas:
-        raise ValueError(f"'{dosya_yolu}' icerisinde gecerli alpha-cl verisi bulunamadi.")
+        raise ValueError(f"'{dosya_yolu.name}' icerisinde gecerli alpha-cl verisi bulunamadi.")
 
     sirali = np.argsort(alphas)
     return np.array(alphas)[sirali], np.array(cls)[sirali]
 
 
-def polarlari_yukle(kaynak_yolu: str | Path) -> dict[str, dict[str, np.ndarray]]:
-    """airfoils_polars klasorunu veya CSV dosyasini tarayarak profil polarlarini dondurur."""
-    yol = Path(kaynak_yolu)
-    polarlar: dict[str, dict[str, np.ndarray]] = {}
+def _polar_yolunu_coz(kaynak_yolu: str | Path) -> Path:
+    """Klasor adindaki 'airfoils_polar' / 'airfoils_polars' ve dizin farklarini cozer."""
+    aday_yollar = [
+        Path(kaynak_yolu),
+        PROJECT_ROOT / kaynak_yolu,
+        SCRIPT_DIR / kaynak_yolu,
+        PROJECT_ROOT / "airfoils_polar",
+        PROJECT_ROOT / "airfoils_polars",
+    ]
+    for p in aday_yollar:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        f"Polar klasoru bulunamadi. Aranan dizin: {(PROJECT_ROOT / 'airfoils_polar').resolve()}"
+    )
 
-    if not yol.exists():
-        raise FileNotFoundError(f"Polar kaynagi bulunamadi: {yol.resolve()}")
+
+def polarlari_yukle(kaynak_yolu: str | Path) -> dict[str, dict[str, np.ndarray]]:
+    """Polar klasorunu veya CSV dosyasini tarayarak profil polarlarini dondurur."""
+    yol = _polar_yolunu_coz(kaynak_yolu)
+    polarlar: dict[str, dict[str, np.ndarray]] = {}
 
     if yol.is_dir():
         for dosya in sorted(yol.glob("*")):
             if dosya.is_file() and dosya.suffix.lower() in {".csv", ".txt", ".pol", ".dat"}:
-                a_deg, c_2d = xfoil_veya_csv_oku(dosya)
-                polarlar[dosya.stem] = {"alpha_deg": a_deg, "cl_2d": c_2d}
+                try:
+                    a_deg, c_2d = xfoil_veya_csv_oku(dosya)
+                    polarlar[dosya.stem] = {"alpha_deg": a_deg, "cl_2d": c_2d}
+                except ValueError as e:
+                    print(f"[UYARI] {e} (Atlandi)")
     else:
-        # Tekil dosya durumu
         a_deg, c_2d = xfoil_veya_csv_oku(yol)
         polarlar[yol.stem] = {"alpha_deg": a_deg, "cl_2d": c_2d}
 
     if not polarlar:
-        raise ValueError(f"'{yol}' icinde hicbir polar verisi okunamadi.")
+        raise ValueError(f"'{yol}' icinde hicbir gecerli polar verisi okunamadi.")
 
     return polarlar
 
@@ -113,7 +139,7 @@ def llt_dikdortgen_kanat(
     alpha_deg_dizi: np.ndarray,
     n_terim: int = 25,
 ) -> tuple[np.ndarray, float, float]:
-    """Prandtl Taşıma Çizgisi matrisini cozer. Dondurur: (cl_3d, CL_alpha_rad, e_oswald)."""
+    """Prandtl Tasima Cizgisi matrisini cozer. Dondurur: (cl_3d, CL_alpha_rad, e_oswald)."""
     i_dizi = np.arange(1, n_terim + 1)
     theta = i_dizi * np.pi / (2.0 * n_terim)
     n_harmonik = 2 * i_dizi - 1
@@ -138,9 +164,10 @@ def llt_dikdortgen_kanat(
 def tum_adaylari_analiz_et_ve_ciz(
     kutle_kg: float = 6.0,
     govde_uzunlugu_m: float = 1.5,
-    polar_dizini: str = "airfoils_polars",
+    polar_dizini: str = "airfoils_polar",
     cikti_grafik_klasoru: str = "cl_alpha_grafikleri",
     ozet_csv: str = "adaylar_3b_llt_sonuclari.csv",
+    grafik_ciz: bool = True,
 ):
     # 1. Adaylari uret
     adaylar = tum_adaylari_uret(
@@ -154,16 +181,23 @@ def tum_adaylari_analiz_et_ve_ciz(
     polarlar = polarlari_yukle(polar_dizini)
     profil_bilgileri = {}
     for profil_adi, veri in polarlar.items():
-        a0, a_l0 = lineer_parametreler(veri["alpha_deg"], veri["cl_2d"])
-        profil_bilgileri[profil_adi] = {
-            "alpha_deg": veri["alpha_deg"],
-            "cl_2d": veri["cl_2d"],
-            "a0_rad": a0,
-            "alpha_l0_rad": a_l0,
-        }
+        try:
+            a0, a_l0 = lineer_parametreler(veri["alpha_deg"], veri["cl_2d"])
+            profil_bilgileri[profil_adi] = {
+                "alpha_deg": veri["alpha_deg"],
+                "cl_2d": veri["cl_2d"],
+                "a0_rad": a0,
+                "alpha_l0_rad": a_l0,
+            }
+        except ValueError as e:
+            print(f"[UYARI] {profil_adi} profili atlandi: {e}")
 
-    grafik_yolu = Path(cikti_grafik_klasoru)
-    grafik_yolu.mkdir(parents=True, exist_ok=True)
+    if not profil_bilgileri:
+        raise RuntimeError("Analiz edilecek gecerli profil kalmadi.")
+
+    grafik_yolu = PROJECT_ROOT / cikti_grafik_klasoru
+    if grafik_ciz:
+        grafik_yolu.mkdir(parents=True, exist_ok=True)
 
     ozet_tablo = []
 
@@ -174,7 +208,8 @@ def tum_adaylari_analiz_et_ve_ciz(
         s_w = aday["S_w_m2"]
         c_w = aday["c_root_w_m"]
 
-        fig, ax = plt.subplots(figsize=(8.5, 5.5), dpi=120)
+        if grafik_ciz:
+            fig, ax = plt.subplots(figsize=(8.5, 5.5), dpi=120)
 
         for profil_adi, profil in profil_bilgileri.items():
             alpha_dizi = profil["alpha_deg"]
@@ -203,44 +238,47 @@ def tum_adaylari_analiz_et_ve_ciz(
                 "CL_3D_at_0deg": round(float(cl_a_rad * (0.0 - profil["alpha_l0_rad"])), 4),
             })
 
-            # Grafige ekle (Duz cizgi: 3B LLT, Kesikli: 2B Polar)
-            cizgi = ax.plot(alpha_dizi, cl_3d, lw=1.8, label=f"{profil_adi} 3B ($C_{{L\\alpha}}$={cl_a_deg:.3f}/°)")
-            ax.plot(alpha_dizi, cl_2d, "--", lw=1.2, alpha=0.4, color=cizgi[0].get_color(), label=f"{profil_adi} 2B")
+            if grafik_ciz:
+                cizgi = ax.plot(alpha_dizi, cl_3d, lw=1.5, label=f"{profil_adi} 3B")
+                ax.plot(alpha_dizi, cl_2d, "--", lw=1.0, alpha=0.35, color=cizgi[0].get_color())
 
-        ax.axhline(0, color="gray", lw=0.6, ls=":")
-        ax.axvline(0, color="gray", lw=0.6, ls=":")
-        ax.set_title(
-            f"Aday #{idx:03d} | b={b_w:.2f} m, AR={ar_w}, S={s_w:.3f} m², c={c_w:.3f} m\n"
-            f"Lifting Line Teorisi ile 3B $C_L - \\alpha$ Grafigi",
-            fontsize=10,
-        )
-        ax.set_xlabel("Hücum Açısı, $\\alpha$ (°)")
-        ax.set_ylabel("Taşıma Katsayısı, $C_L$")
-        ax.grid(True, ls="--", alpha=0.5)
-        ax.legend(loc="upper left", fontsize=8)
-        fig.tight_layout()
+        if grafik_ciz:
+            ax.axhline(0, color="gray", lw=0.6, ls=":")
+            ax.axvline(0, color="gray", lw=0.6, ls=":")
+            ax.set_title(
+                f"Aday #{idx:03d} | b={b_w:.2f} m, AR={ar_w}, S={s_w:.3f} m², c={c_w:.3f} m\n"
+                f"Lifting Line Teorisi ile 3B $C_L - \\alpha$ Grafigi",
+                fontsize=10,
+            )
+            ax.set_xlabel("Hücum Açısı, $\\alpha$ (°)")
+            ax.set_ylabel("Taşıma Katsayısı, $C_L$")
+            ax.grid(True, ls="--", alpha=0.5)
+            if len(profil_bilgileri) <= 15:
+                ax.legend(loc="upper left", fontsize=7)
+            fig.tight_layout()
 
-        # Her aday icin grafigi diske yaz ve bellekten dusur
-        dosya_adi = f"aday_{idx:03d}_b{b_w:.2f}_AR{ar_w}.png"
-        fig.savefig(grafik_yolu / dosya_adi)
-        plt.close(fig)
+            dosya_adi = f"aday_{idx:03d}_b{b_w:.2f}_AR{ar_w}.png"
+            fig.savefig(grafik_yolu / dosya_adi)
+            plt.close(fig)
 
         if idx % 25 == 0 or idx == len(adaylar):
-            print(f"[{idx}/{len(adaylar)}] aday islendi ve grafigi kaydedildi.")
+            print(f"[{idx}/{len(adaylar)}] aday islendi.")
 
     # CSV kaydi
+    ozet_csv_yolu = PROJECT_ROOT / ozet_csv
     if ozet_tablo:
-        with Path(ozet_csv).open("w", newline="", encoding="utf-8-sig") as f:
+        with ozet_csv_yolu.open("w", newline="", encoding="utf-8-sig") as f:
             yazici = csv.DictWriter(f, fieldnames=list(ozet_tablo[0].keys()))
             yazici.writeheader()
             yazici.writerows(ozet_tablo)
-        print(f"\nAnaliz tamamlandi. Sayisal sonuclar kaydedildi: {ozet_csv}")
-        print(f"Grafikler kaydedildi: {grafik_yolu.resolve()}")
-
+        print(f"\nAnaliz tamamlandi. Sayisal sonuclar kaydedildi: {ozet_csv_yolu}")
+        if grafik_ciz:
+            print(f"Grafikler kaydedildi: {grafik_yolu}")
 
 if __name__ == "__main__":
     tum_adaylari_analiz_et_ve_ciz(
         kutle_kg=6.0,
         govde_uzunlugu_m=1.5,
-        polar_dizini="airfoils_polars",
+        polar_dizini="airfoils_polar",
+        grafik_ciz=True,
     )
