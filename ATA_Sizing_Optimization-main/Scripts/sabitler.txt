@@ -1,0 +1,4 @@
+rho = 1.175
+k_crud = dilemin kodu entegre edilecek
+g = 9.81
+mu = 0.06

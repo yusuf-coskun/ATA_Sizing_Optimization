@@ -1,0 +1,14 @@
+  
+       XFOIL         Version 6.99
+  
+ Calculated polar for: Cambered plate C=14% T=5% R=0.96                
+  
+ 1 1 Reynolds number fixed          Mach number fixed         
+  
+ xtrf =   1.000 (top)        1.000 (bottom)  
+ Mach =   0.000     Re =     0.300 e 6     Ncrit =   9.000
+  
+   alpha    CL        CD       CDp       CM     Top_Xtr  Bot_Xtr
+  ------ -------- --------- --------- -------- -------- --------
+  -0.500   0.4439   0.06081   0.05711  -0.1549   0.7641   0.0400
+  -1.000   0.3749   0.06584   0.06220  -0.1461   0.7656   0.0386
