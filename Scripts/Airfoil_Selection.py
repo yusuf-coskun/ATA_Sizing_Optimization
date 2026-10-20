@@ -9,11 +9,11 @@ import numpy as np
 
 # --- KULLANICI PARAMETRELERİ ---
 TARGET_ALPHA = 0.0        # İstenilen hücum açısı (derece)
-MIN_CL = 0.2             # Target alpha'da minimum CL değeri
-MAX_CD = 0.04              # Target alpha'da maksimum CD değeri
-MIN_STALL_ANGLE = 12.0    # Minimum stall açısı (derece)
-MIN_MAX_LD = 30          # Minimum istenen Max L/D oranı
-REYNOLDS = 300000         # Analiz yapılacak Reynolds sayısı
+MIN_CL = 0.38             # Target alpha'da minimum CL değeri
+MAX_CD = 0.01              # Target alpha'da maksimum CD değeri
+MIN_STALL_ANGLE = 11    # Minimum stall açısı (derece)
+MIN_MAX_LD = 80          # Minimum istenen Max L/D oranı
+REYNOLDS = 400000         # Analiz yapılacak Reynolds sayısı
 ITERATIONS = 200          # Yakınsama şansını artırmak için 200'e çıkarıldı
 XFOIL_TIMEOUT = 12        # XFOIL'in takılmasını önlemek için zaman aşımı (saniye)
 # -------------------------------
