@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import csv
+import sys
 from collections.abc import Iterable
 from math import sqrt
 from pathlib import Path
+
+_SCRIPT_KLASORU = Path(__file__).resolve().parent
+if str(_SCRIPT_KLASORU) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_KLASORU))
 
 from govde_boyutlandirma import L_total as GOVDE_L_TOTAL
 
 V_HT = 0.20
 V_VT = 0.05
-AIRFOIL_KLASORU = Path(__file__).resolve().parent / "airfoils"
+KUYRUK_AIRFOIL_DOSYA_ADI = "naca0010.dat"
+
+# airfoils klasörü depo ana dizininde (../airfoils) veya script dizininde (./airfoils) olabilir
+AIRFOIL_KLASORU = (
+    _SCRIPT_KLASORU.parent / "airfoils"
+    if (_SCRIPT_KLASORU.parent / "airfoils").exists()
+    else _SCRIPT_KLASORU / "airfoils"
+)
 
 
 def _pozitif(deger: float, isim: str) -> None:
@@ -30,8 +42,8 @@ def airfoilleri_yukle(
     klasor: str | Path = AIRFOIL_KLASORU,
 ) -> tuple[Path, list[Path]]:
     """
-    airfoils klasöründeki NACA0010.dat dosyasını kuyruk için,
-    geri kalan tüm .dat dosyalarını ise kanat adayları için döndürür.
+    airfoils klasöründeki naca0010.dat dosyasını kuyruk için,
+    NACA0010 hariç geri kalan tüm .dat dosyalarını ise kanat adayları için döndürür.
     """
     klasor_yolu = Path(klasor)
     if not klasor_yolu.exists():
@@ -44,16 +56,22 @@ def airfoilleri_yukle(
         )
 
     kuyruk_airfoilleri = [
-        p for p in dat_dosyalari if _norm_airfoil_adi(p) == "NACA0010.dat"
+        p
+        for p in dat_dosyalari
+        if p.name.lower() == KUYRUK_AIRFOIL_DOSYA_ADI.lower()
+        or _norm_airfoil_adi(p) == "NACA0010"
     ]
     if not kuyruk_airfoilleri:
         raise FileNotFoundError(
-            f"{klasor_yolu} altinda NACA0010.dat dosyasi bulunamadi."
+            f"{klasor_yolu} altinda {KUYRUK_AIRFOIL_DOSYA_ADI} dosyasi bulunamadi."
         )
     kuyruk_airfoil = kuyruk_airfoilleri[0]
 
     kanat_airfoilleri = [
-        p for p in dat_dosyalari if _norm_airfoil_adi(p) != "NACA0010.dat"
+        p
+        for p in dat_dosyalari
+        if p.name.lower() != KUYRUK_AIRFOIL_DOSYA_ADI.lower()
+        and _norm_airfoil_adi(p) != "NACA0010"
     ]
     if not kanat_airfoilleri:
         raise ValueError(
@@ -166,7 +184,7 @@ def tum_adaylari_uret(
     ar_ht: float = 4.0,
     ar_vt: float = 1.5,
 ) -> list[dict]:
-    kuyruk_airfoil, kanat_airfoilleri = airfoilleri_yukle(airfoils)
+    kuyruk_airfoil, kanat_airfoilleri = airfoilleri_yukle(airfoil_klasoru)
 
     if isinstance(govde_uzunluklari_m, Iterable):
         govde_listesi = [float(uzunluk) for uzunluk in govde_uzunluklari_m]
