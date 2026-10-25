@@ -57,10 +57,10 @@ def generate_fuselage_geometry(D_range, V_water_range, L_tail_range, V_avionics,
 
 # Girdi Parametreleri
 # Çap seçenekleri: 20, 25 ve 30 cm (metre cinsinden)
-D_secenekleri = np.array([0.14, 0.17, 0.20])  
+D_secenekleri = np.array([0.14])  #, 0.17, 0.20 eklenecek
 
 # Su hacmi seçenekleri (m^3) (Örnek: 5 litreden 20 litreye kadar)
-V_su_secenekleri = np.linspace(0.003, 0.005, 10)  
+V_su_secenekleri = np.linspace(0.003, 0.005, 2)  #2, 10 ile değiştirilecek
 
 # Kuyruk bölgesi uzunluğu seçenekleri (m)
 L_kuyruk_secenekleri = 1  

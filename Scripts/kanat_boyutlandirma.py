@@ -191,8 +191,8 @@ def tum_adaylari_uret(
     else:
         govde_listesi = [float(govde_uzunluklari_m)]
 
-    b_degerleri = [round(2.0 + 0.02 * i, 2) for i in range(61)]
-    ar_degerleri = range(6, 11)
+    b_degerleri = [round(2.0 + 0.02 * i, 2) for i in range(3)] #range 61 olacak
+    ar_degerleri = range(6, 7) #7, 11 olacak
 
     return [
         aday_boyutlandir(
