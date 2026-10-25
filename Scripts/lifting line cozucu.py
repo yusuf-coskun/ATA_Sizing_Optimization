@@ -162,19 +162,13 @@ def llt_dikdortgen_kanat(
 
 
 def tum_adaylari_analiz_et_ve_ciz(
-    kutle_kg: float = 6.0,
-    govde_uzunlugu_m: float = 1.5,
     polar_dizini: str = "airfoils_polar",
     cikti_grafik_klasoru: str = "cl_alpha_grafikleri",
     ozet_csv: str = "adaylar_3b_llt_sonuclari.csv",
     grafik_ciz: bool = True,
 ):
     # 1. Adaylari uret
-    adaylar = tum_adaylari_uret(
-        kutle_kg=kutle_kg,
-        govde_uzunlugu_m=govde_uzunlugu_m,
-        ws_birimi="kg/m2",
-    )
+    adaylar = tum_adaylari_uret()
     print(f"Toplam incelenecek aday sayisi: {len(adaylar)}")
 
     # 2. 2B polarlari yukle ve profil ozelliklerini cikar
@@ -277,8 +271,6 @@ def tum_adaylari_analiz_et_ve_ciz(
 
 if __name__ == "__main__":
     tum_adaylari_analiz_et_ve_ciz(
-        kutle_kg=6.0,
-        govde_uzunlugu_m=1.5,
         polar_dizini="airfoils_polar",
         grafik_ciz=True,
     )
