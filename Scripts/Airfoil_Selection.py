@@ -8,11 +8,11 @@ import pandas as pd
 import numpy as np
 
 # --- KULLANICI PARAMETRELERİ ---
-TARGET_ALPHA = 0.0        # İstenilen hücum açısı (derece)
-MIN_CL = 0.38             # Target alpha'da minimum CL değeri
-MAX_CD = 0.01              # Target alpha'da maksimum CD değeri
-MIN_STALL_ANGLE = 11    # Minimum stall açısı (derece)
-MIN_MAX_LD = 80          # Minimum istenen Max L/D oranı
+TARGET_CL = 0.52          # CD kontrolü yapılacak hedef CL değeri
+MIN_CL_MAX = 1.32         # Minimum istenen CL_max değeri (İhtiyaca göre güncelleyin)
+MAX_CD = 0.0076             # Hedef CL (0.52) veya 0° AoA'daki maksimum CD değeri
+MIN_STALL_ANGLE = 11      # Minimum stall açısı (derece)
+MIN_MAX_LD = 80           # Minimum istenen Max L/D oranı
 REYNOLDS = 400000         # Analiz yapılacak Reynolds sayısı
 ITERATIONS = 200          # Yakınsama şansını artırmak için 200'e çıkarıldı
 XFOIL_TIMEOUT = 12        # XFOIL'in takılmasını önlemek için zaman aşımı (saniye)
@@ -124,9 +124,10 @@ def check_criteria(polar_filepath):
 
         df['L_D'] = df['CL'] / df['CD']
 
-        # Stall Açısı (CL'nin maksimum olduğu andaki Alpha)
+        # Stall Açısı ve CL_max (CL'nin maksimum olduğu nokta)
         max_cl_idx = df['CL'].idxmax()
         stall_angle = df.loc[max_cl_idx, 'Alpha']
+        max_cl = df.loc[max_cl_idx, 'CL']
         
         # Max L/D
         max_ld_idx = df['L_D'].idxmax()
@@ -142,26 +143,45 @@ def check_criteria(polar_filepath):
         if max_ld < MIN_MAX_LD:
             return False, None, f"Max L/D yetersiz ({max_ld:.1f} < {MIN_MAX_LD})"
 
-        # 3. Target Alpha Aralık Kontrolü
-        min_alpha = df['Alpha'].min()
-        max_alpha = df['Alpha'].max()
-        if TARGET_ALPHA < min_alpha or TARGET_ALPHA > max_alpha:
-            return False, None, f"Hedef açı ({TARGET_ALPHA}°) hesaplanan aralıkta değil [{min_alpha}°, {max_alpha}°]"
+        # 3. CL_max Kontrolü
+        if max_cl < MIN_CL_MAX:
+            return False, None, f"CL_max yetersiz ({max_cl:.3f} < {MIN_CL_MAX})"
 
-        cl_at_target = np.interp(TARGET_ALPHA, df['Alpha'], df['CL'])
-        cd_at_target = np.interp(TARGET_ALPHA, df['Alpha'], df['CD'])
+        # 4. Hedef CL (0.52) veya 0° AoA üzerinden CD Hesaplaması (Stall öncesi bölgede)
+        df_pre_stall = df[df['Alpha'] <= stall_angle].sort_values('Alpha')
         
-        # 4. Target CL Kontrolü
-        if cl_at_target < MIN_CL:
-            return False, None, f"Hedef CL yetersiz ({cl_at_target:.3f} < {MIN_CL})"
+        if TARGET_CL > max_cl:
+            return False, None, f"Hedef CL ({TARGET_CL}) maksimum CL'den ({max_cl:.3f}) büyük"
+
+        # 0 derece hücum açısındaki veriyi kontrol et
+        if 0.0 in df_pre_stall['Alpha'].values:
+            cl_at_zero = df_pre_stall.loc[df_pre_stall['Alpha'] == 0.0, 'CL'].iloc[0]
+            cd_at_zero = df_pre_stall.loc[df_pre_stall['Alpha'] == 0.0, 'CD'].iloc[0]
+        else:
+            cl_at_zero = None
+
+        if cl_at_zero is not None and cl_at_zero > TARGET_CL:
+            # 0° AoA'da CL > 0.52 ise 0 derecedeki CD değerini baz al
+            target_alpha = 0.0
+            cd_at_target = cd_at_zero
+        else:
+            # CL = 0.52 olduğu AoA'yı ve o açıdaki CD değerini bul
+            df_cl_sorted = df_pre_stall.sort_values('CL')
+            min_cl_pre_stall = df_cl_sorted['CL'].min()
             
-        # 5. Target CD Kontrolü
+            if TARGET_CL < min_cl_pre_stall:
+                return False, None, f"Hedef CL ({TARGET_CL}) hesaplanan aralıkta değil [{min_cl_pre_stall:.3f}, {max_cl:.3f}] ve 0° AoA yakınsamadı"
+                
+            target_alpha = np.interp(TARGET_CL, df_cl_sorted['CL'], df_cl_sorted['Alpha'])
+            cd_at_target = np.interp(target_alpha, df_pre_stall['Alpha'], df_pre_stall['CD'])
+            
+        # 5. Hedef Noktadaki CD Kontrolü
         if cd_at_target > MAX_CD:
-            return False, None, f"Hedef CD yüksek ({cd_at_target:.4f} > {MAX_CD})"
+            return False, None, f"Hedef noktada CD yüksek ({cd_at_target:.4f} > {MAX_CD}, AoA={target_alpha:.2f}°)"
             
         return True, {
             'Stall_Angle': stall_angle, 
-            'CL': cl_at_target, 
+            'CL': max_cl, 
             'CD': cd_at_target,
             'Max_LD': max_ld,
             'Alpha_Max_LD': alpha_at_max_ld
