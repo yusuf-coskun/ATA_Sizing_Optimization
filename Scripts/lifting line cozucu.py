@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 
 # ============================== AYARLAR ==============================
-REYNOLDS_LISTESI = [200000, 300000, 400000, 500000, 600000, 700000]
+REYNOLDS_LISTESI = [200000, 250000, 300000, 350000, 400000, 450000, 500000, 550000, 600000]
 
 # TEST AYARI: Sadece ilk N airfoil ile çalış (hızlı deneme için).
 # Tüm airfoiller için None yapın.
@@ -48,7 +48,7 @@ TEST_AIRFOIL_SAYISI = None
 
 # KUYRUK (yatay + dikey) için Reynolds listesi. Kuyruk veterleri kanattan
 # kısa olduğu için Re'leri daha düşüktür. Kuyruk airfoili: naca0010.dat
-KUYRUK_REYNOLDS_LISTESI = [100000, 150000, 200000, 300000, 400000, 500000, 600000]
+KUYRUK_REYNOLDS_LISTESI = [100000, 150000, 200000, 250000, 300000]
 
 SEYIR_HIZI_MS = 18.0        # Seyir hızı (m/s) -> adayın gerçek Re'sini bulmak için
 RHO = 1.175                 # Hava yoğunluğu (kg/m^3), takımın sabitler.txt değeri
