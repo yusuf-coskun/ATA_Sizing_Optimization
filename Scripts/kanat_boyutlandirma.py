@@ -113,7 +113,7 @@ def kuyruk_boyutlandir(
     kuyruk_airfoil_dat: str | Path,
     tail_arm_m: float | None = None,
     ar_ht: float = 4.0,
-    ar_vt: float = 1.5,
+    ar_vt: float = 4.0,
 ) -> dict:
     _pozitif(govde_uzunlugu_m, "govde_uzunlugu_m")
     _pozitif(ar_ht, "ar_ht")
@@ -162,7 +162,7 @@ def aday_boyutlandir(
     kuyruk_airfoil_dat: str | Path,
     tail_arm_m: float | None = None,
     ar_ht: float = 4.0,
-    ar_vt: float = 1.5,
+    ar_vt: float = 4.0,
 ) -> dict:
     kanat = kanat_boyutlandir(b_w_m, ar_w, kanat_airfoil_dat=kanat_airfoil_dat)
     kuyruk = kuyruk_boyutlandir(
@@ -182,7 +182,7 @@ def tum_adaylari_uret(
     airfoil_klasoru: str | Path = AIRFOIL_KLASORU,
     tail_arm_m: float | None = None,
     ar_ht: float = 4.0,
-    ar_vt: float = 1.5,
+    ar_vt: float = 4.0,
 ) -> list[dict]:
     kuyruk_airfoil, kanat_airfoilleri = airfoilleri_yukle(airfoil_klasoru)
 
@@ -225,7 +225,7 @@ def csv_kaydet(adaylar: list[dict], dosya_yolu: str | Path) -> None:
 if __name__ == "__main__":
     adaylar = tum_adaylari_uret(
         ar_ht=4.0,
-        ar_vt=1.5,
+        ar_vt=4.0,
     )
     print(f"Toplam aday sayisi: {len(adaylar)}")
     print("Ilk aday:", adaylar[0])
