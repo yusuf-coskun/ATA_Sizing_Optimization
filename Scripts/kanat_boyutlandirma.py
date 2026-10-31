@@ -12,7 +12,7 @@ if str(_SCRIPT_KLASORU) not in sys.path:
 
 from govde_boyutlandirma import L_total as GOVDE_L_TOTAL
 
-V_HT = 0.20
+V_HT = 0.50
 V_VT = 0.05
 KUYRUK_AIRFOIL_DOSYA_ADI = "naca0010.dat"
 
