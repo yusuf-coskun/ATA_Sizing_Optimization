@@ -19,6 +19,8 @@ ARKA_BORU_G_M = 84.38
 ON_INIS_TAKIMI_G = 300.0
 # Tum flap, aileron, elevator ve rudder servolarinin toplam kutlesi.
 SERVOLAR_TOPLAM_G = 261.0
+# Yapistirici ve diger uretim sarflari icin sabit toplam pay.
+URETIM_SARFLARI_G = 50.0
 SPAR_KONUM_XC = (0.25, 0.70)
 BORU_UZUNLUK_ORANI = 0.10
 
@@ -31,6 +33,7 @@ def _pozitif(x: float, ad: str) -> float:
 
 
 def kanat_rib_sayisi(aciklik_m: float) -> int:
+    """Tam kanat acikligindan bir panelin kok ve uc dahil rib sayisini verir."""
     b = _pozitif(aciklik_m, "aciklik_m")
     if not 2.0 <= b <= 3.2:
         raise ValueError("Kanat rib kurali yalnizca 2.0 <= b <= 3.2 m icin tanimli.")
@@ -125,7 +128,7 @@ def _profil_oku_cache(yol: str, mtime_ns: int, boyut: int) -> Profil:
             raise ValueError("DAT konturunun iki yuzeyi ayristirilamadi.")
         d1, d2 = _dal(pts[:k + 1]), _dal(pts[k:])
 
-        xmin = min(d1[0][0], d2[0][0])
+    xmin = min(d1[0][0], d2[0][0])
     xmax = max(d1[-1][0], d2[-1][0])
     chord = xmax - xmin
 
@@ -193,7 +196,7 @@ def _skin_alan(profil, boy, kok, uc, simetrik):
 def yuzey_agirligi(*, aciklik_m: float, kok_veter_m: float,
                    profil_dat: str | Path, tur: str,
                    uc_veter_m: float | None = None, simetrik: bool | None = None) -> dict:
-    """tur: kanat/yatay/dikey/hibrit. Rib sayisi tum yuzey icin toplamdir.
+    """Kanatta 4/5/6 rib panel basinadir. Ciktidaki rib_sayisi fiziksel toplamdir.
 
     Hibritte aciklik, iki panelin toplam GERCEK gelistirilmis acikligidir;
     yatay izdususumu degildir. V kuyruk butunu icin 5 rib kullanilir.
@@ -203,10 +206,19 @@ def yuzey_agirligi(*, aciklik_m: float, kok_veter_m: float,
     ct = cr if uc_veter_m is None else _pozitif(uc_veter_m, "uc_veter_m")
     if tur not in ("kanat", "yatay", "dikey", "hibrit"):
         raise ValueError(f"Bilinmeyen yuzey turu: {tur}")
-    n = kanat_rib_sayisi(b) if tur == "kanat" else {"yatay": 4, "dikey": 5, "hibrit": 5}[tur]
     simetrik = (tur != "dikey") if simetrik is None else simetrik
     p = profil_oku(profil_dat)
-    konum = [-b/2 + i*b/(n-1) if simetrik else i*b/(n-1) for i in range(n)]
+    if tur == "kanat":
+        panel_ribleri = kanat_rib_sayisi(b)
+        yari_aciklik = b / 2
+        sag_panel = [yari_aciklik * i / (panel_ribleri - 1) for i in range(panel_ribleri)]
+        # Merkezde her panelin kendine ait bir kok ribi bulunur.
+        konum = [-y for y in reversed(sag_panel)] + sag_panel
+        if not simetrik:
+            konum = [y + yari_aciklik for y in konum]
+    else:
+        n = {"yatay": 4, "dikey": 5, "hibrit": 5}[tur]
+        konum = [-b/2 + i*b/(n-1) if simetrik else i*b/(n-1) for i in range(n)]
     veter = [cr + (ct-cr)*(abs(y)/(b/2) if simetrik else y/b) for y in konum]
     rib_alan = [p.alan_katsayisi*c*c for c in veter]
     # Iki yari kanat trapezinin toplami veya tek dikey kuyruk trapezi.
@@ -216,7 +228,7 @@ def yuzey_agirligi(*, aciklik_m: float, kok_veter_m: float,
     arka_boru = b*BORU_UZUNLUK_ORANI*ARKA_BORU_G_M
     rib_g, spar_g, skin_g = sum(rib_alan)*ISKELET_GSM, sum(spar_alan)*ISKELET_GSM, skin*SKIN_GSM
     return {
-        "rib_sayisi": n, "rib_konumlari_m": konum, "rib_veterleri_m": veter,
+        "rib_sayisi": len(konum), "rib_konumlari_m": konum, "rib_veterleri_m": veter,
         "rib_alanlari_m2": rib_alan, "rib_alani_m2": sum(rib_alan),
         "spar_xc": list(SPAR_KONUM_XC), "spar_alanlari_m2": spar_alan,
         "spar_alani_m2": sum(spar_alan), "skin_alani_m2": skin,
@@ -251,10 +263,11 @@ def aday_agirligi(aday: dict, *, hibrit_kuyruk: dict | None = None) -> dict:
                 profil_dat=aday["kuyruk_airfoil_dat"], tur=tur)
     kuyruk = sum(v["toplam_g"] for k, v in yuzeyler.items() if k != "kanat")
     # Sabit ekipman kutleleri genel toplama yalnizca bir kez eklenir.
-    toplam = kanat["toplam_g"] + kuyruk + ON_INIS_TAKIMI_G + SERVOLAR_TOPLAM_G
+    toplam = kanat["toplam_g"] + kuyruk + ON_INIS_TAKIMI_G + SERVOLAR_TOPLAM_G + URETIM_SARFLARI_G
     return {"yuzeyler": yuzeyler, "kanat_toplam_g": kanat["toplam_g"],
             "kuyruk_toplam_g": kuyruk, "on_inis_takimi_g": ON_INIS_TAKIMI_G,
             "servolar_toplam_g": SERVOLAR_TOPLAM_G,
+            "uretim_sarflari_g": URETIM_SARFLARI_G,
             "toplam_g": toplam, "toplam_kg": toplam/1000}
 
 
