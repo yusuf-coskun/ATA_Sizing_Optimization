@@ -1,0 +1,71 @@
+{
+  "pervaneler": [
+    {
+      "ad": "14x7",
+      "itki_birimi": "N",
+      "gaz_seviyeleri": [
+        {
+          "gaz_yuzde": 100,
+          "olcumler": [
+            {"hiz_m_s": 0, "itki": 61.63, "akim_a": 53.21},
+            {"hiz_m_s": 5, "itki": 56.597, "akim_a": 53.21},
+            {"hiz_m_s": 10, "itki": 52.744, "akim_a": 53.21},
+            {"hiz_m_s": 15, "itki": 47.973, "akim_a": 53.21},
+            {"hiz_m_s": 20, "itki": 42.037, "akim_a": 53.21}
+          ]
+        },
+        {
+          "gaz_yuzde": 90,
+          "olcumler": [
+            {"hiz_m_s": 0, "itki": 53.288, "akim_a": 39.41},
+            {"hiz_m_s": 5, "itki": 50.746, "akim_a": 39.41},
+            {"hiz_m_s": 10, "itki": 47.345, "akim_a": 39.41},
+            {"hiz_m_s": 15, "itki": 42.742, "akim_a": 39.41}
+          ]
+        },
+        {
+          "gaz_yuzde": 80,
+          "statik_itki": 45.97,
+          "sabit_akim_a": 26.78,
+          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
+        },
+        {
+          "gaz_yuzde": 75,
+          "statik_itki": 40.672,
+          "sabit_akim_a": 22.48,
+          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
+        },
+        {
+          "gaz_yuzde": 70,
+          "statik_itki": 34.688,
+          "sabit_akim_a": 17.04,
+          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
+        },
+        {
+          "gaz_yuzde": 65,
+          "statik_itki": 29.32,
+          "sabit_akim_a": 13.42,
+          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
+        },
+        {
+          "gaz_yuzde": 60,
+          "statik_itki": 25.83,
+          "sabit_akim_a": 11.21,
+          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
+        },
+        {
+          "gaz_yuzde": 55,
+          "statik_itki": 21.415,
+          "sabit_akim_a": 8.76,
+          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
+        },
+        {
+          "gaz_yuzde": 50,
+          "statik_itki": 17.619,
+          "sabit_akim_a": 3.46,
+          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
+        }
+      ]
+    }
+  ]
+}
