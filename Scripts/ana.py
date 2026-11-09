@@ -27,7 +27,7 @@ def main():
         adaylar = tum_adaylari_uret(
             govde_uzunluklari_m=[govde["L_toplam_m"]],
             ar_ht=4.0,
-            ar_vt=2.0,
+            ar_vt=4.0,
         )
 
         for aday in adaylar:
