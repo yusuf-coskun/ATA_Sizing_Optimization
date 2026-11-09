@@ -7,7 +7,7 @@ DAT_FOLDER = "airfoils_flap"
 POLAR_FOLDER = "airfoils_polar_flap"
 XFOIL_EXE = "xfoil"
 
-REYNOLDS = 450000
+REYNOLDS = 500000
 ALPHA_MIN = -5.0
 ALPHA_MAX = 15.0
 ALPHA_STEP = 0.5
