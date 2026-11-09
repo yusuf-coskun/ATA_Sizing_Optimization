@@ -3,11 +3,11 @@ import subprocess
 import time
 
 # ================= AYARLAR =================
-DAT_FOLDER = "airfoils"
-POLAR_FOLDER = "airfoils_polar"
+DAT_FOLDER = "airfoils_flap"
+POLAR_FOLDER = "airfoils_polar_flap"
 XFOIL_EXE = "xfoil"
 
-REYNOLDS = 300000
+REYNOLDS = 200000
 ALPHA_MIN = -5.0
 ALPHA_MAX = 15.0
 ALPHA_STEP = 0.5
