@@ -1,5 +1,4 @@
 import os
-import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -9,6 +8,8 @@ import matplotlib.pyplot as plt
 # ==============================================================================
 V_SEYIR = 20.0                  # Seyir hızı (m/s)
 RHO_HAVA = 1.225                # Hava yoğunluğu (kg/m^3)
+MU_HAVA = 1.789e-5              # Dinamik viskozite (Pa.s); LLT ve CD0 aynı koşulda
+PERVANE_SECIMI = "14x7"         # Farklı pervanelerin verileri karıştırılmaz
 G_YERCEKIMI = 9.81              # Yerçekimi ivmesi (m/s^2)
 
 N_WAYPOINT = 10                 # Mavi waypoint sayısı (WP1 - WP10)
@@ -59,8 +60,8 @@ def find_csv_file(filename):
 
 def load_all_databases():
     itki_path = find_csv_file("itki_tablosu.csv")
-    vsp_path = find_csv_file("openvsp_llt_polar_detay.csv")
-    llt_path = find_csv_file("llt_coklu_re_tum_sonuclar.csv")
+    vsp_path = find_csv_file("openvsp_llt_flapsiz_polar_detay.csv")
+    llt_path = find_csv_file("llt_flapsiz_tum_sonuclar.csv")
     kutle_path = find_csv_file("kanat_kuyruk_govde_kutleli.csv")
 
     itki_df = pd.read_csv(itki_path, sep=";")
@@ -105,28 +106,49 @@ def add_lookup_record(table, key, value):
     table.setdefault(key, []).append(value)
 
 
-def match_geometry(table, key, context, wet_area=None):
+# Drag CSV'si boyutları 5 ondalıkla yazar. Kuyruk ve gövdeyi birlikte
+# doğrula; yalnız kanadı aynı olan başka bir uçağın CD0 değerlerini alma.
+VSP_GEOMETRY_COLUMNS = {
+    "S_HT_m2": "S_HT_m2", "b_HT_m": "b_HT_m",
+    "c_HT_m": "c_root_HT_m", "S_VT_m2": "S_VT_m2",
+    "h_VT_m": "h_VT_m", "c_VT_m": "c_root_VT_m",
+    "tail_arm_m": "tail_arm_m", "L_govde_m": "govde_L_toplam_m",
+    "D_govde_m": "govde_D_m",
+}
+
+
+def match_geometry(table, key, context, wet_area=None, candidate=None):
     # Yalnızca çok küçük dosya yazım hassasiyeti farklarına izin ver.
     matches = [k for k in table if k[0] == key[0]
                and np.allclose(k[1:], key[1:], rtol=1e-9, atol=1e-6)]
     if len(matches) != 1:
         raise ValueError(f"{context}: {key} için {len(matches)} eşleşme bulundu; tam bir eşleşme gerekli.")
     records = table[matches[0]]
+    if candidate is not None:
+        target = np.asarray([candidate[c] for c in VSP_GEOMETRY_COLUMNS.values()], dtype=float)
+        if not np.isfinite(target).all() or (target <= 0).any():
+            raise ValueError(f"{context}: kuyruk/gövde boyutları sonlu ve pozitif olmalı.")
+        records = [r for r in records
+                   if np.allclose([r[c] for c in VSP_GEOMETRY_COLUMNS], target,
+                                  rtol=1e-9, atol=5.1e-6)
+                   and r["kuyruk_airfoil"] == str(candidate["kuyruk_airfoil"]).strip()]
+        if not records:
+            raise ValueError(f"{context}: aynı kuyruk/gövde geometrisi bulunamadı. "
+                             "Aday ve drag CSV dosyalarını aynı ayarlarla yeniden üretin.")
     if wet_area is not None:
         if not np.isfinite(wet_area) or wet_area <= 0:
             raise ValueError(f"{context}: gövde ıslak alanı sonlu ve pozitif olmalı.")
         areas = np.asarray([record["S_wet_govde_base"] for record in records])
         if not np.isfinite(areas).all() or (areas <= 0).any():
             raise ValueError(f"{context}: referans gövde ıslak alanları pozitif olmalı.")
-        # Varsa aynı alanlı referansı seç. Yoksa en yakın alanlı referansı
-        # mevcut CD0_govde * (aday alanı / referans alanı) hesabında kullan.
-        reference_area = min(areas, key=lambda area: (abs(area - wet_area), area))
         records = [record for record in records
-                   if record["S_wet_govde_base"] == reference_area]
+                   if np.isclose(record["S_wet_govde_base"], wet_area, rtol=1e-9, atol=5.1e-6)]
+        if not records:
+            raise ValueError(f"{context}: aynı gövde ıslak alanı bulunamadı; drag CSV'sini yeniden üretin.")
     reference = records[0]
     # Aynı kanadın ortak LLT verisi tekrar edebilir; kimlik farkı hata değildir.
     # Aynı referansın gerçekten çelişkili aerodinamik verisini gizleme.
-    fields = [field for field in reference if field != "kanat_aday_no"]
+    fields = [field for field in reference if field not in ("kanat_aday_no", "kuyruk_airfoil")]
     for record in records[1:]:
         if not np.allclose([reference[field] for field in fields],
                            [record[field] for field in fields], rtol=1e-9, atol=1e-12):
@@ -135,13 +157,12 @@ def match_geometry(table, key, context, wet_area=None):
 
 
 def build_lookup_tables(itki_df, vsp_df, llt_df):
+    from drag_hesabi import hesapla_openvsp_cd0
+    from lifting_line_cozucu import LINEER_ALPHA_MIN, LINEER_ALPHA_MAX
     if llt_df.empty or vsp_df.empty:
         raise ValueError("LLT ve OpenVSP tabloları boş olamaz.")
     if llt_df["aday_no"].isna().any() or vsp_df["aday_no"].isna().any():
         raise ValueError("LLT/OpenVSP aday_no sütununda eksik kimlik var.")
-    if "Re_aday_hiz_m_s" not in llt_df.columns:
-        warnings.warn("LLT Re_aday_hiz_m_s sütunu yok: mevcut 18 m/s referans varsayımı kullanılıyor.",
-                      RuntimeWarning)
 
     # --- A. LLT Çoklu Reynolds Enterpolasyonu (V = 20 m/s için) ---
     llt_lookup = {}
@@ -150,14 +171,12 @@ def build_lookup_tables(itki_df, vsp_df, llt_df):
         key = geometry_key(unique_value(grp, "profil", context, numeric=False),
                            unique_value(grp, "AR_w", context),
                            unique_value(grp, "b_w_m", context))
-        re_reference = unique_value(grp, "Re_aday", context)
-        reference_speed = (unique_value(grp, "Re_aday_hiz_m_s", context)
-                           if "Re_aday_hiz_m_s" in grp.columns else 18.0)
-        if re_reference <= 0 or reference_speed <= 0:
-            raise ValueError(f"{context}: Reynolds ve referans hız pozitif olmalı.")
-        re_20 = re_reference * (V_SEYIR / reference_speed)
+        chord = unique_value(grp, "c_w_m", context)
+        if min(chord, V_SEYIR, RHO_HAVA, MU_HAVA) <= 0:
+            raise ValueError(f"{context}: veter ve akış koşulları pozitif olmalı.")
+        re_20 = RHO_HAVA * V_SEYIR * chord / MU_HAVA
         polar_columns = ["CL_alpha_3d_per_deg", "alpha_L0_deg", "e_oswald",
-                         "CL_max_3d_tahmini", "CDp_seyir"]
+                         "CL_max_3d_tahmini"]
         if not np.isfinite(grp[["Re_polar"] + polar_columns].to_numpy(dtype=float)).all():
             raise ValueError(f"{context}: polar tablosunda eksik/sonlu olmayan değer var.")
         if (grp["Re_polar"] <= 0).any():
@@ -172,8 +191,10 @@ def build_lookup_tables(itki_df, vsp_df, llt_df):
             raise ValueError(f"{context}: hedef Re={re_20:.1f}, veri aralığı "
                              f"[{re_polars[0]:.1f}, {re_polars[-1]:.1f}] dışında. "
                              "Bu Reynolds aralığı için polar verisi ekleyin.")
-        values = [float(np.interp(re_20, re_polars, polars[:, j + 1])) for j in range(5)]
-        cl_alpha, alpha_l0, e_oswald, cl_max_3d, cdp_llt = values
+        values = [float(np.interp(re_20, re_polars, polars[:, j + 1])) for j in range(len(polar_columns))]
+        cl_alpha, alpha_l0, e_oswald, cl_max_3d = values
+        if min(cl_alpha, e_oswald, cl_max_3d) <= 0:
+            raise ValueError(f"{context}: taşıma eğimi, e ve CL_max pozitif olmalı.")
         add_lookup_record(llt_lookup, key, {
             "kanat_aday_no": int(aday_no),
             "Re_20": re_20,
@@ -181,7 +202,8 @@ def build_lookup_tables(itki_df, vsp_df, llt_df):
             "alpha_L0_deg": alpha_l0,
             "e_oswald": e_oswald,
             "CL_max_3d": cl_max_3d,
-            "CDp_seyir_llt": cdp_llt,
+            "alpha_min_deg": float(LINEER_ALPHA_MIN),
+            "alpha_max_deg": float(LINEER_ALPHA_MAX),
         })
 
     # --- B. OpenVSP CD0 Tablosu: tüm kimlikleri tara, çelişkili satırları reddet ---
@@ -193,30 +215,51 @@ def build_lookup_tables(itki_df, vsp_df, llt_df):
         key = geometry_key(unique_value(sub, "kanat_airfoil", context, numeric=False),
                            unique_value(sub, "AR_w", context),
                            unique_value(sub, "b_w_m", context))
+        # Mevcut drag fonksiyonunu yeniden kullan; 18 m/s katsayılarını
+        # doğrudan 20 m/s'ye taşıma. Geometri ve t/c CSV'den korunur.
+        get = lambda c: unique_value(sub, c, context)
+        cd0 = hesapla_openvsp_cd0(
+            S_w=get("S_w_m2"), Re_w=RHO_HAVA * V_SEYIR * get("c_w_m") / MU_HAVA,
+            t_c_w=get("t_c_w"), S_HT=get("S_HT_m2"),
+            Re_HT=RHO_HAVA * V_SEYIR * get("c_HT_m") / MU_HAVA,
+            t_c_HT=get("t_c_HT"), S_VT=get("S_VT_m2"),
+            Re_VT=RHO_HAVA * V_SEYIR * get("c_VT_m") / MU_HAVA,
+            t_c_VT=get("t_c_VT"), L_govde=get("L_govde_m"),
+            D_govde=get("D_govde_m"), S_wet_govde=get("S_wet_govde_m2"),
+            V_seyir=V_SEYIR, rho=RHO_HAVA, mu=MU_HAVA)
         add_lookup_record(vsp_lookup, key, {
-            "CD0_w": unique_value(sub, "CD0_w", context),
-            "CD0_HT": unique_value(sub, "CD0_HT", context),
-            "CD0_VT": unique_value(sub, "CD0_VT", context),
-            "CD0_govde_base": unique_value(sub, "CD0_govde", context),
-            "CD_0_base": unique_value(sub, "CD_0", context),
+            **{c: unique_value(sub, c, context) for c in VSP_GEOMETRY_COLUMNS},
+            "kuyruk_airfoil": unique_value(sub, "kuyruk_airfoil", context, numeric=False),
+            "CD0_w": cd0["CD0_w"],
+            "CD0_HT": cd0["CD0_HT"],
+            "CD0_VT": cd0["CD0_VT"],
+            "CD0_govde_base": cd0["CD0_govde"],
+            "CD_0_base": cd0["CD_0"],
             "S_wet_govde_base": unique_value(sub, "S_wet_govde_m2", context),
         })
 
     # --- C. İtki Tablosu (V = 20 m/s Hız Dilimi + Kısık Gaz Orijin Uzatması) ---
-    itki_20 = itki_df[np.isclose(itki_df["hiz_m_s"], V_SEYIR)].sort_values("itki_n")
+    itki_20 = itki_df[(itki_df["pervane"].astype(str).str.strip() == PERVANE_SECIMI)
+                      & np.isclose(itki_df["hiz_m_s"], V_SEYIR)].sort_values("itki_n")
     if itki_20.empty:
-        raise ValueError(f"itki_tablosu.csv içinde hiz_m_s == {V_SEYIR} verisi bulunamadı!")
+        raise ValueError(f"İtki tablosunda {PERVANE_SECIMI}, {V_SEYIR} m/s verisi bulunamadı!")
+    numeric = itki_20[["itki_n", "gaz_yuzde", "akim_a"]].to_numpy(dtype=float)
+    if not np.isfinite(numeric).all() or (numeric[:, 0] <= 0).any() or (numeric[:, 2] < 0).any():
+        raise ValueError("İtki pozitif, güç negatif olmayan ve tüm tablo değerleri sonlu olmalı.")
+    if itki_20["itki_n"].duplicated().any():
+        raise ValueError("Aynı itki için birden fazla kayıt var; güç enterpolasyonu belirsiz.")
 
-    # %50 gazın (12.02 N) altındaki kısık gaz seyir bölgesi için (0 N, %0 Gaz, 0 A) orijin bağlantısı
+    # Geçici kullanıcı kabulü: CSV'deki akim_a sütunu elektriksel güç (W).
+    # Kısık gaz için mevcut (0 N, %0 gaz, 0 W) orijin bağlantısı korunur.
     itki_vals = np.insert(itki_20["itki_n"].values, 0, 0.0)
     gaz_vals = np.insert(itki_20["gaz_yuzde"].values, 0, 0.0)
-    akim_vals = np.insert(itki_20["akim_a"].values, 0, 0.0)
+    power_vals = np.insert(itki_20["akim_a"].values, 0, 0.0)
 
     thrust_table_info = {
         "pervane": str(itki_20["pervane"].iloc[0]),
         "itki_n": itki_vals,
         "gaz_yuzde": gaz_vals,
-        "akim_a": akim_vals,
+        "power_w": power_vals,
         "max_itki_n": float(itki_20["itki_n"].max()),
         "min_tablo_itki_n": float(itki_20["itki_n"].min()),
     }
@@ -450,21 +493,36 @@ def compute_waypoint_route_geometry(V_cruise, bank_angle_deg):
 def compute_electrical_power_and_current(T_req_N, thrust_info):
     """
     Gerekli itki (T_req_N) için:
-    1. itki_tablosu.csv'den gaz yüzdesi (%) ve akım (Amper) enterpolasyonu yapar.
-    2. Batarya iç direnci düşümüyle anlık batarya gerilimini hesaplar: V_bat = V_oc - I * R_ic
-    3. Elektriksel gücü hesaplar: P_el (Watt) = V_bat * I
+    Geçici kabul: CSV akim_a sütunu doğrudan elektriksel güç (W) içerir.
+    Güç tekrar gerilimle çarpılmaz. mAh hesabındaki akım, mevcut batarya
+    modelinin P = (V_oc - I*R)*I denkleminin düşük akımlı kökünden bulunur.
     """
+    if not np.isfinite(T_req_N) or T_req_N < 0:
+        raise ValueError("Gerekli itki sonlu ve negatif olmayan bir değer olmalı.")
+    if T_req_N > thrust_info["max_itki_n"]:
+        return (np.nan,) * 4  # Görev sürdürülemez; son tablo gücüne kırpma.
     throttle_pct = float(np.interp(T_req_N, thrust_info["itki_n"], thrust_info["gaz_yuzde"]))
-    current_a = float(np.interp(T_req_N, thrust_info["itki_n"], thrust_info["akim_a"]))
+    power_elec_w = float(np.interp(T_req_N, thrust_info["itki_n"], thrust_info["power_w"]))
+    if not np.isfinite(power_elec_w) or power_elec_w < 0:
+        raise ValueError("Elektriksel güç sonlu ve negatif olmayan bir değer olmalı.")
+    if V_BAT_ACIK_DEVRE <= 0 or R_BAT_IC_DIRENC_OHM < 0:
+        raise ValueError("Batarya gerilimi pozitif, iç direnç negatif olmayan bir değer olmalı.")
+    discriminant = V_BAT_ACIK_DEVRE ** 2 - 4.0 * R_BAT_IC_DIRENC_OHM * power_elec_w
+    if discriminant < 0:
+        raise ValueError("Güç, mevcut batarya gerilim/iç direnç modeliyle sağlanamıyor.")
+    current_a = 2.0 * power_elec_w / (V_BAT_ACIK_DEVRE + np.sqrt(discriminant))
 
     # Yük altında batarya uç gerilimi (Volt) ve Elektriksel Güç (Watt)
     v_bat_loaded = V_BAT_ACIK_DEVRE - (current_a * R_BAT_IC_DIRENC_OHM)
-    power_elec_w = v_bat_loaded * current_a
 
     return throttle_pct, current_a, v_bat_loaded, power_elec_w
 
 
-def evaluate_cruise_phase(mass_kg, S_w, AR_w, CD_0, e_oswald, CL_alpha_deg, alpha_L0_deg, CL_max_3d, route_info, thrust_info):
+def evaluate_cruise_phase(mass_kg, S_w, AR_w, CD_0, e_oswald, CL_alpha_deg, alpha_L0_deg, CL_max_3d, route_info, thrust_info,
+                          alpha_min_deg=-4.0, alpha_max_deg=6.0):
+    positive = [mass_kg, S_w, AR_w, e_oswald, CL_alpha_deg, CL_max_3d]
+    if not np.isfinite(positive).all() or min(positive) <= 0 or not np.isfinite(CD_0) or CD_0 < 0:
+        raise ValueError("Kütle/alan/aerodinamik girdiler geçersiz.")
     q_dyn = 0.5 * RHO_HAVA * (V_SEYIR ** 2)
     W_newton = mass_kg * G_YERCEKIMI
 
@@ -490,6 +548,10 @@ def evaluate_cruise_phase(mass_kg, S_w, AR_w, CD_0, e_oswald, CL_alpha_deg, alph
     # Fizibilite kontrolleri
     stall_ok = CL_turn <= (STALL_EMNIYET_ORANI * CL_max_3d)
     thrust_ok = (T_req_straight <= thrust_info["max_itki_n"]) and (T_req_turn <= thrust_info["max_itki_n"])
+    polar_ok = (alpha_min_deg <= alpha_straight_deg <= alpha_max_deg
+                and alpha_min_deg <= alpha_turn_deg <= alpha_max_deg)
+    energy_ok = bool(stall_ok and thrust_ok and polar_ok
+                     and np.isfinite([pow_s, pow_t, cur_s, cur_t]).all())
 
     # 1 Turda Tüketilen Kapasite (mAh) = I(A) * t(s) * (1000 / 3600)
     t_s = route_info["t_straight_lap_s"]
@@ -499,6 +561,8 @@ def evaluate_cruise_phase(mass_kg, S_w, AR_w, CD_0, e_oswald, CL_alpha_deg, alph
     # 1 Turda Harcanan Elektriksel Enerji (Joule ve Wh) = P_el(W) * t(s)
     joule_per_lap = (pow_s * t_s) + (pow_t * t_t)
     wh_per_lap = joule_per_lap / 3600.0
+    if not energy_ok:
+        mah_per_lap = joule_per_lap = wh_per_lap = np.nan
 
     return {
         "CL_straight": CL_straight,
@@ -523,12 +587,30 @@ def evaluate_cruise_phase(mass_kg, S_w, AR_w, CD_0, e_oswald, CL_alpha_deg, alph
         "joule_per_lap": joule_per_lap,
         "stall_ok": stall_ok,
         "thrust_ok": thrust_ok,
+        "polar_ok": polar_ok,
+        "energy_ok": energy_ok,
+        "low_throttle_assumption": min(T_req_straight, T_req_turn) < thrust_info["min_tablo_itki_n"],
     }
 
 
 # ==============================================================================
 # 5. TÜM ADAYLARIN TARANMASI VE BAĞIL ENERJİ PUANLANDIRMA SİMÜLASYONU
 # ==============================================================================
+def score_feasible_candidates(res_df):
+    """Yalnız geçerli seyir adaylarını puanla; geçersiz puanları boş bırak."""
+    res_df["puan_enerji_60"] = np.nan
+    res_df["toplam_yarisma_puani"] = np.nan
+    mask = (res_df["feasible"] & np.isfinite(res_df["ham_enerji_endeksi"])
+            & (res_df["ham_enerji_endeksi"] > 0))
+    if mask.any():
+        best_index = res_df.loc[mask, "ham_enerji_endeksi"].max()
+        res_df.loc[mask, "puan_enerji_60"] = (
+            MAX_ENERJI_PUANI * res_df.loc[mask, "ham_enerji_endeksi"] / best_index)
+        res_df.loc[mask, "toplam_yarisma_puani"] = (
+            res_df.loc[mask, "puan_navigasyon"] + res_df.loc[mask, "puan_enerji_60"])
+    return res_df
+
+
 def run_full_cruise_mission_optimization():
     itki_df, vsp_df, llt_df, kutle_df = load_all_databases()
     llt_lookup, vsp_lookup, thrust_info = build_lookup_tables(itki_df, vsp_df, llt_df)
@@ -546,12 +628,10 @@ def run_full_cruise_mission_optimization():
 
         llt_data = match_geometry(llt_lookup, key, f"Kütle satırı {idx + 1}, LLT")
         vsp_data = match_geometry(vsp_lookup, key, f"Kütle satırı {idx + 1}, OpenVSP",
-                                  wet_area=float(row["govde_S_toplam_m2"]))
+                                  wet_area=float(row["govde_S_toplam_m2"]), candidate=row)
 
-        # Gövde ıslak alanına göre CD0_govde ölçeklemesi
-        S_wet_govde_aday = float(row["govde_S_toplam_m2"])
-        govde_ratio = S_wet_govde_aday / max(vsp_data["S_wet_govde_base"], 1e-4)
-        CD0_govde_aday = vsp_data["CD0_govde_base"] * govde_ratio
+        # Geometri birebir doğrulandı; başka gövde/kuyruktan ölçekleme yapılmaz.
+        CD0_govde_aday = vsp_data["CD0_govde_base"]
         CD_0_total = vsp_data["CD0_w"] + vsp_data["CD0_HT"] + vsp_data["CD0_VT"] + CD0_govde_aday
 
         m_total_kg = float(row["total_kutle_kg"])
@@ -564,6 +644,7 @@ def run_full_cruise_mission_optimization():
             e_oswald=llt_data["e_oswald"], CL_alpha_deg=llt_data["CL_alpha_3d_per_deg"],
             alpha_L0_deg=llt_data["alpha_L0_deg"], CL_max_3d=llt_data["CL_max_3d"],
             route_info=route_info, thrust_info=thrust_info,
+            alpha_min_deg=llt_data["alpha_min_deg"], alpha_max_deg=llt_data["alpha_max_deg"],
         )
 
         # 2. BOŞ SEYİR ANALİZİ (1 Tur)
@@ -572,6 +653,7 @@ def run_full_cruise_mission_optimization():
             e_oswald=llt_data["e_oswald"], CL_alpha_deg=llt_data["CL_alpha_3d_per_deg"],
             alpha_L0_deg=llt_data["alpha_L0_deg"], CL_max_3d=llt_data["CL_max_3d"],
             route_info=route_info, thrust_info=thrust_info,
+            alpha_min_deg=llt_data["alpha_min_deg"], alpha_max_deg=llt_data["alpha_max_deg"],
         )
 
         # 3. TOPLAM GÖREV SÜRESİ, KAPASİTE (mAh) VE ENERJİ (Wh / kJ) TÜKETİMİ
@@ -601,7 +683,8 @@ def run_full_cruise_mission_optimization():
 
         # Ham Enerji Endeksi = (Su Kütlesi * Waypoint Sayısı) / Harcanan Enerji (Wh)
         toplam_yuklu_wp = N_TUR_YUKLU * N_WAYPOINT
-        ham_enerji_endeksi = (m_water_kg * toplam_yuklu_wp) / max(seyir_enerji_wh, 1e-6)
+        ham_enerji_endeksi = ((m_water_kg * toplam_yuklu_wp) / seyir_enerji_wh
+                             if np.isfinite(seyir_enerji_wh) and seyir_enerji_wh > 0 else np.nan)
 
         # 5. FİZİBİLİTE KONTROLÜ (%20 İniş Rezervi Dahil!)
         feasible = (
@@ -609,10 +692,23 @@ def run_full_cruise_mission_optimization():
             and empty_res["stall_ok"]
             and loaded_res["thrust_ok"]
             and empty_res["thrust_ok"]
+            and loaded_res["energy_ok"] and empty_res["energy_ok"]
+            and np.isfinite(ham_enerji_endeksi) and ham_enerji_endeksi > 0
             and mission_time["sure_uygun"]
             and (seyir_tuketim_mah <= SEYIR_MAX_KULLANILABILIR_MAH)
             and (iniste_kalan_batarya_yuzde >= INIS_REZERV_ORANI * 100.0)
         )
+        reasons = []
+        for label, phase in (("yuklu", loaded_res), ("bos", empty_res)):
+            for check, reason in (("stall_ok", "stall"), ("thrust_ok", "itki"), ("polar_ok", "lineer_aci_araligi")):
+                if not phase[check]:
+                    reasons.append(f"{label}_{reason}")
+        if not mission_time["sure_uygun"]:
+            reasons.append("sure")
+        if np.isfinite(seyir_tuketim_mah) and seyir_tuketim_mah > SEYIR_MAX_KULLANILABILIR_MAH:
+            reasons.append("batarya")
+        if not np.isfinite(ham_enerji_endeksi) or ham_enerji_endeksi <= 0:
+            reasons.append("gecersiz_enerji_endeksi")
 
         results.append({
             "kombinasyon_no": idx + 1,
@@ -672,6 +768,13 @@ def run_full_cruise_mission_optimization():
             "puan_navigasyon": puan_navigasyon,
             "ham_enerji_endeksi": ham_enerji_endeksi,
             "feasible": feasible,
+            "uygunsuzluk_nedenleri": ";".join(reasons),
+            "trim_dogrulandi": False,
+            "dusuk_gaz_varsayimi": loaded_res["low_throttle_assumption"] or empty_res["low_throttle_assumption"],
+            "seyir_hizi_m_s": V_SEYIR,
+            "rho_kg_m3": RHO_HAVA,
+            "mu_pa_s": MU_HAVA,
+            "pervane": thrust_info["pervane"],
         })
 
     if not results:
@@ -679,14 +782,7 @@ def run_full_cruise_mission_optimization():
     res_df = pd.DataFrame(results)
 
     # --- BAĞIL ENERJİ PUANI HESABI (1. Sıradaki Aday = 60 Puan) ---
-    feasible_mask = res_df["feasible"]
-    if feasible_mask.any():
-        max_enerji_endeksi = float(res_df.loc[feasible_mask, "ham_enerji_endeksi"].max())
-    else:
-        max_enerji_endeksi = float(res_df["ham_enerji_endeksi"].max())
-
-    res_df["puan_enerji_60"] = MAX_ENERJI_PUANI * (res_df["ham_enerji_endeksi"] / max_enerji_endeksi)
-    res_df["toplam_yarisma_puani"] = res_df["puan_navigasyon"] + res_df["puan_enerji_60"]
+    res_df = score_feasible_candidates(res_df)
 
     res_df.to_csv("seyir_optimizasyon_sonuclari.csv", index=False)
     return res_df, route_info, thrust_info
@@ -744,6 +840,10 @@ def preview_route_only():
 
 
 def plot_mission_and_route_summary(res_df, route_info):
+    print("KAPSAM: Ön seyir değerlendirmesi; trim/moment dengesi doğrulanmadı. "
+          "Seyir dışı süre ve kapasite sabit bütçedir. Puanlar seyir enerjisine dayalıdır.")
+    print("MODEL: Rüzgârsız, sabit hızlı/yatışlı dönüş; yatış geçişleri modellenmiyor. "
+          "CSV akim_a sütunu geçici olarak W kabul ediliyor.")
     if res_df.empty:
         print("UYARI: Sonuç tablosu boş; optimum aday seçilemedi.")
         return
@@ -773,7 +873,7 @@ def plot_mission_and_route_summary(res_df, route_info):
     print(f"Kullanılabilir Net / Seyir Sınırı: {KULLANILABILIR_TOPLAM_MAH:.0f} mAh Net ({KALKIS_TIRMANIS_INIS_REZERV_MAH:.0f} mAh Kalkış/İniş Payı -> Max {SEYIR_MAX_KULLANILABILIR_MAH:.0f} mAh Seyir)")
 
     print("\n" + "=" * 80)
-    print("=== 2. EN YÜKSEK PUANLI OPTİMUM UÇAK KONFİGÜRASYONU ===")
+    print("=== 2. ÖN SEYİR MODELİNDE EN YÜKSEK PUANLI ADAY ===")
     print("=" * 80)
     print(f"Kombinasyon / Kanat / Gövde No   : #{int(best['kombinasyon_no'])} (Kanat #{int(best['kanat_aday_no'])}, Gövde #{int(best['govde_aday_no'])})")
     print(f"Kanat Profili & Geometrisi       : {best['kanat_airfoil']} | b = {best['b_w_m']:.2f} m | AR = {best['AR_w']:.1f} | S = {best['S_w_m2']:.4f} m²")
@@ -794,7 +894,7 @@ def plot_mission_and_route_summary(res_df, route_info):
     print(f"1) Yüklü Navigasyon Puanı (2 Tur): {best['puan_yuklu_2tur']:.2f} Puan")
     print(f"2) Boş Navigasyon Puanı (1 Tur)  : {best['puan_bos_1tur']:.2f} Puan")
     print(f"3) Bağıl Enerji Puanı (Max 60)   : {best['puan_enerji_60']:.2f} Puan (Endeks: {best['ham_enerji_endeksi']:.2f} kg*WP/Wh)")
-    print(f"TOPLAM YARIŞMA GÖREV PUANI       : {best['toplam_yarisma_puani']:.2f} Puan")
+    print(f"SEYİR TABANLI MODEL PUANI       : {best['toplam_yarisma_puani']:.2f} Puan")
     print("=" * 80)
 
     # --- GÖRSELLEŞTİRME ---
@@ -823,7 +923,7 @@ def plot_mission_and_route_summary(res_df, route_info):
         label=f"Optimum Aday #{int(best['kombinasyon_no'])} ({best['kanat_airfoil']}, Su={best['su_kutlesi_kg']:.1f}kg, Puan={best['toplam_yarisma_puani']:.1f})",
     )
 
-    ax2.set_title("2. 2871 Aday: Harcanan Seyir Enerjisi (Wh) vs. Toplam Yarışma Puanı (Nav + Enerji)", fontsize=11, fontweight="bold")
+    ax2.set_title(f"2. {len(feasible_df)} Uygun Aday: Seyir Enerjisi (Wh) ve Model Puanı", fontsize=11, fontweight="bold")
     ax2.set_xlabel("3 Tur Harcanan Elektriksel Enerji (Wh)")
     ax2.set_ylabel("Toplam Görev Puanı (Navigasyon + 60p Bağıl Enerji)")
     ax2.legend(loc="lower left", fontsize=9.5)
