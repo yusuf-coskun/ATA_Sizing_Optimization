@@ -1,37 +1,22 @@
 """
-ATA_Sizing_Optimization - OpenVSP Eşdeğeri Parazit Sürükleme (CD0) ve LLT (CDi) Hesaplayıcı
-==========================================================================================
-Bu betik:
-1. 'govde_boyutlandirma.py' içindeki global dizilerden (D_arr, L_total, S_toplam) her gövde
-   konfigürasyonunun çapını, uzunluğunu ve ıslak alanını doğrudan bellekte okur.
-2. Flapsız adayları ('kanat_boyutlandirma.tum_adaylari_uret()') ve flaplı adayları
-   ('kanat_boyutlandirma.tum_flapli_adaylari_uret()') alır.
-3. LLT sonuçlarını doğrudan 'llt_flapsiz_aday_re.csv' ve 'llt_flapli_aday_re.csv'
-   dosyalarından okur (dosyalar yoksa 'lifting line cozucu.py'yi çalıştırarak üretir).
-4. 'CDi_seyir' değerini LLT dosyasından okumaz; doğrudan bu dosyada
-   CDi_seyir = CL_seyir^2 / (pi * AR_w * e_oswald) formülüyle hesaplar.
-5. OpenVSP (Schlichting Compressible Cf + Jenkinson Form Factor + Q) yöntemiyle iniş takımsız
-   CD_0 değerini ve -5° .. +15° aralığındaki CL, CD_i, CD_0, CD, L_D değerlerini hesaplayıp:
-   - openvsp_llt_flapsiz_aday_ozet.csv
-   - openvsp_llt_flapsiz_polar_detay.csv
-   - openvsp_llt_flapli_aday_ozet.csv
-   - openvsp_llt_flapli_polar_detay.csv
-   dosyalarını oluşturur.
+ATA_Sizing_Optimization - Bellek İçi OpenVSP Parazit Sürükleme (CD0) ve LLT (CDi) Motoru
+========================================================================================
+Yeni '<kanat_airfoil>_flap.dat' adlandırma standardına göre güncellenmiştir:
+- Flaplı kanat profil kalınlığı (t/c) doğrudan `airfoils_flap/<kanat_airfoil>_flap.dat`
+  dosyasından okunur.
 """
-
 from __future__ import annotations
 
 import contextlib
 import csv
-import importlib.util
 import io
 import math
+import re
 import sys
 from pathlib import Path
 
 import numpy as np
 
-# 1. PROJE DİZİNLERİ VE MEVCUT MODÜLLERİN BELLEKTEN İMPORT EDİLMESİ
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJE_KLASORU = SCRIPT_DIR.parent if SCRIPT_DIR.name.lower() == "scripts" else SCRIPT_DIR
 if str(SCRIPT_DIR) not in sys.path:
@@ -39,61 +24,98 @@ if str(SCRIPT_DIR) not in sys.path:
 if str(PROJE_KLASORU) not in sys.path:
     sys.path.insert(0, str(PROJE_KLASORU))
 
-with contextlib.redirect_stdout(io.StringIO()):
-    import govde_boyutlandirma as gb
-    import kanat_boyutlandirma as kb
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        import govde_boyutlandirma as gb
+        import kanat_boyutlandirma as kb
+except Exception:
+    gb = None
+    kb = None
 
-AIRFOIL_KLASORU = kb.AIRFOIL_KLASORU
-AIRFOIL_FLAP_KLASORU = kb.AIRFOIL_FLAP_KLASORU
+import lifting_line_cozucu as llt
 
-# lifting line cozucu.py ile birebir aynı akışkan ve açı sabitleri
+AIRFOIL_KLASORU = (
+    PROJE_KLASORU / "airfoils"
+    if (PROJE_KLASORU / "airfoils").exists()
+    else SCRIPT_DIR / "airfoils"
+)
+AIRFOIL_FLAP_KLASORU = (
+    PROJE_KLASORU / "airfoils_flap"
+    if (PROJE_KLASORU / "airfoils_flap").exists()
+    else SCRIPT_DIR / "airfoils_flap"
+)
+
 SEYIR_HIZI_MS = 18.0
+KALKIS_HIZI_MS = 12.0
 RHO = 1.175
 MU = 1.789e-5
 A_SOUND = 340.294
 ALPHA_MIN, ALPHA_MAX, ALPHA_STEP = -5.0, 15.0, 0.5
 
-# OpenVSP Etkileşim Faktörleri (Q) - Temiz Geometri (İniş Takımsız)
 Q_KANAT = 1.00
 Q_HT = 1.20
 Q_VT = 1.20
 Q_GOVDE = 1.00
 
-# Girdi LLT CSV dosyaları
-LLT_FLAPSIZ_ADAY_RE_CSV = PROJE_KLASORU / "llt_flapsiz_aday_re.csv"
-LLT_FLAPLI_ADAY_RE_CSV = PROJE_KLASORU / "llt_flapli_aday_re.csv"
-
-# Çıktı OpenVSP + LLT CSV dosyaları
 CIKTI_FLAPSIZ_OZET_CSV = PROJE_KLASORU / "openvsp_llt_flapsiz_aday_ozet.csv"
 CIKTI_FLAPSIZ_POLAR_CSV = PROJE_KLASORU / "openvsp_llt_flapsiz_polar_detay.csv"
 CIKTI_FLAPLI_OZET_CSV = PROJE_KLASORU / "openvsp_llt_flapli_aday_ozet.csv"
 CIKTI_FLAPLI_POLAR_CSV = PROJE_KLASORU / "openvsp_llt_flapli_polar_detay.csv"
 
+_tc_onbellek: dict[tuple[str, bool], float] = {}
 
-# 2. AIRFOIL .DAT DOSYASINDAN KALINLIK ORANI (t/c) HESAPLAMA
+
+def _temizle_profil_adi(ad: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", ad.lower())
+
+
+def profil_dat_dosyasi_bul(dat_veya_ad: str | Path, flapli_klasor_mu: bool = False) -> Path:
+    """
+    Verilen profil adına (ör. 'clarkysm-il' veya 'clarkysm-il_flap') karşılık gelen
+    .dat dosyasını 'airfoils' veya 'airfoils_flap' klasöründen doğrudan bulur.
+    """
+    kok_ad = Path(str(dat_veya_ad).strip()).stem
+    if flapli_klasor_mu and not kok_ad.lower().endswith("_flap"):
+        kok_ad_flap = f"{kok_ad}_flap"
+    else:
+        kok_ad_flap = kok_ad
+
+    hedef_klasor = AIRFOIL_FLAP_KLASORU if flapli_klasor_mu else AIRFOIL_KLASORU
+
+    # 1. Doğrudan yeni standart adla kontrol et (<kanat_airfoil>_flap.dat veya <kanat_airfoil>.dat)
+    for aday_ad in (kok_ad_flap, kok_ad):
+        dogrudan = hedef_klasor / f"{aday_ad}.dat"
+        if dogrudan.is_file():
+            return dogrudan
+
+    # 2. Tam dosya yolu verilmişse ve mevcutsa
+    yol = Path(str(dat_veya_ad).strip())
+    if yol.is_file():
+        return yol
+
+    # 3. Normalize edilmiş isimle klasörde ara
+    norm_aranan = _temizle_profil_adi(kok_ad_flap)
+    if hedef_klasor.is_dir():
+        for f in hedef_klasor.glob("*.dat"):
+            if _temizle_profil_adi(f.stem) == norm_aranan:
+                return f
+
+    raise FileNotFoundError(f"Airfoil .dat dosyasi bulunamadi: {hedef_klasor / (kok_ad_flap + '.dat')}")
+
+
+# -------------------------------------------------------------------
+# 1) AIRFOIL .DAT DOSYASINDAN ÖNBELLEKLİ (t/c) KALINLIK ORANI OKUMA
+# -------------------------------------------------------------------
 def dat_dosyasindan_t_bolu_c_oku(
     dat_veya_ad: str | Path,
-    varsayilan_klasor: Path = AIRFOIL_KLASORU,
+    flapli_klasor_mu: bool = False,
 ) -> float:
-    """
-    Airfoil .dat dosyasındaki koordinatlardan profilin maksimum kalınlık/veter
-    oranını (t/c) hesaplar.
-    """
-    yol = Path(dat_veya_ad)
-    if not yol.is_file():
-        aday_yollar = [
-            PROJE_KLASORU / yol,
-            varsayilan_klasor / f"{yol.stem}.dat",
-            AIRFOIL_KLASORU / f"{yol.stem}.dat",
-            AIRFOIL_FLAP_KLASORU / f"{yol.stem}.dat",
-        ]
-        for a_yol in aday_yollar:
-            if a_yol.is_file():
-                yol = a_yol
-                break
+    kok_anahtar = Path(str(dat_veya_ad).strip()).stem.lower()
+    anahtar = (kok_anahtar, bool(flapli_klasor_mu))
+    if anahtar in _tc_onbellek:
+        return _tc_onbellek[anahtar]
 
-    if not yol.is_file():
-        raise FileNotFoundError(f"Airfoil .dat dosyası bulunamadı: {yol}")
+    yol = profil_dat_dosyasi_bul(dat_veya_ad, flapli_klasor_mu=flapli_klasor_mu)
 
     noktalar: list[tuple[float, float]] = []
     with yol.open("r", encoding="utf-8", errors="ignore") as f:
@@ -108,6 +130,7 @@ def dat_dosyasindan_t_bolu_c_oku(
                     continue
 
     if not noktalar:
+        _tc_onbellek[anahtar] = 0.12
         return 0.12
 
     xs = np.array([p[0] for p in noktalar])
@@ -121,27 +144,34 @@ def dat_dosyasindan_t_bolu_c_oku(
         x_grid = np.linspace(0.05, 0.95, 91)
         y_ust = np.interp(x_grid, x1[s1], y1[s1])
         y_alt = np.interp(x_grid, x2[s2], y2[s2])
-        return float(np.max(np.abs(y_ust - y_alt)))
+        tc_deger = float(np.max(np.abs(y_ust - y_alt)))
+    else:
+        tc_deger = float(2.0 * np.max(np.abs(ys)))
 
-    return float(2.0 * np.max(np.abs(ys)))
-
-
-# 3. GÖVDE BOYUTLANDIRMA VERİLERİNİ BELLEKTEN EŞLEŞTİRME
-def govde_ozelliklerini_bul(hedef_l_govde: float) -> tuple[float, float, float]:
-    """
-    'govde_boyutlandirma.py' içinde bellekte tutulan global dizilerden
-    (D_arr, L_total, S_toplam) adayın gövde uzunluğuna (govde_uzunlugu_m)
-    karşılık gelen (L_govde, D_govde, S_wet_govde) değerlerini döndürür.
-    """
-    l_dizisi = np.ravel(gb.L_total).astype(float)
-    d_dizisi = np.ravel(gb.D_arr).astype(float)
-    s_dizisi = np.ravel(gb.S_toplam).astype(float)
-
-    idx = int(np.argmin(np.abs(l_dizisi - float(hedef_l_govde))))
-    return float(l_dizisi[idx]), float(d_dizisi[idx]), float(s_dizisi[idx])
+    _tc_onbellek[anahtar] = tc_deger
+    return tc_deger
 
 
-# 4. OPENVSP EŞDEĞERİ (İNİŞ TAKIMSIZ) PARAZİT SÜRÜKLEME (CD_0) HESABI
+def govde_ozelliklerini_bul(aday: dict) -> tuple[float, float, float]:
+    if all(k in aday and aday[k] not in (None, "") for k in ("govde_uzunlugu_m", "govde_D_m", "govde_S_toplam_m2")):
+        return (
+            float(aday["govde_uzunlugu_m"]),
+            float(aday["govde_D_m"]),
+            float(aday["govde_S_toplam_m2"]),
+        )
+    hedef_l = float(aday.get("govde_uzunlugu_m") or (getattr(gb, "L_total", 1.2) if gb else 1.2))
+    if gb is not None and hasattr(gb, "L_total"):
+        l_dizisi = np.ravel(gb.L_total).astype(float)
+        d_dizisi = np.ravel(gb.D_arr).astype(float)
+        s_dizisi = np.ravel(gb.S_toplam).astype(float)
+        idx = int(np.argmin(np.abs(l_dizisi - hedef_l)))
+        return float(l_dizisi[idx]), float(d_dizisi[idx]), float(s_dizisi[idx])
+    return hedef_l, 0.119, 0.3707
+
+
+# -------------------------------------------------------------------
+# 2) OPENVSP EŞDEĞERİ PARAZİT SÜRÜKLEME (CD_0) HESABI
+# -------------------------------------------------------------------
 def hesapla_openvsp_cd0(
     S_w: float,
     Re_w: float,
@@ -155,35 +185,27 @@ def hesapla_openvsp_cd0(
     L_govde: float,
     D_govde: float,
     S_wet_govde: float,
-    V_seyir: float = SEYIR_HIZI_MS,
+    V_ref: float = SEYIR_HIZI_MS,
     rho: float = RHO,
     mu: float = MU,
     a_sound: float = A_SOUND,
     sweep_deg: float = 0.0,
 ) -> dict[str, float]:
-    """
-    OpenVSP Parasite Drag modülü ile aynı denklemleri kullanarak her bileşenin
-    ıslak alanını (S_wet), sürtünme katsayısını (Cf - Schlichting Compressible),
-    şekil faktörünü (FF - Jenkinson) ve parazit sürükleme katsayısını (CD_0) hesaplar.
-    """
-    # 1. Kanat ve Kuyruk Islak Alanları
+    v_safe = max(float(V_ref), 0.5)
     S_wet_w = 2.0 * S_w * (1.0 + 0.2 * t_c_w)
     S_wet_HT = 2.0 * S_HT * (1.0 + 0.2 * t_c_HT)
     S_wet_VT = 2.0 * S_VT * (1.0 + 0.2 * t_c_VT)
 
-    # 2. Gövde Reynolds Sayısı ve Mach Sayısı
-    Re_govde = (rho * V_seyir * L_govde) / mu
-    Mach = V_seyir / a_sound
+    Re_govde = (rho * v_safe * L_govde) / mu
+    Mach = v_safe / a_sound
 
     sikistirilabilirlik = (1.0 + 0.144 * (Mach ** 2)) ** 0.65
 
-    # 3. Türbülanslı Yüzey Sürtünme Katsayısı (OpenVSP: Schlichting Compressible)
-    Cf_w = 0.455 / ((math.log10(Re_w) ** 2.58) * sikistirilabilirlik)
-    Cf_HT = 0.455 / ((math.log10(Re_HT) ** 2.58) * sikistirilabilirlik)
-    Cf_VT = 0.455 / ((math.log10(Re_VT) ** 2.58) * sikistirilabilirlik)
-    Cf_govde = 0.455 / ((math.log10(Re_govde) ** 2.58) * sikistirilabilirlik)
+    Cf_w = 0.455 / ((math.log10(max(Re_w, 10.0)) ** 2.58) * sikistirilabilirlik)
+    Cf_HT = 0.455 / ((math.log10(max(Re_HT, 10.0)) ** 2.58) * sikistirilabilirlik)
+    Cf_VT = 0.455 / ((math.log10(max(Re_VT, 10.0)) ** 2.58) * sikistirilabilirlik)
+    Cf_govde = 0.455 / ((math.log10(max(Re_govde, 10.0)) ** 2.58) * sikistirilabilirlik)
 
-    # 4. Şekil Faktörleri (OpenVSP: Jenkinson Wing, Tail, Fuselage)
     cos2_sweep = math.cos(math.radians(sweep_deg)) ** 2
     FF_w = 1.0 + (3.3 * t_c_w - 0.008 * (t_c_w ** 2) + 27.0 * (t_c_w ** 3)) * cos2_sweep
     FF_HT = 1.0 + (3.52 * t_c_HT) * cos2_sweep
@@ -192,7 +214,6 @@ def hesapla_openvsp_cd0(
     f_govde_narinlik = L_govde / D_govde
     FF_govde = 1.0 + 2.2 * (f_govde_narinlik ** -1.5) - 0.9 * (f_govde_narinlik ** -3.0)
 
-    # 5. Eşdeğer Düz Plaka Alanları (f = Cf * FF * Q * S_wet) ve CD_0 Katkıları
     f_w = Cf_w * FF_w * Q_KANAT * S_wet_w
     f_HT = Cf_HT * FF_HT * Q_HT * S_wet_HT
     f_VT = Cf_VT * FF_VT * Q_VT * S_wet_VT
@@ -206,10 +227,16 @@ def hesapla_openvsp_cd0(
     CD0_toplam = f_toplam / S_w
 
     return {
+        "t_c_w": t_c_w,
+        "t_c_HT": t_c_HT,
+        "t_c_VT": t_c_VT,
         "S_wet_w_m2": S_wet_w,
         "S_wet_HT_m2": S_wet_HT,
         "S_wet_VT_m2": S_wet_VT,
         "S_wet_govde_m2": S_wet_govde,
+        "Re_w": Re_w,
+        "Re_HT": Re_HT,
+        "Re_VT": Re_VT,
         "Re_govde": Re_govde,
         "Cf_w": Cf_w,
         "Cf_HT": Cf_HT,
@@ -228,82 +255,71 @@ def hesapla_openvsp_cd0(
         "CD0_HT": CD0_HT,
         "CD0_VT": CD0_VT,
         "CD0_govde": CD0_govde,
-        "CD_0": CD0_toplam,
+        "CD0_0": CD0_toplam,
+        "CD0_toplam": CD0_toplam,
     }
 
 
-# 5. LLT SONUÇLARINI CSV'DEN OKUMA (CDi_seyir BURADA OKUNMAZ, DRAG HESABINDA HESAPLANIR)
-def _llt_dosyalarini_kontrol_et_veya_uret() -> None:
-    if LLT_FLAPSIZ_ADAY_RE_CSV.is_file() and LLT_FLAPLI_ADAY_RE_CSV.is_file():
-        return
-
-    olasi_llt_betikleri = [
-        SCRIPT_DIR / "lifting line cozucu.py",
-        SCRIPT_DIR / "lifting_line_cozucu.py",
-    ]
-    llt_dosya = next((p for p in olasi_llt_betikleri if p.is_file()), None)
-    if llt_dosya is None:
-        raise FileNotFoundError(
-            f"LLT aday Re dosyalari ({LLT_FLAPSIZ_ADAY_RE_CSV.name}, "
-            f"{LLT_FLAPLI_ADAY_RE_CSV.name}) bulunamadi ve LLT cozucu betigi mevcut degil."
-        )
-
-    spec = importlib.util.spec_from_file_location("llt_cozucu_mod", llt_dosya)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"LLT betigi yuklenemedi: {llt_dosya}")
-    llt_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(llt_mod)
-    llt_mod.main()
-
-
-def llt_aday_re_csv_oku(
-    csv_yolu: Path,
+def aday_cd0_hesapla(
+    aday: dict,
+    hiz_ms: float,
+    rho: float = RHO,
+    mu: float = MU,
     flapli_mi: bool = False,
-) -> dict[tuple[str, float, float], dict[str, float]]:
-    """
-    'llt_flapsiz_aday_re.csv' veya 'llt_flapli_aday_re.csv' dosyasından
-    yalnızca taşıma parametrelerini (CL_alpha_3d_per_deg, alpha_L0_deg, e_oswald, CL_seyir)
-    okur. CDi_seyir LLT dosyasından okunmaz; drag_hesabi.py içinde hesaplanır.
-    """
-    _llt_dosyalarini_kontrol_et_veya_uret()
+    flap_profil_adi: str | None = None,
+    oran_flap: float | None = None,
+) -> dict[str, float]:
+    kanat_profil = Path(str(aday.get("kanat_airfoil") or aday.get("profil"))).stem.strip()
+    kuyruk_profil = Path(str(aday.get("kuyruk_airfoil") or aday.get("ht_airfoil") or "naca0010")).stem.strip()
 
-    llt_harita: dict[tuple[str, float, float], dict[str, float]] = {}
-    with csv_yolu.open("r", encoding="utf-8-sig", errors="ignore") as f:
-        for row in csv.DictReader(f):
-            prof = (row.get("profil") or row.get("kanat_airfoil") or "").strip()
-            b_w = round(float(row["b_w_m"]), 4)
-            ar_w = round(float(row["AR_w"]), 4)
+    t_c_w_flapsiz = dat_dosyasindan_t_bolu_c_oku(kanat_profil, flapli_klasor_mu=False)
+    t_c_kuyruk = dat_dosyasindan_t_bolu_c_oku(kuyruk_profil, flapli_klasor_mu=False)
 
-            if flapli_mi:
-                cl_alpha_3d = float(
-                    row.get("CL_alpha_3d_per_deg")
-                    or row.get("CL_alpha_3d_kanat_per_deg")
-                )
-                e_oswald = float(
-                    row.get("e_oswald") or row.get("e_oswald_kanat")
-                )
-                cl_seyir = float(row["CL_seyir"])
-                if "alpha_L0_deg" in row and row["alpha_L0_deg"] != "":
-                    alpha_l0_deg = float(row["alpha_L0_deg"])
-                else:
-                    alpha_l0_deg = -cl_seyir / cl_alpha_3d if cl_alpha_3d > 0 else 0.0
-            else:
-                cl_alpha_3d = float(row["CL_alpha_3d_per_deg"])
-                alpha_l0_deg = float(row["alpha_L0_deg"])
-                e_oswald = float(row["e_oswald"])
-                cl_seyir = float(row["CL_seyir"])
+    b_w = llt.aday_degeri_al(aday, "b_w_m")
+    s_w = llt.aday_degeri_al(aday, "S_w_m2")
+    c_w = llt.aday_degeri_al(aday, "c_root_w_m", "c_w_m")
 
-            llt_harita[(prof, b_w, ar_w)] = {
-                "CL_alpha_3d_per_deg": cl_alpha_3d,
-                "alpha_L0_deg": alpha_l0_deg,
-                "e_oswald": e_oswald,
-                "CL_seyir": cl_seyir,
-            }
+    if flapli_mi:
+        f_prof = flap_profil_adi or f"{kanat_profil}_flap"
+        t_c_w_flapli = dat_dosyasindan_t_bolu_c_oku(f_prof, flapli_klasor_mu=True)
+        if oran_flap is None:
+            b_flap = llt.aday_degeri_al(aday, "b_flap_m", varsayilan=min(1.0, b_w))
+            oran_flap = b_flap / b_w
+        t_c_w = oran_flap * t_c_w_flapli + (1.0 - oran_flap) * t_c_w_flapsiz
+    else:
+        t_c_w = t_c_w_flapsiz
 
-    return llt_harita
+    s_ht = llt.aday_degeri_al(aday, "S_HT_m2", "S_h_m2")
+    c_ht = llt.aday_degeri_al(aday, "c_root_HT_m", "c_root_h_m", "c_HT_m")
+    s_vt = llt.aday_degeri_al(aday, "S_VT_m2", "S_v_m2")
+    c_vt = llt.aday_degeri_al(aday, "c_root_VT_m", "c_root_v_m", "c_VT_m")
+
+    L_govde, D_govde, S_wet_govde = govde_ozelliklerini_bul(aday)
+
+    v_safe = max(float(hiz_ms), 0.5)
+    re_w = (rho * v_safe * c_w) / mu
+    re_ht = (rho * v_safe * c_ht) / mu
+    re_vt = (rho * v_safe * c_vt) / mu
+
+    return hesapla_openvsp_cd0(
+        S_w=s_w,
+        Re_w=re_w,
+        t_c_w=t_c_w,
+        S_HT=s_ht,
+        Re_HT=re_ht,
+        t_c_HT=t_c_kuyruk,
+        S_VT=s_vt,
+        Re_VT=re_vt,
+        t_c_VT=t_c_kuyruk,
+        L_govde=L_govde,
+        D_govde=D_govde,
+        S_wet_govde=S_wet_govde,
+        V_ref=v_safe,
+        rho=rho,
+        mu=mu,
+    )
 
 
-# 6. CSV YAZMA FONKSİYONU
 def csv_yaz(satirlar: list[dict], yol: Path) -> None:
     if not satirlar:
         return
@@ -315,164 +331,115 @@ def csv_yaz(satirlar: list[dict], yol: Path) -> None:
             y.writerow({k: (round(v, 5) if isinstance(v, float) else v) for k, v in s.items()})
 
 
-# 7. FLAPSIZ VE FLAPLI ADAYLAR İÇİN OPENVSP + LLT SÜRÜKLEME HESABI
 def grubu_hesapla_ve_kaydet(
     adaylar: list[dict],
-    llt_harita: dict[tuple[str, float, float], dict[str, float]],
     cikti_ozet_csv: Path,
     cikti_polar_csv: Path,
     flapli_mi: bool = False,
 ) -> tuple[int, int]:
-    t_c_onbellek: dict[str, float] = {}
-    nu = MU / RHO
-    alfa_dizisi = np.arange(ALPHA_MIN, ALPHA_MAX + 1e-9, ALPHA_STEP)
+    v_ref = KALKIS_HIZI_MS if flapli_mi else SEYIR_HIZI_MS
+    alfa_dizisi = llt.ALFA_DIZISI_DEG
 
     ozet_satirlari: list[dict] = []
     polar_detay_satirlari: list[dict] = []
 
     for no, aday in enumerate(adaylar, start=1):
-        kanat_profil = str(aday["kanat_airfoil"])
-        kuyruk_profil = str(aday["kuyruk_airfoil"])
+        kanat_profil = Path(str(aday.get("kanat_airfoil") or aday.get("profil"))).stem.strip()
+        kuyruk_profil = Path(str(aday.get("kuyruk_airfoil") or aday.get("ht_airfoil") or "naca0010")).stem.strip()
+        flap_profil = f"{kanat_profil}_flap" if flapli_mi else ""
 
-        anahtar = (kanat_profil, round(float(aday["b_w_m"]), 4), round(float(aday["AR_w"]), 4))
-        if anahtar not in llt_harita:
-            continue
-        llt_veri = llt_harita[anahtar]
+        b_w = llt.aday_degeri_al(aday, "b_w_m")
+        AR_w = llt.aday_degeri_al(aday, "AR_w")
+        S_w = llt.aday_degeri_al(aday, "S_w_m2")
+        c_w = llt.aday_degeri_al(aday, "c_root_w_m", "c_w_m")
+        b_flap = llt.aday_degeri_al(aday, "b_flap_m", varsayilan=min(1.0, b_w))
+        oran_flap = b_flap / b_w
 
-        # Kanat ve kuyruk .dat dosyalarından (t/c) değerlerini oku (önbellekli)
-        if kanat_profil not in t_c_onbellek:
-            t_c_onbellek[kanat_profil] = dat_dosyasindan_t_bolu_c_oku(
-                aday["kanat_airfoil_dat"], AIRFOIL_KLASORU
-            )
-        if kuyruk_profil not in t_c_onbellek:
-            t_c_onbellek[kuyruk_profil] = dat_dosyasindan_t_bolu_c_oku(
-                aday["kuyruk_airfoil_dat"], AIRFOIL_KLASORU
-            )
+        S_HT = llt.aday_degeri_al(aday, "S_HT_m2", "S_h_m2")
+        b_HT = llt.aday_degeri_al(aday, "b_HT_m", "b_h_m")
+        c_HT = llt.aday_degeri_al(aday, "c_root_HT_m", "c_root_h_m", "c_HT_m")
 
-        t_c_w_flapsiz = t_c_onbellek[kanat_profil]
-        t_c_kuyruk = t_c_onbellek[kuyruk_profil]
+        S_VT = llt.aday_degeri_al(aday, "S_VT_m2", "S_v_m2")
+        h_VT = llt.aday_degeri_al(aday, "h_VT_m", "b_v_m")
+        c_VT = llt.aday_degeri_al(aday, "c_root_VT_m", "c_root_v_m", "c_VT_m")
+        tail_arm = llt.aday_degeri_al(aday, "tail_arm_m", "l_h_m", varsayilan=0.85)
 
-        if flapli_mi and "flap_airfoil" in aday:
-            flap_profil = str(aday["flap_airfoil"])
-            if flap_profil not in t_c_onbellek:
-                t_c_onbellek[flap_profil] = dat_dosyasindan_t_bolu_c_oku(
-                    aday["flap_airfoil_dat"], AIRFOIL_FLAP_KLASORU
-                )
-            t_c_w_flapli = t_c_onbellek[flap_profil]
-            oran_flap = float(aday.get("flap_aciklik_orani", float(aday["S_flap_m2"]) / float(aday["S_w_m2"])))
-            t_c_w = oran_flap * t_c_w_flapli + (1.0 - oran_flap) * t_c_w_flapsiz
+        L_govde, D_govde, S_wet_govde = govde_ozelliklerini_bul(aday)
+
+        vsp = aday_cd0_hesapla(
+            aday, hiz_ms=v_ref, rho=RHO, mu=MU,
+            flapli_mi=flapli_mi, flap_profil_adi=flap_profil, oran_flap=oran_flap,
+        )
+        Re_w = vsp["Re_w"]
+
+        if flapli_mi:
+            llt_veri = llt.flapli_kanat_coz_re(kanat_profil, flap_profil, AR_w, oran_flap, Re_w)
         else:
-            t_c_w = t_c_w_flapsiz
+            llt_veri = llt.flapsiz_kanat_coz_re(kanat_profil, AR_w, Re_w)
 
-        # Gövde özelliklerini eşleştir
-        L_govde, D_govde, S_wet_govde = govde_ozelliklerini_bul(aday["govde_uzunlugu_m"])
-
-        # Kanat ve kuyruk boyutları ile Reynolds sayıları
-        b_w = float(aday["b_w_m"])
-        AR_w = float(aday["AR_w"])
-        S_w = float(aday["S_w_m2"])
-        c_w = float(aday["c_root_w_m"])
-        Re_w = SEYIR_HIZI_MS * c_w / nu
-
-        S_HT = float(aday["S_HT_m2"])
-        b_HT = float(aday["b_HT_m"])
-        c_HT = float(aday["c_root_HT_m"])
-        Re_HT = SEYIR_HIZI_MS * c_HT / nu
-
-        S_VT = float(aday["S_VT_m2"])
-        h_VT = float(aday["h_VT_m"])
-        c_VT = float(aday["c_root_VT_m"])
-        Re_VT = SEYIR_HIZI_MS * c_VT / nu
-
-        # LLT'den gelen 3B taşıma parametreleri
         CL_alpha_3d = llt_veri["CL_alpha_3d_per_deg"]
         alpha_L0_deg = llt_veri["alpha_L0_deg"]
         e_oswald = llt_veri["e_oswald"]
         CL_seyir = llt_veri["CL_seyir"]
+        CL_max_3d = llt_veri["CL_max_3d_tahmini"]
+        curve = llt_veri["curve"]
 
-        # CDi_seyir LLT dosyasından okunmaz; doğrudan burada hesaplanır
         CDi_seyir = (CL_seyir ** 2) / (math.pi * AR_w * e_oswald)
-
-        # OpenVSP eşdeğeri (iniş takımsız) CD_0 hesabı
-        vsp = hesapla_openvsp_cd0(
-            S_w=S_w,
-            Re_w=Re_w,
-            t_c_w=t_c_w,
-            S_HT=S_HT,
-            Re_HT=Re_HT,
-            t_c_HT=t_c_kuyruk,
-            S_VT=S_VT,
-            Re_VT=Re_VT,
-            t_c_VT=t_c_kuyruk,
-            L_govde=L_govde,
-            D_govde=D_govde,
-            S_wet_govde=S_wet_govde,
-        )
-
-        CD_0 = vsp["CD_0"]
+        CD_0 = vsp["CD0_0"]
         CD_seyir_toplam = CD_0 + CDi_seyir
         L_D_seyir_toplam = CL_seyir / CD_seyir_toplam if CD_seyir_toplam > 0 else np.nan
 
         temel_bilgi = {
             "aday_no": no,
             "kanat_airfoil": kanat_profil,
+            "flap_airfoil": flap_profil,
             "kuyruk_airfoil": kuyruk_profil,
-            "V_seyir_ms": SEYIR_HIZI_MS,
+            "V_seyir_ms": v_ref,
             "b_w_m": b_w,
             "AR_w": AR_w,
             "S_w_m2": S_w,
             "c_w_m": c_w,
-            "t_c_w": t_c_w,
             "S_HT_m2": S_HT,
             "b_HT_m": b_HT,
             "c_HT_m": c_HT,
-            "t_c_HT": t_c_kuyruk,
             "S_VT_m2": S_VT,
             "h_VT_m": h_VT,
             "c_VT_m": c_VT,
-            "t_c_VT": t_c_kuyruk,
             "L_govde_m": L_govde,
             "D_govde_m": D_govde,
-            "tail_arm_m": float(aday["tail_arm_m"]),
+            "tail_arm_m": tail_arm,
             "Re_aday": Re_w,
-            "Re_HT": Re_HT,
-            "Re_VT": Re_VT,
             **vsp,
             "CL_alpha_3d_per_deg": CL_alpha_3d,
             "alpha_L0_deg": alpha_L0_deg,
             "e_oswald": e_oswald,
+            "CL_max_3d_tahmini": CL_max_3d,
         }
 
-        # 1) Aday Özet Satırı (0° Seyir / Referans Koşulu)
-        ozet_satirlari.append(
-            {
-                **temel_bilgi,
-                "CL_seyir": CL_seyir,
-                "CD_i_seyir": CDi_seyir,
-                "CD_0_seyir": CD_0,
-                "CD_seyir": CD_seyir_toplam,
-                "L_D_seyir": L_D_seyir_toplam,
-            }
-        )
+        ozet_satirlari.append({
+            **temel_bilgi,
+            "CL_seyir": CL_seyir,
+            "CD_i_seyir": CDi_seyir,
+            "CD_0_seyir": CD_0,
+            "CD_seyir": CD_seyir_toplam,
+            "L_D_seyir": L_D_seyir_toplam,
+        })
 
-        # 2) -5° ile +15° Arası Açı Taraması
         for alfa_deg in alfa_dizisi:
-            cl_alfa = CL_alpha_3d * (float(alfa_deg) - alpha_L0_deg)
+            cl_alfa = curve[float(alfa_deg)]
             cd_i_alfa = (cl_alfa ** 2) / (math.pi * AR_w * e_oswald)
             cd_toplam_alfa = CD_0 + cd_i_alfa
             l_d_alfa = cl_alfa / cd_toplam_alfa if cd_toplam_alfa > 0 else np.nan
 
-            polar_detay_satirlari.append(
-                {
-                    **temel_bilgi,
-                    "alpha_deg": float(alfa_deg),
-                    "CL": cl_alfa,
-                    "CD_i": cd_i_alfa,
-                    "CD_0": CD_0,
-                    "CD": cd_toplam_alfa,
-                    "L_D": l_d_alfa,
-                }
-            )
+            polar_detay_satirlari.append({
+                **temel_bilgi,
+                "alpha_deg": float(alfa_deg),
+                "CL": cl_alfa,
+                "CD_i": cd_i_alfa,
+                "CD_0": CD_0,
+                "CD": cd_toplam_alfa,
+                "L_D": l_d_alfa,
+            })
 
     csv_yaz(ozet_satirlari, cikti_ozet_csv)
     csv_yaz(polar_detay_satirlari, cikti_polar_csv)
@@ -480,31 +447,21 @@ def grubu_hesapla_ve_kaydet(
 
 
 def main() -> None:
-    print("1) Flapsiz ucak adaylari icin OpenVSP CD0 + LLT CDi hesaplaniyor...")
-    flapsiz_adaylar = kb.tum_adaylari_uret()
-    llt_flapsiz_harita = llt_aday_re_csv_oku(LLT_FLAPSIZ_ADAY_RE_CSV, flapli_mi=False)
+    print("1) Flapsiz ucak adaylari icin OpenVSP CD0 + LLT CDi bellek icinde hesaplaniyor...")
+    flapsiz_adaylar = llt.adaylari_yukle(llt.FLAPSIZ_ADAY_CSV_ADI, flapli_mi=False)
     n_flapsiz_ozet, n_flapsiz_polar = grubu_hesapla_ve_kaydet(
-        flapsiz_adaylar,
-        llt_flapsiz_harita,
-        CIKTI_FLAPSIZ_OZET_CSV,
-        CIKTI_FLAPSIZ_POLAR_CSV,
-        flapli_mi=False,
+        flapsiz_adaylar, CIKTI_FLAPSIZ_OZET_CSV, CIKTI_FLAPSIZ_POLAR_CSV, flapli_mi=False
     )
-    print(f"   - Kaydedildi: {CIKTI_FLAPSIZ_OZET_CSV} ({n_flapsiz_ozet} aday)")
-    print(f"   - Kaydedildi: {CIKTI_FLAPSIZ_POLAR_CSV} ({n_flapsiz_polar} satir)")
+    print(f"  - Kaydedildi: {CIKTI_FLAPSIZ_OZET_CSV} ({n_flapsiz_ozet} aday)")
+    print(f"  - Kaydedildi: {CIKTI_FLAPSIZ_POLAR_CSV} ({n_flapsiz_polar} satir)")
 
-    print("\n2) Flapli ucak adaylari icin OpenVSP CD0 + LLT CDi hesaplaniyor...")
-    flapli_adaylar = kb.tum_flapli_adaylari_uret()
-    llt_flapli_harita = llt_aday_re_csv_oku(LLT_FLAPLI_ADAY_RE_CSV, flapli_mi=True)
+    print("\n2) Flapli ucak adaylari icin OpenVSP CD0 + LLT CDi bellek icinde hesaplaniyor...")
+    flapli_adaylar = llt.adaylari_yukle(llt.FLAPLI_ADAY_CSV_ADI, flapli_mi=True)
     n_flapli_ozet, n_flapli_polar = grubu_hesapla_ve_kaydet(
-        flapli_adaylar,
-        llt_flapli_harita,
-        CIKTI_FLAPLI_OZET_CSV,
-        CIKTI_FLAPLI_POLAR_CSV,
-        flapli_mi=True,
+        flapli_adaylar, CIKTI_FLAPLI_OZET_CSV, CIKTI_FLAPLI_POLAR_CSV, flapli_mi=True
     )
-    print(f"   - Kaydedildi: {CIKTI_FLAPLI_OZET_CSV} ({n_flapli_ozet} aday)")
-    print(f"   - Kaydedildi: {CIKTI_FLAPLI_POLAR_CSV} ({n_flapli_polar} satir)")
+    print(f"  - Kaydedildi: {CIKTI_FLAPLI_OZET_CSV} ({n_flapli_ozet} aday)")
+    print(f"  - Kaydedildi: {CIKTI_FLAPLI_POLAR_CSV} ({n_flapli_polar} satir)")
 
 
 if __name__ == "__main__":

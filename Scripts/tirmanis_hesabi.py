@@ -3,7 +3,7 @@
 Python 3.10+, yalniz standart kutuphane. Ornek: python tirmanis_hesabi.py
 Varsayilanlar: Vx=15, Vz=4 m/s, dh=50 m, U=24 V, pervane=14x7.
 Trim/downwash yok; i_HT=0, NACA0010 icin alpha_L0_HT=0.
-Mevcut akim_a sutunu varsayilan olarak W kabul edilir (gecici veri).
+Itki tablosundaki akim_a amperdir; guc P=U*I ile hesaplanir (varsayilan sabit U=24 V).
 """
 from __future__ import annotations
 
@@ -436,7 +436,7 @@ def main(argv=None):
                          ('rho',1.175),('mu',1.789e-5),('g',9.80665),('kuyruk-oturma',0.0)]:
         parser.add_argument('--'+flag,type=float,default=default)
     parser.add_argument('--pervane',default='14x7',help='Adayda pervane sutunu yoksa kullanilir.')
-    parser.add_argument('--tablo-degeri',choices=['guc_w','akim_a'],default='guc_w',
+    parser.add_argument('--tablo-degeri',choices=['guc_w','akim_a'],default='akim_a',
                         help='guc_w: guc_w/power_w veya gecici olarak akim_a W kabul edilir. akim_a: gercek A * V.')
     args = parser.parse_args(argv)
     for name in ('vx','vz','irtifa','gerilim','rho','mu','g'):
