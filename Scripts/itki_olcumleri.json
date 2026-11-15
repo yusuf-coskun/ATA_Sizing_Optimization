@@ -1,71 +1,705 @@
 {
-  "pervaneler": [
+ "pervaneler": [
+  {
+   "ad": "18x8",
+   "itki_birimi": "gf",
+   "not": "Gercek olcum: %50,60,70,80,90,100 gazda 0 m/s itki ve guc (kullanici olcum tablosu). Diger gaz seviyeleri (55,65,75,85,95) ara degerdir (interpolasyon). 0 m/s disindaki hizlar APC PER3 performans dosyasi modelidir (olcume oturtulmus). guc_w = elektriksel guc (W); hiz boyunca degisim APC modelinden, olcum noktalarinda tablodaki degerlere birebir esitlenmistir. Hizlar arasi 1 m/s degerler dogrusal interpolasyondur. %50 gazda 20 m/s'de itki negatife dustugu icin itki ve guc 0 yazildi.",
+   "gaz_seviyeleri": [
     {
-      "ad": "14x7",
-      "itki_birimi": "N",
-      "gaz_seviyeleri": [
-        {
-          "gaz_yuzde": 100,
-          "olcumler": [
-            {"hiz_m_s": 0, "itki": 61.63, "akim_a": 53.21},
-            {"hiz_m_s": 5, "itki": 56.597, "akim_a": 53.21},
-            {"hiz_m_s": 10, "itki": 52.744, "akim_a": 53.21},
-            {"hiz_m_s": 15, "itki": 47.973, "akim_a": 53.21},
-            {"hiz_m_s": 20, "itki": 42.037, "akim_a": 53.21}
-          ]
-        },
-        {
-          "gaz_yuzde": 90,
-          "olcumler": [
-            {"hiz_m_s": 0, "itki": 53.288, "akim_a": 39.41},
-            {"hiz_m_s": 5, "itki": 50.746, "akim_a": 39.41},
-            {"hiz_m_s": 10, "itki": 47.345, "akim_a": 39.41},
-            {"hiz_m_s": 15, "itki": 42.742, "akim_a": 39.41}
-          ]
-        },
-        {
-          "gaz_yuzde": 80,
-          "statik_itki": 45.97,
-          "sabit_akim_a": 26.78,
-          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
-        },
-        {
-          "gaz_yuzde": 75,
-          "statik_itki": 40.672,
-          "sabit_akim_a": 22.48,
-          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
-        },
-        {
-          "gaz_yuzde": 70,
-          "statik_itki": 34.688,
-          "sabit_akim_a": 17.04,
-          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
-        },
-        {
-          "gaz_yuzde": 65,
-          "statik_itki": 29.32,
-          "sabit_akim_a": 13.42,
-          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
-        },
-        {
-          "gaz_yuzde": 60,
-          "statik_itki": 25.83,
-          "sabit_akim_a": 11.21,
-          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
-        },
-        {
-          "gaz_yuzde": 55,
-          "statik_itki": 21.415,
-          "sabit_akim_a": 8.76,
-          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
-        },
-        {
-          "gaz_yuzde": 50,
-          "statik_itki": 17.619,
-          "sabit_akim_a": 3.46,
-          "model": {"tur": "statik_oran", "referans_gaz_yuzde": 100}
-        }
-      ]
+     "gaz_yuzde": 100,
+     "kaynak": "olcum_0ms+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 7500.0,
+       "guc_w": 1650.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 6895.2,
+       "guc_w": 1743.0
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 6085.4,
+       "guc_w": 1774.1
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 5079.7,
+       "guc_w": 1709.4
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 3912.7,
+       "guc_w": 1528.6
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 95,
+     "kaynak": "ara_deger+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 6987.5,
+       "guc_w": 1454.8
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 6407.4,
+       "guc_w": 1538.1
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 5630.2,
+       "guc_w": 1563.3
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 4664.4,
+       "guc_w": 1502.5
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 3545.2,
+       "guc_w": 1330.7
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 90,
+     "kaynak": "olcum_0ms+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 6500.0,
+       "guc_w": 1277.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 5945.4,
+       "guc_w": 1351.2
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 5200.5,
+       "guc_w": 1370.9
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 4274.1,
+       "guc_w": 1311.6
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 3199.4,
+       "guc_w": 1150.9
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 85,
+     "kaynak": "ara_deger+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 6054.7,
+       "guc_w": 1130.1
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 5511.8,
+       "guc_w": 1197.6
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 4778.3,
+       "guc_w": 1211.1
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 3863.9,
+       "guc_w": 1146.8
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 2800.4,
+       "guc_w": 987.5
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 80,
+     "kaynak": "olcum_0ms+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 5620.0,
+       "guc_w": 995.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 5089.5,
+       "guc_w": 1056.2
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 4366.7,
+       "guc_w": 1063.2
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 3464.3,
+       "guc_w": 996.0
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 2417.0,
+       "guc_w": 837.0
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 75,
+     "kaynak": "ara_deger+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 5113.0,
+       "guc_w": 857.1
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 4599.7,
+       "guc_w": 911.8
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 3892.2,
+       "guc_w": 911.6
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 3010.1,
+       "guc_w": 840.7
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 1989.6,
+       "guc_w": 682.7
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 70,
+     "kaynak": "olcum_0ms+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 4600.0,
+       "guc_w": 728.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 4105.6,
+       "guc_w": 774.3
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 3414.4,
+       "guc_w": 769.2
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 2554.5,
+       "guc_w": 695.8
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 1563.2,
+       "guc_w": 537.0
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 65,
+     "kaynak": "ara_deger+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 4030.8,
+       "guc_w": 605.1
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 3565.9,
+       "guc_w": 643.5
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 2910.3,
+       "guc_w": 634.9
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 2091.2,
+       "guc_w": 559.7
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 1151.2,
+       "guc_w": 403.9
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 60,
+     "kaynak": "olcum_0ms+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 3500.0,
+       "guc_w": 496.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 3063.5,
+       "guc_w": 527.6
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 2442.1,
+       "guc_w": 516.5
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 1664.0,
+       "guc_w": 439.6
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 781.1,
+       "guc_w": 289.1
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 55,
+     "kaynak": "ara_deger+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 2921.4,
+       "guc_w": 380.5
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 2517.4,
+       "guc_w": 404.5
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 1935.3,
+       "guc_w": 388.8
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 1207.1,
+       "guc_w": 314.7
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 391.1,
+       "guc_w": 170.1
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 50,
+     "kaynak": "olcum_0ms+APC_modeli; 20 m/s: itki negatife dustugu icin 0 yazildi",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 2400.0,
+       "guc_w": 285.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 2029.3,
+       "guc_w": 303.0
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 1484.9,
+       "guc_w": 283.7
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 807.2,
+       "guc_w": 211.2
+      },
+      {
+       "hiz_m_s": 19,
+       "itki": 211.6,
+       "guc_w": 108.2
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 0.0,
+       "guc_w": 0.0
+      }
+     ]
     }
-  ]
+   ]
+  },
+  {
+   "ad": "17x10E",
+   "itki_birimi": "gf",
+   "not": "Gercek olcum: %50,60,70,80,90,100 gazda 0 m/s itki ve guc (kullanici olcum tablosu). Diger gaz seviyeleri (55,65,75,85,95) ara degerdir (interpolasyon). 0 m/s disindaki hizlar APC PER3 performans dosyasi modelidir (olcume oturtulmus). guc_w = elektriksel guc (W); hiz boyunca degisim APC modelinden, olcum noktalarinda tablodaki degerlere birebir esitlenmistir. Hizlar arasi 1 m/s degerler dogrusal interpolasyondur.",
+   "gaz_seviyeleri": [
+    {
+     "gaz_yuzde": 100,
+     "kaynak": "olcum_0ms+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 6750.0,
+       "guc_w": 1573.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 6374.3,
+       "guc_w": 1675.9
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 5851.5,
+       "guc_w": 1743.5
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 5144.8,
+       "guc_w": 1736.4
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 4238.6,
+       "guc_w": 1625.6
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 95,
+     "kaynak": "ara_deger+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 6144.6,
+       "guc_w": 1389.2
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 5795.3,
+       "guc_w": 1480.6
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 5306.6,
+       "guc_w": 1540.5
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 4643.6,
+       "guc_w": 1530.1
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 3792.1,
+       "guc_w": 1423.8
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 90,
+     "kaynak": "olcum_0ms+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 5570.0,
+       "guc_w": 1219.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 5246.5,
+       "guc_w": 1300.1
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 4791.3,
+       "guc_w": 1352.5
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 4172.0,
+       "guc_w": 1340.0
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 3375.5,
+       "guc_w": 1239.0
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 85,
+     "kaynak": "ara_deger+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 5314.3,
+       "guc_w": 1078.6
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 4990.1,
+       "guc_w": 1153.1
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 4528.7,
+       "guc_w": 1198.1
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 3898.0,
+       "guc_w": 1180.5
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 3085.3,
+       "guc_w": 1074.2
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 80,
+     "kaynak": "olcum_0ms+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 5050.0,
+       "guc_w": 950.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 4725.1,
+       "guc_w": 1018.2
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 4258.0,
+       "guc_w": 1055.2
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 3616.3,
+       "guc_w": 1032.9
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 2789.4,
+       "guc_w": 922.1
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 75,
+     "kaynak": "ara_deger+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 4630.1,
+       "guc_w": 832.7
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 4312.4,
+       "guc_w": 895.6
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 3849.8,
+       "guc_w": 925.8
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 3206.5,
+       "guc_w": 896.2
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 2382.3,
+       "guc_w": 777.4
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 70,
+     "kaynak": "olcum_0ms+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 4160.0,
+       "guc_w": 710.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 3853.2,
+       "guc_w": 765.7
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 3393.9,
+       "guc_w": 788.2
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 2752.3,
+       "guc_w": 750.8
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 1934.4,
+       "guc_w": 626.0
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 65,
+     "kaynak": "ara_deger+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 3793.5,
+       "guc_w": 603.2
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 3493.7,
+       "guc_w": 651.6
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 3035.2,
+       "guc_w": 668.1
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 2388.1,
+       "guc_w": 623.9
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 1573.3,
+       "guc_w": 497.4
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 60,
+     "kaynak": "olcum_0ms+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 3400.0,
+       "guc_w": 500.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 3107.6,
+       "guc_w": 540.9
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 2650.8,
+       "guc_w": 551.5
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 2003.1,
+       "guc_w": 500.2
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 1195.2,
+       "guc_w": 373.8
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 55,
+     "kaynak": "ara_deger+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 2960.6,
+       "guc_w": 408.3
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 2679.1,
+       "guc_w": 443.6
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 2228.1,
+       "guc_w": 447.6
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 1584.5,
+       "guc_w": 389.4
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 803.1,
+       "guc_w": 261.6
+      }
+     ]
+    },
+    {
+     "gaz_yuzde": 50,
+     "kaynak": "olcum_0ms+APC_modeli",
+     "olcumler": [
+      {
+       "hiz_m_s": 0,
+       "itki": 2490.0,
+       "guc_w": 317.0
+      },
+      {
+       "hiz_m_s": 5,
+       "itki": 2221.6,
+       "guc_w": 345.7
+      },
+      {
+       "hiz_m_s": 10,
+       "itki": 1778.9,
+       "guc_w": 342.2
+      },
+      {
+       "hiz_m_s": 15,
+       "itki": 1144.8,
+       "guc_w": 277.9
+      },
+      {
+       "hiz_m_s": 20,
+       "itki": 407.3,
+       "guc_w": 153.2
+      }
+     ]
+    }
+   ]
+  }
+ ]
 }
