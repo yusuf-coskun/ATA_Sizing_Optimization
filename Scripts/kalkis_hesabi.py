@@ -3,7 +3,7 @@
 Yeni '<kanat_airfoil>_flap' adlandırma standardına göre güncellenmiştir:
 - Her adayın 'kanat_airfoil' adına (ör. 'clarkysm-il') doğrudan '_flap' eklenerek
   'clarkysm-il_flap' profili ve poları çağrılır.
-- Adaylar 'itki_tablosu.csv' içindeki TÜM PERVANE TİPLERİYLE çaprazlanır.
+- Pervaneler ana.py tarafindan adaylara atanir; burada yeniden caprazlanmaz.
 - Pist sürtünme katsayısı mu = 0.03, ek flap parazit sürüklemesi = 0.0.
 - UAS Challenge 2027 Kuralları (M3.2.1, M3.3.1, M3.3.6, T2.8.1) puanlaması uygulanır.
 """
@@ -25,6 +25,8 @@ if str(PROJE_KLASORU) not in sys.path:
 
 import drag_hesabi as dh
 import lifting_line_cozucu as llt
+from aday_pervane import (GERILIM_V, elektrik_gucu, kimlik_alanlari,
+                         performans_adaylarini_hazirla)
 
 MAX_AIRSPEED_40KTS_MS = 40.0 * 0.514444  # Kural T2.6.1: 40 kts = 20.5778 m/s
 
@@ -86,17 +88,12 @@ def index_propellers(prop_rows: list[dict], throttle: float, voltage: float, mod
             continue
         v = number(row, 'hiz_m_s')
         itki = number(row, 'itki_n')
-        if mode == 'akim_a':
-            guc = number(row, 'akim_a') * voltage
-            kaynak = 'akim_a_x_gerilim'
-        else:
-            if row.get('guc_w') not in (None, ''):
-                guc = number(row, 'guc_w')
-                kaynak = 'guc_w'
-            else:
-                guc = number(row, 'akim_a')
-                kaynak = 'akim_a_W_kabul_gecici'
-        prop_map.setdefault(prop, {})[v] = {'itki_N': itki, 'guc_W': guc, 'kaynak': kaynak}
+        guc, kaynak = elektrik_gucu(row, voltage, mode)
+        point = {'itki_N': itki, 'guc_W': guc, 'kaynak': kaynak}
+        curve = prop_map.setdefault(prop, {})
+        if v in curve and curve[v] != point:
+            raise ValueError(f'Celisen pervane/gaz/hiz verisi: {prop}, {gaz}, {v}')
+        curve[v] = point
     return prop_map
 
 
@@ -270,6 +267,7 @@ def solve_takeoff_for_mass(
         'enerji_sayisal_Wh': wh_to_num,
         'S_ROT_1s_m': v_lof * 1.0,
         'S_G_kriter_m': s_kriter,
+        'sure_kriter_s': t_num if args.yontem == 'sayisal' else t_to_avg,
         'tuketim_kriter_mAh': mah_kriter,
         'enerji_kriter_Wh': wh_kriter,
         'guc_kaynagi': guc_kaynagi,
@@ -279,9 +277,9 @@ def solve_takeoff_for_mass(
 
 
 def calculate(mass_rows: list[dict], prop_map: dict[str, dict[float, dict]], args) -> list[dict]:
+    mass_rows = performans_adaylarini_hazirla(mass_rows, args.pervane)
     flapsiz_indeks = llt.polar_klasorunu_indeksle(llt.POLAR_KLASORU)
     flapli_indeks = llt.polar_klasorunu_indeksle(llt.FLAP_POLAR_KLASORU)
-    all_props = sorted(prop_map.keys())
     llt_cache: dict = {}
 
     output = []
@@ -292,11 +290,12 @@ def calculate(mass_rows: list[dict], prop_map: dict[str, dict[float, dict]], arg
         kuyruk_profil = Path(str(mass.get('kuyruk_airfoil') or mass.get('ht_airfoil') or 'naca0010')).stem.strip()
         flap_profil = f"{kanat_profil}_flap" if kanat_profil else ""
 
-        prop_list = [(mass.get('pervane') or args.pervane).strip()] if args.tek_pervane else all_props
+        prop_list = [mass['pervane']]
 
         for prop in prop_list:
             aday_sayaci += 1
             out = {
+                **kimlik_alanlari(mass),
                 'aday_no': aday_sayaci,
                 'kanat_airfoil': kanat_profil,
                 'flap_airfoil': flap_profil,
@@ -309,6 +308,7 @@ def calculate(mass_rows: list[dict], prop_map: dict[str, dict[float, dict]], arg
                 'puan_M3_manuel_kalkis_20': 0.0,
                 'resmi_kalkis_puani_60': 0.0,
                 'tasarim_kalkis_puani_100': 0.0,
+                'yontem': args.yontem,
                 'gaz_yuzde': args.gaz_yuzde,
                 'gerilim_V': args.gerilim,
                 'rho_kg_m3': args.rho,
@@ -407,6 +407,9 @@ def calculate(mass_rows: list[dict], prop_map: dict[str, dict[float, dict]], arg
                     enerji_M2_sayisal_Wh=m2['enerji_sayisal_Wh'],
                     S_ROT_M2_1s_m=m2['S_ROT_1s_m'],
                     S_G_M2_kriter_m=m2['S_G_kriter_m'],
+                    sure_M2_kriter_s=m2['sure_kriter_s'],
+                    tuketim_M2_kriter_mAh=m2['tuketim_kriter_mAh'],
+                    enerji_M2_kriter_Wh=m2['enerji_kriter_Wh'],
                     V_stall_M1_bos_m_s=m1['V_stall_m_s'],
                     V_LOF_M1_bos_m_s=m1['V_LOF_m_s'],
                     S_G_M1_bos_ort_ivme_m=m1['S_G_ort_ivme_m'],
@@ -480,7 +483,7 @@ def main(argv=None):
         ('hedef-mesafe', 20.0),
         ('v-lof-katsayi', 1.1),
         ('gaz-yuzde', 100.0),
-        ('gerilim', 22.2),
+        ('gerilim', GERILIM_V),
         ('rho', 1.175),
         ('mu', 1.789e-5),
         ('g', 9.80665),
@@ -493,13 +496,13 @@ def main(argv=None):
         ('ek-cihaz-kutlesi-kg', 0.0),
     ]:
         parser.add_argument('--' + flag, type=float, default=default)
-    parser.add_argument('--pervane', default='14x7', help='--tek-pervane secildiginde kullanilacak varsayilan pervane.')
+    parser.add_argument('--pervane', help='Yalniz pervane alani bos eski adaylar icin acik varsayilan.')
     parser.add_argument('--tek-pervane', action='store_true',
-                        help='Belirtilirse tum pervaneleri caprazlamak yerine sadece --pervane ile verilen pervaneyi cozer.')
+                        help='Geriye uyumluluk: artik her zaman aday satirindaki pervane kullanilir.')
     parser.add_argument('--yontem', choices=['ort_ivme', 'sayisal'], default='ort_ivme',
                         help='20m baraji ve puanlama icin baz alinacak yontem (her iki yontem de CSVye yazilir).')
-    parser.add_argument('--tablo-degeri', choices=['akim_a', 'guc_w'], default='akim_a',
-                        help='akim_a: gercek A * V (varsayilan). guc_w: guc_w/power_w veya gecici W.')
+    parser.add_argument('--tablo-degeri', choices=['auto', 'akim_a', 'guc_w'], default='auto',
+                        help='auto: guc_w/power_w varsa W, yoksa akim_a * gerilim.')
     args = parser.parse_args(argv)
 
     try:

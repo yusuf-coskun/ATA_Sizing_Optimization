@@ -1,9 +1,9 @@
 """Flapsiz adaylar icin sabit hizli tirmanis ve batarya tuketimi.
 
 Python 3.10+, yalniz standart kutuphane. Ornek: python tirmanis_hesabi.py
-Varsayilanlar: Vx=15, Vz=4 m/s, dh=50 m, U=24 V, pervane=14x7.
+Varsayilanlar: Vx=15, Vz=4 m/s, dh=50 m, U=24 V; pervane aday satirindan.
 Trim/downwash yok; i_HT=0, NACA0010 icin alpha_L0_HT=0.
-Itki tablosundaki akim_a amperdir; guc P=U*I ile hesaplanir (varsayilan sabit U=24 V).
+Itki tablosunda guc_w/power_w watt, akim_a amperdir; auto modu sutuna gore okur.
 """
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ import re
 import sys
 from functools import lru_cache
 from pathlib import Path
+from aday_pervane import (GERILIM_V, elektrik_gucu, kimlik_alanlari,
+                         performans_adaylarini_hazirla)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -300,12 +302,10 @@ def prop_at_speed(rows: list[dict], prop: str, speed: float, voltage: float, mod
             continue
         a,b = by_speed[lo],by_speed[hi]
         def power(row):
-            if mode=='akim_a':
-                return number(row,'akim_a')*voltage, 'akim_a_x_gerilim'
-            for name in ('guc_w','power_w'):
-                if row.get(name) not in (None,''):
-                    return number(row,name), name
-            return number(row,'akim_a'), 'akim_a_W_kabul_gecici'
+            try:
+                return elektrik_gucu(row, voltage, mode)
+            except ValueError as exc:
+                raise ModelError('veri_hatasi', str(exc)) from exc
         pa,source = power(a)
         pb,source_b = power(b)
         if source != source_b or min(pa,pb) < 0:
@@ -335,6 +335,7 @@ def required_power(points: list[dict], thrust: float) -> dict:
 
 
 def calculate(mass_rows, wing_index, drag_rows, tail_polars, prop_rows, args):
+    mass_rows = performans_adaylarini_hazirla(mass_rows, args.pervane)
     velocity = math.hypot(args.vx,args.vz)
     gamma = math.atan2(args.vz,args.vx)
     duration = args.irtifa/args.vz
@@ -345,8 +346,8 @@ def calculate(mass_rows, wing_index, drag_rows, tail_polars, prop_rows, args):
     prop_cache = {}
     output = []
     for i,mass in enumerate(mass_rows,1):
-        prop = (mass.get('pervane') or args.pervane).strip()
-        out = {'aday_no':i, 'kanat_airfoil':mass.get('kanat_airfoil',''), 'pervane':prop,
+        prop = mass['pervane']
+        out = {**kimlik_alanlari(mass), 'aday_no':i, 'kanat_airfoil':mass.get('kanat_airfoil',''), 'pervane':prop,
                'durum':'', 'aciklama':'', 'Vx_m_s':args.vx,'Vz_m_s':args.vz,'V_m_s':velocity,
                'tirmanis_acisi_deg':math.degrees(gamma),'irtifa_m':args.irtifa,'sure_s':duration,
                'gerilim_V':args.gerilim,'rho_kg_m3':args.rho,'q_Pa':dynamic,
@@ -404,8 +405,6 @@ def calculate(mass_rows, wing_index, drag_rows, tail_polars, prop_rows, args):
             out.update(enerji_J=power*duration,enerji_Wh=power*duration/3600,
                        esdeger_akim_A=power/args.gerilim,
                        tuketim_mAh=1000*power*duration/(3600*args.gerilim),durum='uygun')
-            if 'gecici' in out['guc_kaynagi']:
-                out['aciklama'] = 'akim_a sayilari W kabul edildi; guc ve tuketim gecicidir.'
         except ModelError as exc:
             out['durum'],out['aciklama'] = exc.status,str(exc)
         output.append(out)
@@ -432,12 +431,12 @@ def main(argv=None):
     for flag in ('kutle','llt','drag','kuyruk-polar','itki'):
         parser.add_argument('--'+flag,type=Path)
     parser.add_argument('--cikti',type=Path,default=ROOT/'tirmanis_sonuclari.csv')
-    for flag,default in [('vx',15.0),('vz',4.0),('irtifa',50.0),('gerilim',24.0),
+    for flag,default in [('vx',15.0),('vz',4.0),('irtifa',50.0),('gerilim',GERILIM_V),
                          ('rho',1.175),('mu',1.789e-5),('g',9.80665),('kuyruk-oturma',0.0)]:
         parser.add_argument('--'+flag,type=float,default=default)
-    parser.add_argument('--pervane',default='14x7',help='Adayda pervane sutunu yoksa kullanilir.')
-    parser.add_argument('--tablo-degeri',choices=['guc_w','akim_a'],default='akim_a',
-                        help='guc_w: guc_w/power_w veya gecici olarak akim_a W kabul edilir. akim_a: gercek A * V.')
+    parser.add_argument('--pervane',help='Yalniz pervane alani bos eski adaylar icin acik varsayilan.')
+    parser.add_argument('--tablo-degeri',choices=['auto','guc_w','akim_a'],default='auto',
+                        help='auto: guc_w/power_w varsa W, yoksa akim_a * gerilim.')
     args = parser.parse_args(argv)
     for name in ('vx','vz','irtifa','gerilim','rho','mu','g'):
         val = getattr(args,name)

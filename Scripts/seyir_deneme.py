@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 ====================================================================================================
 ATA_Sizing_Optimization - Entegre Seyir (Cruise) ve Tam Görev Enerji Optimizasyonu Kodu
@@ -26,12 +24,12 @@ ATA_Sizing_Optimization - Entegre Seyir (Cruise) ve Tam Görev Enerji Optimizasy
        CDi_HT = (S_HT / S_w) * CL_HT^2 / (pi * AR_HT * e_HT)
        CD_toplam = CD_0 (20 m/s'deki parazit sürükleme) + CDi_w + CDi_HT
    - Gerekli itki T_req = q * S_w * CD_toplam olarak bulunur ve 20 m/s itki tablosundan
-     akım (A), gaz (%) ve elektriksel güç (P = V_BAT * I) enterpole edilir.
+     adaya atanmis pervanenin gaz (%) ve elektriksel gucu (W) enterpole edilir; I = P / V.
 
 3. Kalkış ve Tırmanış Kodlarından Gerçek Kapasite (mAh) ve Enerji (Wh) Entegrasyonu:
    - Sabit 2000 mAh varsayımı yerine, 'kalkis_sonuclari.csv' ve 'tirmanis_sonuclari.csv' dosyalarından
      her adayın (ve seçili pervanenin) gerçek kalkış ve tırmanış tüketimleri çekilir:
-       * Kalkış (Mission 2 Yüklü): S_G_M2_kriter_m, sure_M2_ort_ivme_s, tuketim_M2_ort_ivme_mAh, enerji_M2_ort_ivme_Wh
+       * Kalkış (Mission 2 Yüklü): S_G_M2_kriter_m, sure_M2_kriter_s, tuketim_M2_kriter_mAh, enerji_M2_kriter_Wh
        * Tırmanış (50m İrtifaya Çıkış): sure_s, tuketim_mAh, enerji_Wh
    - Su bırakma yaklaşması, alçalma ve iniş manevraları için emniyet rezervi (INIS_YAKLASMA_EK_BUTCE_MAH)
      eklenerek adaya özgü gerçek seyir dışı tüketim bulunur:
@@ -39,7 +37,8 @@ ATA_Sizing_Optimization - Entegre Seyir (Cruise) ve Tam Görev Enerji Optimizasy
    - Böylece her adayın seyir için kullanabileceği maksimum batarya kapasitesi dinamik hale gelir:
        aday_seyir_max_kullanilabilir_mah = KULLANILABILIR_TOPLAM_MAH (9600 mAh) - seyir_disi_gercek_mah
    - Eğer 'kalkis_sonuclari.csv' veya 'tirmanis_sonuclari.csv' henüz üretilmemişse kod çökmez;
-     otomatik olarak sabit SEYIR_DISI_KAPASITE_BUTCESI_MAH (2000 mAh) yedek değerine döner.
+     seyir on hesabi 2000 mAh yedek butceyle raporlanir; tam gorev uygun sayilmaz.
+   - Eslesme konfigurasyon_id uzerindendir; eski kimliksiz faz CSV dosyalari yeniden uretilmelidir.
 ====================================================================================================
 """
 from functools import lru_cache
@@ -48,6 +47,8 @@ from pathlib import Path
 import re
 import numpy as np
 import pandas as pd
+from aday_pervane import GERILIM_V, faz_anahtari, kimlik_alanlari, performans_adaylarini_hazirla
+from tirmanis_hesabi import prop_at_speed
 
 # ==============================================================================
 # 1. SABITLER, BATARYA KISITLARI VE GOREV PARAMETRELERI
@@ -55,7 +56,6 @@ import pandas as pd
 V_SEYIR = 20.0  # Seyir hizi (m/s)
 RHO_HAVA = 1.175  # Hava yogunlugu (kg/m^3)
 MU_HAVA = 1.789e-5  # Dinamik viskozite (Pa.s); LLT ve CD0 ayni kosulda
-PERVANE_SECIMI = "14x7"  # Farkli pervanelerin verileri karistirilmaz
 G_YERCEKIMI = 9.81  # Yercekimi ivmesi (m/s^2)
 
 N_WAYPOINT = 10  # Mavi waypoint sayisi (WP1 - WP10)
@@ -68,7 +68,7 @@ WP_CLEARANCE_M = 5.0  # Waypoint dis guvenlik mesafesi (m)
 
 # --- Batarya ve Elektriksel Guc Modeli (6S 12000 mAh LiPo) ---
 BATARYA_HUCRE_SAYISI = 6  # 6S LiPo (Nominal: 6 * 3.7V = 22.2V)
-V_BAT_SABIT = 24.0  # Sabit uc gerilimi; P(W) = 24 * I(A)
+V_BAT_SABIT = GERILIM_V  # Ortak sabit gerilim; I(A) = P(W) / V
 
 BATARYA_TOPLAM_MAH = 12000.0  # Toplam batarya kapasitesi (mAh)
 INIS_REZERV_ORANI = 0.20  # Iniste bataryada kalmasi zorunlu %20 rezerv (2400 mAh)
@@ -100,6 +100,7 @@ def find_csv_file(filename, required=True):
     script_dir = Path(__file__).resolve().parent
     proje_dir = script_dir.parent if script_dir.name.lower() == "scripts" else script_dir
     search_paths = [
+        script_dir / filename,
         Path(filename),
         Path("Scripts") / filename,
         Path("..") / filename,
@@ -134,99 +135,52 @@ def load_all_databases():
     return itki_df, vsp_df, llt_df, kutle_df
 
 
-def load_takeoff_and_climb_tables(pervane_secimi=PERVANE_SECIMI):
-    """
-    'kalkis_sonuclari.csv' ve 'tirmanis_sonuclari.csv' dosyalarini okur;
-    her aday ve pervane icin gercek kalkis ve tirmanis batarya/enerji tuketimlerini
-    hizli erisim sozlugune indeksler.
-    """
-    kalkis_path = find_csv_file("kalkis_sonuclari.csv", required=False)
-    tirmanis_path = find_csv_file("tirmanis_sonuclari.csv", required=False)
-
-    kalkis_map = {}
-    tirmanis_map = {}
-
-    if kalkis_path is not None:
-        try:
-            k_df = pd.read_csv(kalkis_path, comment="#", encoding="utf-8-sig")
-            for _, r in k_df.iterrows():
-                prof = str(r.get("kanat_airfoil", "")).strip().lower()
-                prop = str(r.get("pervane", pervane_secimi)).strip()
-                if prop != pervane_secimi:
-                    continue
-                b_w = float(r.get("b_w_m", np.nan))
-                ar_w = float(r.get("AR_w", np.nan))
-                govde_no = int(float(r["govde_aday_no"])) if pd.notna(r.get("govde_aday_no")) and str(r.get("govde_aday_no")).strip() != "" else -1
-                aday_no = int(float(r["aday_no"])) if pd.notna(r.get("aday_no")) else -1
-
-                kayit = {
-                    "durum": str(r.get("durum", "")).strip(),
-                    "kalkis_20m_basarili": bool(r.get("kalkis_20m_basarili", False)),
-                    "S_G_M2_m": float(r.get("S_G_M2_kriter_m", r.get("S_G_M2_ort_ivme_m", np.nan))),
-                    "sure_M2_s": float(r.get("sure_M2_ort_ivme_s", np.nan)),
-                    "tuketim_M2_mAh": float(r.get("tuketim_M2_ort_ivme_mAh", np.nan)),
-                    "enerji_M2_Wh": float(r.get("enerji_M2_ort_ivme_Wh", np.nan)),
-                    "tuketim_M1_bos_mAh": float(r.get("tuketim_M1_bos_mAh", np.nan)),
-                    "enerji_M1_bos_Wh": float(r.get("enerji_M1_bos_Wh", np.nan)),
-                    "resmi_kalkis_puani_60": float(r.get("resmi_kalkis_puani_60", 0.0)),
+def load_takeoff_and_climb_tables():
+    """Sonuclari satir sirasina degil, aday + pervane kimligine gore eslestir."""
+    maps = []
+    for filename in ("kalkis_sonuclari.csv", "tirmanis_sonuclari.csv"):
+        table = {}
+        path = find_csv_file(filename, required=False)
+        if path is None:
+            maps.append(table)
+            continue
+        rows = pd.read_csv(path, comment="#", encoding="utf-8-sig")
+        for _, row in rows.iterrows():
+            key = faz_anahtari(row)
+            if key in table:
+                raise ValueError(f"{filename}: tekrarlanan konfigurasyon: {key}")
+            status = str(row.get("durum", "")).strip()
+            def number(field, default=np.nan):
+                value = row.get(field, default)
+                return float(value) if pd.notna(value) and str(value).strip() else default
+            if filename.startswith("kalkis"):
+                # Kriter alanlari kalkista secilen ortalama/sayisal yontemi tasir.
+                wh = number("enerji_M2_kriter_Wh")
+                table[key] = {
+                    "durum": status,
+                    "kalkis_uygun": status in ("uygun", "mesafe_asimi_20m"),
+                    "kalkis_20m_basarili": str(row.get("kalkis_20m_basarili", "")).lower() in ("true", "1", "1.0"),
+                    "S_G_M2_m": number("S_G_M2_kriter_m"),
+                    "sure_M2_s": number("sure_M2_kriter_s"),
+                    "tuketim_M2_mAh": wh * 1000.0 / V_BAT_SABIT,
+                    "enerji_M2_Wh": wh,
+                    "resmi_kalkis_puani_60": number("resmi_kalkis_puani_60", 0.0),
                 }
-                kalkis_map[("geom", prof, round(ar_w, 4), round(b_w, 4), govde_no)] = kayit
-                if aday_no > 0:
-                    kalkis_map[("id", aday_no)] = kayit
-        except Exception as exc:
-            print(f"UYARI: kalkis_sonuclari.csv okunurken hata olustu ({exc}); yedek butce kullanilacak.")
-
-    if tirmanis_path is not None:
-        try:
-            t_df = pd.read_csv(tirmanis_path, comment="#", encoding="utf-8-sig")
-            for _, r in t_df.iterrows():
-                prof = str(r.get("kanat_airfoil", "")).strip().lower()
-                prop = str(r.get("pervane", pervane_secimi)).strip()
-                if prop != pervane_secimi:
-                    continue
-                b_w = float(r.get("b_w_m", np.nan))
-                ar_w = float(r.get("AR_w", np.nan))
-                govde_no = int(float(r["govde_aday_no"])) if pd.notna(r.get("govde_aday_no")) and str(r.get("govde_aday_no")).strip() != "" else -1
-                aday_no = int(float(r["aday_no"])) if pd.notna(r.get("aday_no")) else -1
-
-                # Gerilim uyumu: tirmanis_sonuclari.csv'deki enerji_Wh uzerinden V_BAT_SABIT bazli esdeger mAh kontrolu
-                t_mah = float(r.get("tuketim_mAh", np.nan))
-                t_wh = float(r.get("enerji_Wh", np.nan))
-                t_sure = float(r.get("sure_s", np.nan))
-
-                kayit = {
-                    "durum": str(r.get("durum", "")).strip(),
-                    "tirmanis_uygun": str(r.get("durum", "")).strip() == "uygun",
-                    "sure_s": t_sure,
-                    "tuketim_mAh": t_mah,
-                    "enerji_Wh": t_wh,
-                    "T_gerekli_N": float(r.get("T_gerekli_N", np.nan)),
-                    "gaz_yuzde": float(r.get("gaz_yuzde", np.nan)),
+            else:
+                wh = number("enerji_Wh")
+                table[key] = {
+                    "durum": status, "tirmanis_uygun": status == "uygun",
+                    "sure_s": number("sure_s"), "enerji_Wh": wh,
+                    "tuketim_mAh": wh * 1000.0 / V_BAT_SABIT,
+                    "T_gerekli_N": number("T_gerekli_N"), "gaz_yuzde": number("gaz_yuzde"),
                 }
-                tirmanis_map[("geom", prof, round(ar_w, 4), round(b_w, 4), govde_no)] = kayit
-                if aday_no > 0:
-                    tirmanis_map[("id", aday_no)] = kayit
-        except Exception as exc:
-            print(f"UYARI: tirmanis_sonuclari.csv okunurken hata olustu ({exc}); yedek butce kullanilacak.")
-
-    return kalkis_map, tirmanis_map
+        maps.append(table)
+    return tuple(maps)
 
 
 def match_phase_record(phase_map, row_idx_1based, row):
-    """Aday satirini kalkis veya tirmanis tablosundaki kayitla eslestirir."""
-    if not phase_map:
-        return None
-    prof = str(row["kanat_airfoil"]).strip().lower()
-    ar_w = round(float(row["AR_w"]), 4)
-    b_w = round(float(row["b_w_m"]), 4)
-    govde_no = int(float(row["govde_aday_no"])) if pd.notna(row.get("govde_aday_no")) else -1
-
-    geom_key = ("geom", prof, ar_w, b_w, govde_no)
-    if geom_key in phase_map:
-        return phase_map[geom_key]
-    if ("id", row_idx_1based) in phase_map:
-        return phase_map[("id", row_idx_1based)]
-    return None
+    """Satir numarasi uyumluluk icin tutulur; kimlik olarak kullanilmaz."""
+    return phase_map.get(faz_anahtari(row))
 
 
 # ==============================================================================
@@ -457,34 +411,29 @@ def build_lookup_tables(itki_df, vsp_df, llt_df):
         except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
             vsp_lookup.errors.append(f"aday {aday_no}: {exc}")
 
-    # --- C. Itki Tablosu (V = 20 m/s Hiz Dilimi + Kisik Gaz Orijin Uzatmasi) ---
-    itki_20 = itki_df[(itki_df["pervane"].astype(str).str.strip() == PERVANE_SECIMI)
-                      & np.isclose(itki_df["hiz_m_s"], V_SEYIR)].sort_values("itki_n")
-    if itki_20.empty:
-        raise ValueError(f"Itki tablosunda {PERVANE_SECIMI}, {V_SEYIR} m/s verisi bulunamadi!")
-    numeric = itki_20[["itki_n", "gaz_yuzde", "akim_a"]].to_numpy(dtype=float)
-    if not np.isfinite(numeric).all() or (numeric[:, 0] <= 0).any() or (numeric[:, 2] < 0).any():
-        raise ValueError("Itki pozitif, akim negatif olmayan ve tum tablo degerleri sonlu olmali.")
-    if itki_20["itki_n"].duplicated().any():
-        raise ValueError("Ayni itki icin birden fazla kayit var; akim enterpolasyonu belirsiz.")
+    return llt_lookup, vsp_lookup, build_propeller_tables(itki_df)
 
-    # CSV akim_a sutunu amperdir. Mevcut dusuk gaz orijin varsayimi korunur.
-    # Guc yalniz sabit 24 V ile hesaplanir; akim gucten geri turetilmez.
-    itki_vals = np.insert(itki_20["itki_n"].values, 0, 0.0)
-    gaz_vals = np.insert(itki_20["gaz_yuzde"].values, 0, 0.0)
-    current_vals = np.insert(itki_20["akim_a"].to_numpy(dtype=float), 0, 0.0)
 
-    thrust_table_info = {
-        "pervane": str(itki_20["pervane"].iloc[0]),
-        "itki_n": itki_vals,
-        "gaz_yuzde": gaz_vals,
-        "current_a": current_vals,
-        "power_w": V_BAT_SABIT * current_vals,
-        "max_itki_n": float(itki_20["itki_n"].max()),
-        "min_tablo_itki_n": float(itki_20["itki_n"].min()),
-    }
-
-    return llt_lookup, vsp_lookup, thrust_table_info
+def build_propeller_tables(itki_df):
+    """Her pervane icin seyir hizinda ayri itki/gaz/elektriksel guc tablosu."""
+    rows = itki_df.to_dict("records")
+    tables = {}
+    for prop in sorted(itki_df["pervane"].astype(str).str.strip().unique()):
+        points, skipped = prop_at_speed(rows, prop, V_SEYIR, V_BAT_SABIT, "auto")
+        if not points:
+            raise ValueError(f"{prop}: {V_SEYIR} m/s hizini kapsayan veri yok.")
+        numeric = np.asarray([[p["itki"], p["gaz"], p["guc"]] for p in points], dtype=float)
+        if not np.isfinite(numeric).all() or (numeric < 0).any():
+            raise ValueError(f"{prop}: itki, gaz ve guc sonlu ve negatif olmayan olmali.")
+        if (np.diff(numeric[:, 0]) <= 0).any():
+            raise ValueError(f"{prop}: gaz arttikca itki artmiyor; ters enterpolasyon belirsiz.")
+        tables[prop] = {
+            "pervane": prop, "itki_n": numeric[:, 0], "gaz_yuzde": numeric[:, 1],
+            "power_w": numeric[:, 2], "current_a": numeric[:, 2] / V_BAT_SABIT,
+            "min_tablo_itki_n": float(numeric[0, 0]), "max_itki_n": float(numeric[-1, 0]),
+            "kapsanmayan_gaz_yuzdeleri": skipped,
+        }
+    return tables
 
 
 # ==============================================================================
@@ -779,16 +728,14 @@ def compute_waypoint_route_geometry(V_cruise, bank_angle_deg):
 
 
 def compute_electrical_power_and_current(T_req_N, thrust_info):
-    """Itki tablosundan I(A); sabit 24 V ile P(W)=V*I."""
+    """Adayin pervanesinden W enterpole et; A = W / ortak gerilim."""
     if not np.isfinite(T_req_N) or T_req_N < 0:
         raise ValueError("Gerekli itki sonlu ve negatif olmayan bir deger olmali.")
-    if T_req_N > thrust_info["max_itki_n"]:
+    if not thrust_info["min_tablo_itki_n"] <= T_req_N <= thrust_info["max_itki_n"]:
         return (np.nan,) * 4
     throttle_pct = float(np.interp(T_req_N, thrust_info["itki_n"], thrust_info["gaz_yuzde"]))
-    current_a = float(np.interp(T_req_N, thrust_info["itki_n"], thrust_info["current_a"]))
-    if not np.isfinite(current_a) or current_a < 0:
-        raise ValueError("Tablodan bulunan akim sonlu ve negatif olmayan bir deger olmali.")
-    return throttle_pct, current_a, V_BAT_SABIT, V_BAT_SABIT * current_a
+    power_w = float(np.interp(T_req_N, thrust_info["itki_n"], thrust_info["power_w"]))
+    return throttle_pct, power_w / V_BAT_SABIT, V_BAT_SABIT, power_w
 
 
 def load_tail_lookup(explicit=None):
@@ -916,7 +863,8 @@ def evaluate_cruise_phase(mass_kg, S_w, AR_w, CD_0, e_oswald, CL_alpha_deg, alph
 
     straight, turn = state(1.0), state(route_info["n_load_turn"])
     stall_ok = bool(straight["stall"] and turn["stall"])
-    thrust_ok = max(straight["thrust"], turn["thrust"]) <= thrust_info["max_itki_n"]
+    thrust_ok = (thrust_info["min_tablo_itki_n"] <= min(straight["thrust"], turn["thrust"])
+                 and max(straight["thrust"], turn["thrust"]) <= thrust_info["max_itki_n"])
     polar_ok = bool(straight["polar"] and turn["polar"])
     energy_ok = bool(stall_ok and thrust_ok and polar_ok
                      and np.isfinite([straight["current"], turn["current"]]).all())
@@ -964,9 +912,10 @@ def score_feasible_candidates(res_df):
 
 def run_full_cruise_mission_optimization(tail_csv_path=None):
     itki_df, vsp_df, llt_df, kutle_df = load_all_databases()
-    llt_lookup, vsp_lookup, thrust_info = build_lookup_tables(itki_df, vsp_df, llt_df)
+    llt_lookup, vsp_lookup, thrust_tables = build_lookup_tables(itki_df, vsp_df, llt_df)
+    kutle_df = pd.DataFrame(performans_adaylarini_hazirla(kutle_df.to_dict("records")))
     tail_lookup = load_tail_lookup(tail_csv_path)
-    kalkis_map, tirmanis_map = load_takeoff_and_climb_tables(PERVANE_SECIMI)
+    kalkis_map, tirmanis_map = load_takeoff_and_climb_tables()
 
     for label, table in (("LLT", llt_lookup), ("OpenVSP", vsp_lookup)):
         for error in table.errors:
@@ -979,6 +928,7 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
     for idx, row in kutle_df.iterrows():
         aday_sira_no = idx + 1
         try:
+            thrust_info = thrust_tables[row["pervane"]]
             validate_candidate(row)
             tail_data = tail_for_candidate(row, tail_lookup)
             profil = str(row["kanat_airfoil"]).strip()
@@ -1028,13 +978,14 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
             kalkis_wh = kalkis_rec["enerji_M2_Wh"] if kalkis_rec is not None else np.nan
             kalkis_sure_sn = kalkis_rec["sure_M2_s"] if kalkis_rec is not None else np.nan
             kalkis_mesafe_m = kalkis_rec["S_G_M2_m"] if kalkis_rec is not None else np.nan
-            kalkis_20m_ok = kalkis_rec["kalkis_20m_basarili"] if kalkis_rec is not None else True
+            kalkis_20m_ok = kalkis_rec["kalkis_20m_basarili"] if kalkis_rec is not None else False
+            kalkis_uygun_ok = kalkis_rec["kalkis_uygun"] if kalkis_rec is not None else False
             resmi_kalkis_puani_60 = kalkis_rec["resmi_kalkis_puani_60"] if kalkis_rec is not None else 0.0
 
             tirmanis_mah = tirmanis_rec["tuketim_mAh"] if tirmanis_rec is not None else np.nan
             tirmanis_wh = tirmanis_rec["enerji_Wh"] if tirmanis_rec is not None else np.nan
             tirmanis_sure_sn = tirmanis_rec["sure_s"] if tirmanis_rec is not None else np.nan
-            tirmanis_uygun_ok = tirmanis_rec["tirmanis_uygun"] if tirmanis_rec is not None else True
+            tirmanis_uygun_ok = tirmanis_rec["tirmanis_uygun"] if tirmanis_rec is not None else False
 
             gercek_faz_verisi_var = bool(np.isfinite(kalkis_mah) and np.isfinite(tirmanis_mah))
 
@@ -1087,7 +1038,7 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
                 and loaded_res["thrust_ok"]
                 and empty_res["thrust_ok"]
                 and loaded_res["energy_ok"] and empty_res["energy_ok"]
-                and tirmanis_uygun_ok
+                and gercek_faz_verisi_var and kalkis_uygun_ok and tirmanis_uygun_ok
                 and np.isfinite(ham_enerji_endeksi) and ham_enerji_endeksi > 0
                 and mission_time["sure_uygun"]
                 and (seyir_tuketim_mah <= aday_seyir_max_kullanilabilir_mah)
@@ -1098,6 +1049,10 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
                 for check, reason in (("stall_ok", "stall"), ("thrust_ok", "itki"), ("polar_ok", "lineer_aci_araligi")):
                     if not phase[check]:
                         reasons.append(f"{label}_{reason}")
+            if not gercek_faz_verisi_var:
+                reasons.append("faz_verisi_eksik")
+            if not kalkis_uygun_ok:
+                reasons.append("kalkis_uygun_degil")
             if not tirmanis_uygun_ok:
                 reasons.append("tirmanis_uygun_degil")
             if not mission_time["sure_uygun"]:
@@ -1108,6 +1063,7 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
                 reasons.append("gecersiz_enerji_endeksi")
 
             results.append({
+                **kimlik_alanlari(row),
                 "kombinasyon_no": aday_sira_no,
                 "kanat_aday_no": llt_data["kanat_aday_no"],
                 "govde_aday_no": int(row["govde_aday_no"]),
@@ -1209,7 +1165,8 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
                 + ("" if tail_data["reynolds_match"] else " CSV Reynolds degerleri seyirden farkli; katsayilar korundu."),
                 "gerilim_V": V_BAT_SABIT,
                 "hata_aciklamasi": "",
-                "dusuk_gaz_varsayimi": loaded_res["low_throttle_assumption"] or empty_res["low_throttle_assumption"],
+                "dusuk_gaz_varsayimi": False,
+                "dusuk_gaz_verisi_eksik": loaded_res["low_throttle_assumption"] or empty_res["low_throttle_assumption"],
                 "seyir_hizi_m_s": V_SEYIR,
                 "rho_kg_m3": RHO_HAVA,
                 "mu_pa_s": MU_HAVA,
@@ -1225,6 +1182,7 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
                     results[-1][f"alpha_HT_{label}_{suffix}_deg"] = phase[f"alpha_HT_{flight}_deg"]
         except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
             results.append({
+                **kimlik_alanlari(row),
                 "kombinasyon_no": aday_sira_no,
                 "kanat_airfoil": row.get("kanat_airfoil", ""),
                 "govde_aday_no": row.get("govde_aday_no", np.nan),
@@ -1250,7 +1208,7 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
     res_df = score_feasible_candidates(res_df)
 
     res_df.to_csv("seyir_optimizasyon_sonuclari.csv", index=False, encoding="utf-8-sig")
-    return res_df, route_info, thrust_info
+    return res_df, route_info, thrust_tables
 
 
 # ==============================================================================
