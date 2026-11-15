@@ -49,6 +49,7 @@ import numpy as np
 import pandas as pd
 from aday_pervane import GERILIM_V, faz_anahtari, kimlik_alanlari, performans_adaylarini_hazirla
 from tirmanis_hesabi import prop_at_speed
+from llt_csv_okuyucu import LLTTable
 
 # ==============================================================================
 # 1. SABITLER, BATARYA KISITLARI VE GOREV PARAMETRELERI
@@ -86,7 +87,7 @@ MAX_UCUS_SURESI_SN = 600.0  # Kalkistan inise TUM ucusun sure siniri (sn)
 NAVIGASYON_DISI_SURE_SN = 100.0  # Kullanicinin gecici butcesi: kalkis, tirmanis,
 # TOAL/rota gecisleri, yuk birakma yaklasmasi ve inis dahil.
 UCUS_SURE_EMNIYET_ORANI = 0.02  # 600 saniyenin %2'si = 12 sn; hedef toplam <= 588 sn.
-STALL_EMNIYET_ORANI = 0.85  # Kanat CL_max emniyet payi; CSV kuyruk stall siniri icermiyor
+STALL_EMNIYET_ORANI = 0.85  # Kanat CL_max emniyet payi; kuyruk CL_max CSVden ayrica denetlenir
 KUYRUK_OTURMA_DEG = 0.0  # Kanat referansina gore; downwash ve trim cozulmez
 GEOMETRI_RTOL = 1e-4  # CSV yazim hassasiyeti icin; sekil varsayimi eklenmez
 GEOMETRI_ATOL = 6e-6
@@ -117,10 +118,10 @@ def find_csv_file(filename, required=True):
     return None
 
 
-def load_all_databases():
+def load_all_databases(llt_csv_path=None):
     itki_path = find_csv_file("itki_tablosu.csv")
     vsp_path = find_csv_file("openvsp_llt_flapsiz_polar_detay.csv")
-    llt_path = find_csv_file("llt_flapsiz_tum_sonuclar.csv", required=False)
+    llt_path = str(llt_csv_path) if llt_csv_path is not None else find_csv_file("llt_flapsiz_aday_re.csv")
     kutle_path = find_csv_file("kanat_kuyruk_govde_kutleli.csv")
 
     itki_df = pd.read_csv(itki_path, sep=";")
@@ -289,92 +290,11 @@ def match_geometry(table, key, context, wet_area=None, candidate=None):
 
 def build_lookup_tables(itki_df, vsp_df, llt_df):
     from drag_hesabi import hesapla_openvsp_cd0
-    import lifting_line_cozucu as llt_mod
-    from lifting_line_cozucu import LINEER_ALPHA_MIN, LINEER_ALPHA_MAX
     if vsp_df.empty:
         raise ValueError("OpenVSP tablosu bos olamaz.")
 
-    # --- A. LLT Coklu Reynolds Enterpolasyonu (V = 20 m/s icin) ---
-    llt_lookup = LookupTable()
-    if not llt_df.empty and "Re_polar" in llt_df.columns:
-        for aday_no, grp in llt_df.groupby("aday_no", dropna=False):
-            try:
-                if not np.isfinite(float(aday_no)) or float(aday_no) != int(aday_no):
-                    raise ValueError("LLT aday kimligi eksik/gecersiz.")
-                context = f"LLT aday {aday_no}"
-                prof_col = "profil" if "profil" in grp.columns else "kanat_airfoil"
-                key = geometry_key(unique_value(grp, prof_col, context, numeric=False),
-                                   unique_value(grp, "AR_w", context),
-                                   unique_value(grp, "b_w_m", context))
-                chord = unique_value(grp, "c_w_m", context)
-                if "S_w_m2" in grp:
-                    area = unique_value(grp, "S_w_m2", context)
-                    if not np.isclose(key[1], key[2] ** 2 / area, rtol=GEOMETRI_RTOL, atol=GEOMETRI_ATOL):
-                        raise ValueError(f"{context}: AR, aciklik ve alan tutarsiz.")
-                if min(chord, V_SEYIR, RHO_HAVA, MU_HAVA) <= 0:
-                    raise ValueError(f"{context}: veter ve akis kosullari pozitif olmali.")
-                re_20 = RHO_HAVA * V_SEYIR * chord / MU_HAVA
-                polar_columns = ["CL_alpha_3d_per_deg", "alpha_L0_deg", "e_oswald",
-                                 "CL_max_3d_tahmini"]
-                if not np.isfinite(grp[["Re_polar"] + polar_columns].to_numpy(dtype=float)).all():
-                    raise ValueError(f"{context}: polar tablosunda eksik/sonlu olmayan deger var.")
-                if (grp["Re_polar"] <= 0).any():
-                    raise ValueError(f"{context}: Re_polar pozitif olmali.")
-                polar_rows = []
-                for reynolds, same_re in grp.groupby("Re_polar", sort=True):
-                    polar_rows.append([float(reynolds)] + [unique_value(same_re, c, context) for c in polar_columns])
-                polars = np.asarray(polar_rows, dtype=float)
-                re_polars = polars[:, 0]
-                tolerance = 1e-9 * max(abs(re_20), abs(re_polars[-1]), 1.0)
-                if re_20 < re_polars[0] - tolerance or re_20 > re_polars[-1] + tolerance:
-                    raise ValueError(f"{context}: hedef Re={re_20:.1f}, veri araligi "
-                                     f"[{re_polars[0]:.1f}, {re_polars[-1]:.1f}] disinda. "
-                                     "Bu Reynolds araligi icin polar verisi ekleyin.")
-                values = [float(np.interp(re_20, re_polars, polars[:, j + 1])) for j in range(len(polar_columns))]
-                cl_alpha, alpha_10, e_oswald, cl_max_3d = values
-                if min(cl_alpha, e_oswald, cl_max_3d) <= 0:
-                    raise ValueError(f"{context}: tasima egimi, e ve CL_max pozitif olmali.")
-                add_lookup_record(llt_lookup, key, {
-                    "kanat_aday_no": int(aday_no),
-                    "Re_20": re_20,
-                    "c_w_m": chord,
-                    "S_w_m2": key[2] ** 2 / key[1],
-                    "CL_alpha_3d_per_deg": cl_alpha,
-                    "alpha_L0_deg": alpha_10,
-                    "e_oswald": e_oswald,
-                    "CL_max_3d": cl_max_3d,
-                    "alpha_min_deg": float(LINEER_ALPHA_MIN),
-                    "alpha_max_deg": float(LINEER_ALPHA_MAX),
-                })
-            except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
-                llt_lookup.errors.append(f"aday {aday_no}: {exc}")
-    else:
-        # llt_flapsiz_tum_sonuclar.csv yoksa veya farkli formattaysa dogrudan LLT cozucu motorundan 20 m/s'de coz
-        flapsiz_indeks = llt_mod.polar_klasorunu_indeksle(llt_mod.POLAR_KLASORU)
-        for aday_no, grp in vsp_df.groupby("aday_no", dropna=False):
-            try:
-                context = f"LLT bellek-ici aday {aday_no}"
-                prof_adi = unique_value(grp, "kanat_airfoil", context, numeric=False)
-                ar_w = unique_value(grp, "AR_w", context)
-                b_w = unique_value(grp, "b_w_m", context)
-                chord = unique_value(grp, "c_w_m", context)
-                key = geometry_key(prof_adi, ar_w, b_w)
-                re_20 = RHO_HAVA * V_SEYIR * chord / MU_HAVA
-                cozum = llt_mod.flapsiz_kanat_coz_re(prof_adi, ar_w, re_20, flapsiz_indeks)
-                add_lookup_record(llt_lookup, key, {
-                    "kanat_aday_no": int(aday_no),
-                    "Re_20": re_20,
-                    "c_w_m": chord,
-                    "S_w_m2": b_w ** 2 / ar_w,
-                    "CL_alpha_3d_per_deg": float(cozum["CL_alpha_3d_per_deg"]),
-                    "alpha_L0_deg": float(cozum["alpha_L0_deg"]),
-                    "e_oswald": float(cozum["e_oswald"]),
-                    "CL_max_3d": float(cozum["CL_max_3d_tahmini"]),
-                    "alpha_min_deg": float(LINEER_ALPHA_MIN),
-                    "alpha_max_deg": float(LINEER_ALPHA_MAX),
-                })
-            except Exception as exc:
-                llt_lookup.errors.append(f"aday {aday_no}: {exc}")
+    # Aday-Re CSV: kanat/kuyruk katsayilari aynen korunur, polar yeniden cozulmez.
+    llt_lookup = LLTTable(llt_df.to_dict('records'),source='llt_flapsiz_aday_re.csv')
 
     # --- B. OpenVSP CD0 Tablosu: tum kimlikleri tara, 20 m/s hizda dinamik CD0 hesapla ---
     vsp_lookup = LookupTable()
@@ -739,58 +659,19 @@ def compute_electrical_power_and_current(T_req_N, thrust_info):
 
 
 def load_tail_lookup(explicit=None):
-    """Hazir aday-Re LLT tablosu; kuyruk polari yeniden cozulmez."""
-    path = Path(explicit) if explicit is not None else Path(find_csv_file("llt_flapsiz_aday_re.csv"))
-    table = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
-    required = {"aday_no", "profil", "b_w_m", "AR_w", "S_w_m2", "c_w_m",
-                "c_HT_m", "S_HT_m2", "Re_HT", "CL_alpha_HT_per_deg", "e_HT",
-                "c_VT_m", "S_VT_m2", "Re_VT", "CL_alpha_VT_per_deg", "e_VT"}
-    missing = required - set(table.columns)
-    if missing:
-        raise ValueError(f"Kuyruk LLT tablosunda eksik sutunlar: {', '.join(sorted(missing))}")
-    if table.empty:
-        raise ValueError("Kuyruk LLT tablosu bos olamaz.")
-    table["profil"] = table["profil"].fillna("").astype(str).str.strip().str.lower()
-    for column in required - {"profil"}:
-        # Hatali bir satir diger adaylarin okunmasini engellemez.
-        table[column] = pd.to_numeric(table[column], errors="coerce")
-    return table
+    path = Path(explicit) if explicit is not None else Path(find_csv_file('llt_flapsiz_aday_re.csv'))
+    return LLTTable.read(path)
 
 
-def tail_for_candidate(row, table):
-    """Kanat ve kuyruk geometrisiyle eslestir; HT katsayilarini CSV'den al."""
-    profile = re.sub(r"[^a-z0-9]", "", str(row["kuyruk_airfoil"]).lower())
-    if profile != "naca0010":
-        raise ValueError("Kuyruk sifir-tasima acisi kabulu NACA0010 icindir; baska profil icin gecerli degildir.")
-    mask = table["profil"].eq(str(row["kanat_airfoil"]).strip().lower()).to_numpy(copy=True)
-    fields = {"b_w_m": "b_w_m", "AR_w": "AR_w", "S_w_m2": "S_w_m2",
-              "c_w_m": "c_root_w_m", "c_HT_m": "c_root_HT_m", "S_HT_m2": "S_HT_m2",
-              "c_VT_m": "c_root_VT_m", "S_VT_m2": "S_VT_m2"}
-    for reference, candidate in fields.items():
-        mask &= np.isclose(table[reference].to_numpy(dtype=float), float(row[candidate]),
-                           rtol=GEOMETRI_RTOL, atol=GEOMETRI_ATOL)
-    matched = table.loc[mask]
-    if matched.empty:
-        raise ValueError("llt_flapsiz_aday_re.csv icinde ayni kanat/kuyruk geometrisi bulunamadi.")
-    context = "Kuyruk LLT eslesmesi"
-    values = {key: unique_value(matched, key, context) for key in
-              ("CL_alpha_HT_per_deg", "e_HT", "Re_HT", "CL_alpha_VT_per_deg", "e_VT", "Re_VT")}
-    if min(values.values()) <= 0:
-        raise ValueError("Kuyruk tasima egimleri, e ve Reynolds degerleri pozitif olmali.")
-    reference_ar = unique_value(matched, "S_HT_m2", context) / unique_value(matched, "c_HT_m", context)**2
-    if not np.isclose(reference_ar, float(row["AR_HT"]), rtol=GEOMETRI_RTOL, atol=GEOMETRI_ATOL):
-        raise ValueError("Dikdortgen kuyruk icin CSV alan/veter orani aday AR_HT ile uyusmuyor.")
-    target_ht = RHO_HAVA * V_SEYIR * float(row["c_root_HT_m"]) / MU_HAVA
-    target_vt = RHO_HAVA * V_SEYIR * float(row["c_root_VT_m"]) / MU_HAVA
-    re_ok = bool(np.isclose(values["Re_HT"], target_ht, rtol=1e-3, atol=1.)
-                 and np.isclose(values["Re_VT"], target_vt, rtol=1e-3, atol=1.))
-    return dict(slope=values["CL_alpha_HT_per_deg"], e=values["e_HT"],
-                Re=values["Re_HT"], Re_target=target_ht,
-                Re_VT=values["Re_VT"], Re_VT_target=target_vt,
-                slope_VT=values["CL_alpha_VT_per_deg"], e_VT=values["e_VT"],
-                AR=float(row["AR_HT"]), S=float(row["S_HT_m2"]),
-                alpha_min=-4.0, alpha_max=6.0, reynolds_match=re_ok,
-                stall_verified=False, source="llt_flapsiz_aday_re.csv")
+def tail_for_candidate(row, table, strict_re=False):
+    _, tail, meta, record = table.values_for(row,V_SEYIR,RHO_HAVA,MU_HAVA,strict_re)
+    return dict(slope=tail['slope'],e=tail['e'],cl_max=tail['cl_max'],
+                Re=float(record['Re_HT']),Re_target=meta['llt_Re_HT_ucus'],
+                Re_VT=float(record['Re_VT']),Re_VT_target=meta['llt_Re_VT_ucus'],
+                slope_VT=float(record['CL_alpha_VT_per_deg']),e_VT=float(record['e_VT']),
+                AR=float(row['AR_HT']),S=float(row['S_HT_m2']),
+                alpha_min=max(-4.,tail['alpha_min']),alpha_max=min(6.,tail['alpha_max']),
+                reynolds_match=meta['llt_Re_uyumlu'],stall_verified=True,source=table.source)
 
 
 def validate_candidate(row):
@@ -852,7 +733,8 @@ def evaluate_cruise_phase(mass_kg, S_w, AR_w, CD_0, e_oswald, CL_alpha_deg, alph
         cd = CD_0 + cdiw + cdih
         thrust = q * S_w * cd
         throttle, current, voltage, power = compute_electrical_power_and_current(thrust, thrust_info)
-        stall = 0 <= clw <= STALL_EMNIYET_ORANI * CL_max_3d
+        stall = (0 <= clw <= STALL_EMNIYET_ORANI * CL_max_3d
+                 and abs(clh) <= tail_data["cl_max"])
         polar = (alpha_min_deg <= alpha <= alpha_max_deg
                  and tail_data["alpha_min"] <= alpha_tail <= tail_data["alpha_max"])
         return dict(CL=required, CL_w=clw, CL_HT=clh, CD=cd, CDi_w=cdiw, CDi_HT=cdih,
@@ -910,11 +792,12 @@ def score_feasible_candidates(res_df):
     return res_df
 
 
-def run_full_cruise_mission_optimization(tail_csv_path=None):
-    itki_df, vsp_df, llt_df, kutle_df = load_all_databases()
+def run_full_cruise_mission_optimization(tail_csv_path=None, llt_csv_path=None, strict_re=False, output_path=None):
+    itki_df, vsp_df, llt_df, kutle_df = load_all_databases(llt_csv_path)
     llt_lookup, vsp_lookup, thrust_tables = build_lookup_tables(itki_df, vsp_df, llt_df)
     kutle_df = pd.DataFrame(performans_adaylarini_hazirla(kutle_df.to_dict("records")))
-    tail_lookup = load_tail_lookup(tail_csv_path)
+    llt_lookup.source = str(Path(llt_csv_path or find_csv_file("llt_flapsiz_aday_re.csv")).resolve())
+    tail_lookup = load_tail_lookup(tail_csv_path) if tail_csv_path else llt_lookup
     kalkis_map, tirmanis_map = load_takeoff_and_climb_tables()
 
     for label, table in (("LLT", llt_lookup), ("OpenVSP", vsp_lookup)):
@@ -930,14 +813,20 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
         try:
             thrust_info = thrust_tables[row["pervane"]]
             validate_candidate(row)
-            tail_data = tail_for_candidate(row, tail_lookup)
+            tail_data = tail_for_candidate(row, tail_lookup, strict_re)
             profil = str(row["kanat_airfoil"]).strip()
             ar_w = float(row["AR_w"])
             b_w = float(row["b_w_m"])
             S_w = float(row["S_w_m2"])
             key = geometry_key(profil, row["AR_w"], row["b_w_m"])
 
-            llt_data = match_geometry(llt_lookup, key, f"Kutle satiri {aday_sira_no}, LLT")
+            wing, _, llt_meta, llt_row = llt_lookup.values_for(row,V_SEYIR,RHO_HAVA,MU_HAVA,strict_re)
+            llt_data = dict(kanat_aday_no=int(float(llt_row['aday_no'])),
+                            S_w_m2=float(llt_row['S_w_m2']),c_w_m=float(llt_row['c_w_m']),
+                            e_oswald=wing['e'],CL_alpha_3d_per_deg=wing['slope'],
+                            alpha_L0_deg=wing['alpha_L0'],CL_max_3d=wing['cl_max'],
+                            alpha_min_deg=max(-4.,min(wing['curve'])),
+                            alpha_max_deg=min(6.,wing['stall'],max(wing['curve'])))
             vsp_data = match_geometry(vsp_lookup, key, f"Kutle satiri {aday_sira_no}, OpenVSP",
                                       wet_area=float(row["govde_S_toplam_m2"]), candidate=row)
 
@@ -1065,6 +954,7 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
             results.append({
                 **kimlik_alanlari(row),
                 "kombinasyon_no": aday_sira_no,
+                **llt_meta,
                 "kanat_aday_no": llt_data["kanat_aday_no"],
                 "govde_aday_no": int(row["govde_aday_no"]),
                 "kanat_airfoil": profil,
@@ -1161,7 +1051,8 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
                 "kuyruk_Re_uyumlu": tail_data["reynolds_match"],
                 "kuyruk_stall_dogrulandi": tail_data["stall_verified"],
                 "kuyruk_lineer_araligi_varsayim": True,
-                "kuyruk_model_notu": "CSV kuyruk stall siniri icermiyor; dogrusal aralik -4..6 derece kabuludur."
+                "CL_max_HT": tail_data["cl_max"],
+                "kuyruk_model_notu": "CL_max_HT ve stall siniri CSVden; negatif CL icin simetrik profil varsayimi."
                 + ("" if tail_data["reynolds_match"] else " CSV Reynolds degerleri seyirden farkli; katsayilar korundu."),
                 "gerilim_V": V_BAT_SABIT,
                 "hata_aciklamasi": "",
@@ -1197,7 +1088,7 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
         raise ValueError("Değerlendirilecek aday yok: kütle tablosunu ve veri eşleşmelerini kontrol edin.")
     res_df = pd.DataFrame(results)
     print("Kuyruk: llt_flapsiz_aday_re.csv katsayıları doğrudan kullanıldı. "
-          "Dosyada kuyruk CL_max bulunmadığından kuyruk stall doğrulanmadı; uygunluk ön model kapsamındadır.")
+          "Kuyruk CL_max ve stall sınırı CSVden alındı; uygunluk CSV koşulundaki model kapsamındadır.")
     if "kuyruk_Re_uyumlu" in res_df:
         mismatch = res_df["kuyruk_Re_uyumlu"].eq(False).sum()
         if mismatch:
@@ -1207,7 +1098,7 @@ def run_full_cruise_mission_optimization(tail_csv_path=None):
     # --- BAĞIL ENERJİ PUANI HESABI (1. Sıradaki Aday = 60 Puan) ---
     res_df = score_feasible_candidates(res_df)
 
-    res_df.to_csv("seyir_optimizasyon_sonuclari.csv", index=False, encoding="utf-8-sig")
+    res_df.to_csv(output_path or "seyir_optimizasyon_sonuclari.csv", index=False, encoding="utf-8-sig")
     return res_df, route_info, thrust_tables
 
 
@@ -1367,9 +1258,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--rota", action="store_true", help="CSV veritabanları olmadan örnek rotayı göster")
     parser.add_argument("--kuyruk-llt", type=Path, help="Kuyruk katsayıları: llt_flapsiz_aday_re.csv")
+    parser.add_argument('--llt',type=Path,help='Kanat/kuyruk aday-Re LLT CSV dosyasi')
+    parser.add_argument('--llt-re-kontrol',action='store_true',help='CSV/ucus Re farkinda adayi reddet')
+    parser.add_argument('--grafik-yok',action='store_true',help='Yalniz sonuc CSV dosyasini uret')
+    parser.add_argument('--cikti',type=Path,default=Path('seyir_optimizasyon_sonuclari.csv'))
     args = parser.parse_args()
     if args.rota:
         preview_route_only()
     else:
-        res_df, route_info, thrust_info = run_full_cruise_mission_optimization(args.kuyruk_llt)
-        plot_mission_and_route_summary(res_df, route_info)
+        res_df, route_info, thrust_info = run_full_cruise_mission_optimization(args.kuyruk_llt,args.llt,args.llt_re_kontrol,args.cikti)
+        if not args.grafik_yok:
+            plot_mission_and_route_summary(res_df, route_info)

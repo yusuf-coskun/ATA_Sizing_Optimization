@@ -1,7 +1,8 @@
 """Flapsiz adaylar icin sabit hizli tirmanis ve batarya tuketimi.
 
 Python 3.10+, yalniz standart kutuphane. Ornek: python tirmanis_hesabi.py
-Varsayilanlar: Vx=15, Vz=4 m/s, dh=50 m, U=24 V; pervane aday satirindan.
+Varsayilanlar: Vx=15, Vz=4 m/s, dh=50 m; gerilim ortak ayardan, pervane aday satirindan.
+Kanat ve kuyruk katsayilari llt_flapsiz_aday_re.csv dosyasindan alinir.
 Trim/downwash yok; i_HT=0, NACA0010 icin alpha_L0_HT=0.
 Itki tablosunda guc_w/power_w watt, akim_a amperdir; auto modu sutuna gore okur.
 """
@@ -11,12 +12,12 @@ import argparse
 import bisect
 import csv
 import math
-import re
 import sys
-from functools import lru_cache
 from pathlib import Path
 from aday_pervane import (GERILIM_V, elektrik_gucu, kimlik_alanlari,
                          performans_adaylarini_hazirla)
+
+from llt_csv_okuyucu import LLTTable, LLTError
 
 ROOT = Path(__file__).resolve().parent
 
@@ -72,142 +73,6 @@ def lerp(a: float, b: float, t: float) -> float:
 def interp_curve(curve: dict[float, float], alpha: float) -> float:
     lo, hi, t = bracket(curve, alpha, 'Hucum acisi')
     return lerp(curve[lo], curve[hi], t)
-
-
-def index_wing(rows: list[dict]) -> dict:
-    result = {}
-    for row in rows:
-        key = wing_key(row)
-        reynolds = number(row, 'Re_polar', True)
-        alpha = number(row, 'alpha_deg')
-        group = result.setdefault(key, {}).setdefault(reynolds, {'curve': {}, 'row': row})
-        cl = number(row, 'CL')
-        if alpha in group['curve'] and abs(group['curve'][alpha] - cl) > 1e-9:
-            raise ValueError(f'Celisen LLT satirlari: {key}, Re={reynolds}, alpha={alpha}')
-        group['curve'][alpha] = cl
-    return result
-
-
-def wing_at_re(re_map: dict, target: float) -> dict:
-    lo, hi, f = bracket(re_map, target, 'Kanat Reynolds')
-    a, b = re_map[lo], re_map[hi]
-    left = max(min(a['curve']), min(b['curve']))
-    right = min(max(a['curve']), max(b['curve']))
-    angles = sorted({x for x in set(a['curve']) | set(b['curve']) if left <= x <= right})
-    if len(angles) < 2:
-        raise ModelError('veri_hatasi', 'Ortak LLT aci araligi yok.')
-    curve = {x: lerp(interp_curve(a['curve'], x), interp_curve(b['curve'], x), f) for x in angles}
-    def field(name):
-        return lerp(number(a['row'], name), number(b['row'], name), f)
-    return {'curve': curve, 'e': field('e_oswald'),
-            'cl_max': field('CL_max_3d_tahmini'),
-            'stall': field('alpha_stall_2d_deg'), 'Re_lo': lo, 'Re_hi': hi}
-
-
-def linear_slope(points: dict[float, float]) -> float:
-    # Mevcut lifting_line_cozucu.py ile ayni -4..6 derece fit araligi.
-    pairs = [(math.radians(a), cl) for a, cl in sorted(points.items()) if -4 <= a <= 6]
-    if len(pairs) < 3:
-        raise ModelError('veri_hatasi', 'Kuyruk polarinda -4..6 derece araliginda en az 3 nokta gerekli.')
-    xm = sum(x for x, y in pairs) / len(pairs)
-    ym = sum(y for x, y in pairs) / len(pairs)
-    slope = sum((x-xm)*(y-ym) for x, y in pairs) / sum((x-xm)**2 for x, y in pairs)
-    if slope <= 0:
-        raise ModelError('veri_hatasi', 'Kuyruk 2B tasima egimi pozitif olmali.')
-    return slope
-
-
-def solve_linear(matrix: list[list[float]], rhs: list[float]) -> list[float]:
-    # Kismi pivotlamali Gauss eliminasyonu; 25x25 LLT icin NumPy gerektirmez.
-    n = len(rhs)
-    a = [list(row) + [val] for row, val in zip(matrix, rhs)]
-    for k in range(n):
-        pivot = max(range(k, n), key=lambda j: abs(a[j][k]))
-        a[k], a[pivot] = a[pivot], a[k]
-        if abs(a[k][k]) < 1e-14:
-            raise ModelError('veri_hatasi', 'LLT matrisi tekil.')
-        for i in range(k+1, n):
-            factor = a[i][k] / a[k][k]
-            a[i][k] = 0.0
-            for j in range(k+1, n+1):
-                a[i][j] -= factor * a[k][j]
-    x = [0.0] * n
-    for i in reversed(range(n)):
-        x[i] = (a[i][n] - sum(a[i][j]*x[j] for j in range(i+1, n))) / a[i][i]
-    return x
-
-
-@lru_cache(maxsize=512)
-def llt_rectangular(ar: float, a0_rad: float, terms: int = 25) -> tuple[float, float]:
-    odd = [2*j+1 for j in range(terms)]
-    theta = [(i+1)*math.pi/(2*terms) for i in range(terms)]
-    matrix = [[math.sin(t*n)*(4*ar/a0_rad + n/math.sin(t)) for n in odd] for t in theta]
-    coef = solve_linear(matrix, [1.0]*terms)
-    slope_per_deg = math.pi*ar*coef[0]*math.pi/180
-    e = 1/(1+sum(n*(an/coef[0])**2 for n, an in zip(odd[1:], coef[1:])))
-    return slope_per_deg, e
-
-
-def read_tail(path: Path) -> dict[float, dict[float, float]]:
-    polars = {}
-    if path.is_file() and path.suffix.lower() == '.csv':
-        for row in read_csv(path):
-            re_val, alpha = number(row, 'Re', True), number(row, 'alpha_deg')
-            cl = number(row, 'CL_2d')
-            curve = polars.setdefault(re_val, {})
-            if alpha in curve and abs(curve[alpha]-cl) > 1e-9:
-                raise ValueError(f'Celisen kuyruk verisi: Re={re_val}, alpha={alpha}')
-            curve[alpha] = cl
-    else:
-        files = sorted(p for p in path.rglob('*') if p.is_file()) if path.is_dir() else [path]
-        for file in files:
-            text = file.read_text(encoding='utf-8-sig', errors='replace')
-            for block in re.split(r'(?=Calculated polar for:)', text):
-                header = re.search(r'Calculated polar for:\s*([^\r\n]+)', block)
-                if not header or 'naca0010' not in re.sub(r'[^a-z0-9]', '', header[1].lower()):
-                    continue
-                match = re.search(r'\bRe\s*=\s*([\d.]+)\s*[eE]\s*([+-]?\d+)', block)
-                if not match:
-                    continue
-                re_val = float(match[1])*10**int(match[2])
-                curve = polars.setdefault(re_val, {})
-                started = False
-                for line in block.splitlines():
-                    if '------' in line:
-                        started = True
-                        continue
-                    parts = line.split()
-                    if not started or len(parts) < 7:
-                        continue
-                    try:
-                        alpha, cl = float(parts[0]), float(parts[1])
-                    except ValueError:
-                        continue
-                    if not math.isfinite(alpha) or not math.isfinite(cl):
-                        raise ValueError(f'Sonlu olmayan polar verisi: {file}')
-                    if alpha in curve and abs(curve[alpha]-cl) > 1e-9:
-                        raise ValueError(f'Celisen polar: {file}, Re={re_val}, alpha={alpha}')
-                    curve[alpha] = cl
-    if not polars:
-        raise ValueError(f'NACA0010 polari bulunamadi: {path}')
-    return polars
-
-
-def tail_at_re(polars: dict, target: float, ar: float) -> dict:
-    lo, hi, f = bracket(polars, target, 'Kuyruk Reynolds')
-    def at(re_val):
-        points = polars[re_val]
-        slope, e = llt_rectangular(ar, linear_slope(points))
-        stall = max(points, key=points.get)
-        return {'slope': slope, 'e': e, 'stall': stall,
-                'cl_max': min(slope*stall, points[stall]),
-                'alpha_min': min(points), 'alpha_max': max(points)}
-    a, b = at(lo), at(hi)
-    result = {key: lerp(a[key], b[key], f) for key in a}
-    result['alpha_min'] = max(a['alpha_min'], b['alpha_min'])
-    result['alpha_max'] = min(a['alpha_max'], b['alpha_max'])
-    result.update(Re_lo=lo, Re_hi=hi)
-    return result
 
 
 def find_drag(mass: dict, rows: list[dict]) -> dict:
@@ -334,7 +199,7 @@ def required_power(points: list[dict], thrust: float) -> dict:
             'itki_veri_yontemi':'|'.join(sorted({a['yontem'],b['yontem']}))}
 
 
-def calculate(mass_rows, wing_index, drag_rows, tail_polars, prop_rows, args):
+def calculate(mass_rows, wing_index, drag_rows, prop_rows, args):
     mass_rows = performans_adaylarini_hazirla(mass_rows, args.pervane)
     velocity = math.hypot(args.vx,args.vz)
     gamma = math.atan2(args.vz,args.vx)
@@ -369,10 +234,9 @@ def calculate(mass_rows, wing_index, drag_rows, tail_polars, prop_rows, args):
             drag = find_drag(mass,drag_index.get(key,[]))
             cd0 = calc_cd0(mass,drag,velocity,args.rho,args.mu)
             out.update(cd0)
-            if key not in wing_index:
-                raise ModelError('llt_bulunamadi',str(key))
-            wing = wing_at_re(wing_index[key],out['Re_w'])
-            tail = tail_at_re(tail_polars,out['Re_HT'],arh)
+            wing, tail, llt_meta, _ = wing_index.values_for(
+                mass, velocity, args.rho, args.mu, getattr(args,'llt_re_kontrol',False))
+            out.update(llt_meta)
             required = weight*math.cos(gamma)/(dynamic*sw)
             out.update(CL_gerekli=required,e_w=wing['e'],e_HT=tail['e'],
                        CL_alpha_HT_per_deg=tail['slope'],CL_max_w=wing['cl_max'],CL_max_HT=tail['cl_max'],
@@ -405,7 +269,7 @@ def calculate(mass_rows, wing_index, drag_rows, tail_polars, prop_rows, args):
             out.update(enerji_J=power*duration,enerji_Wh=power*duration/3600,
                        esdeger_akim_A=power/args.gerilim,
                        tuketim_mAh=1000*power*duration/(3600*args.gerilim),durum='uygun')
-        except ModelError as exc:
+        except (ModelError, LLTError) as exc:
             out['durum'],out['aciklama'] = exc.status,str(exc)
         output.append(out)
     return output
@@ -428,7 +292,7 @@ def resolve_input(explicit, names):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
-    for flag in ('kutle','llt','drag','kuyruk-polar','itki'):
+    for flag in ('kutle','llt','drag','itki'):
         parser.add_argument('--'+flag,type=Path)
     parser.add_argument('--cikti',type=Path,default=ROOT/'tirmanis_sonuclari.csv')
     for flag,default in [('vx',15.0),('vz',4.0),('irtifa',50.0),('gerilim',GERILIM_V),
@@ -437,6 +301,7 @@ def main(argv=None):
     parser.add_argument('--pervane',help='Yalniz pervane alani bos eski adaylar icin acik varsayilan.')
     parser.add_argument('--tablo-degeri',choices=['auto','guc_w','akim_a'],default='auto',
                         help='auto: guc_w/power_w varsa W, yoksa akim_a * gerilim.')
+    parser.add_argument('--llt-re-kontrol',action='store_true',help='CSV ve ucus Re farkliysa adayi reddet.')
     args = parser.parse_args(argv)
     for name in ('vx','vz','irtifa','gerilim','rho','mu','g'):
         val = getattr(args,name)
@@ -446,11 +311,10 @@ def main(argv=None):
         parser.error('kuyruk-oturma sonlu olmali.')
     try:
         masses = read_csv(resolve_input(args.kutle,['kanat_kuyruk_govde_kutleli.csv']))
-        wings = index_wing(read_csv(resolve_input(args.llt,['llt_flapsiz_tum_sonuclar.csv'])))
+        wings = LLTTable.read(resolve_input(args.llt,['llt_flapsiz_aday_re.csv']))
         drag = read_csv(resolve_input(args.drag,['openvsp_llt_flapsiz_aday_ozet.csv','openvsp_llt_flapsiz_polar_detay.csv']))
-        tail = read_tail(resolve_input(args.kuyruk_polar,['naca0010_polarlari.csv','airfoils_polar']))
         props = read_csv(resolve_input(args.itki,['itki_tablosu.csv']))
-        output = calculate(masses,wings,drag,tail,props,args)
+        output = calculate(masses,wings,drag,props,args)
         fields = list(dict.fromkeys(key for row in output for key in row))
         args.cikti.parent.mkdir(parents=True,exist_ok=True)
         with args.cikti.open('w',encoding='utf-8-sig',newline='') as stream:
