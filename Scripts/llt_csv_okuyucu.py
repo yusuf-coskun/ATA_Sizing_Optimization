@@ -1,7 +1,6 @@
-"""Aday-Re LLT CSV okuyucusu. Katsayilari yeniden cozmez/duzeltmez.
-
-Tek Re kosulundaki CSV baska ucus hizinda kullanilirsa sabit katsayi
-varsayimi acikca raporlanir. strict_re=True bu kullanimi reddeder.
+"""Geometri/Re/alpha tabanli LLT CSV okuyucusu. Alt sinir kabulleri raporlanir.
+Flapli kanat Re<200000 ise 200000 satiri kullanilir; flapsiz alt sinir reddedilir.
+strict_re=True alt sinir kabullerini reddeder; aralik ici interpolasyona izin verir.
 """
 from __future__ import annotations
 import csv
@@ -42,32 +41,40 @@ class LLTTable:
         groups = {}
         for row in rows:
             key = (profile(row),) + tuple(round(num(row,k),9) for k in GEOMETRY)
-            if not key[0]:
-                raise LLTError('LLT CSV: profil adi eksik.')
+            if not key[0]: raise LLTError('LLT CSV: profil adi eksik.')
             if flapped:
-                key += (str(row.get('flap_airfoil','')).strip().lower(), round(num(row,'b_flap_m'),9))
-            constants = {k:num(row,k) for k in CONSTANTS}
-            for k in ('Re_aday','e_oswald','CL_alpha_3d_per_deg','CL_max_3d_tahmini',
-                      'Re_HT','CL_alpha_HT_per_deg','e_HT','CL_max_HT','Re_VT','CL_alpha_VT_per_deg','e_VT'):
-                if constants[k] <= 0:
+                key += (str(row.get('flap_airfoil','')).strip().lower(),round(num(row,'b_flap_m'),9))
+            v = {k:num(row,k) for k in CONSTANTS}
+            for k in CONSTANTS:
+                if k not in ('alpha_L0_deg','alpha_stall_2d_deg','alpha_stall_HT_deg') and v[k]<=0:
                     raise LLTError(f'LLT CSV: {k} pozitif olmali.')
-            if key not in groups:
-                groups[key] = {'row':dict(row), 'values':constants, 'curve':{}}
-            group = groups[key]
-            for field,value in constants.items():
-                if not math.isclose(value, group['values'][field], rel_tol=1e-9, abs_tol=1e-10):
-                    raise LLTError(f'LLT CSV: ayni geometride celisen {field}; aday-Re dosyasi tek kosul icermeli.')
-            angle, cl = num(row,'alpha_deg'), num(row,'CL')
-            if angle in group['curve'] and not math.isclose(cl,group['curve'][angle],rel_tol=1e-9,abs_tol=1e-10):
-                raise LLTError(f'LLT CSV: ayni geometri/acida celisen CL: {key[0]}, {angle}')
-            group['curve'][angle] = cl
-        if not groups:
-            raise LLTError('LLT CSV bos.')
-        self.groups = list(groups.values())
-        self.by_profile = {}
+            used = num(row,'Re_VT_kullanilan') if row.get('Re_VT_kullanilan') not in (None,'') else v['Re_VT']
+            if used<=0: raise LLTError('Gecersiz Re_VT_kullanilan.')
+            v['Re_VT_kullanilan']=used
+            # Her satir ayni hizdaki kanat ve kuyruklari temsil etmeli.
+            for part in ('HT','VT'):
+                if not math.isclose(v['Re_'+part]/v['Re_aday'],num(row,'c_'+part+'_m')/num(row,'c_w_m'),rel_tol=1e-5):
+                    raise LLTError('Kanat/kuyruk Reynolds ve kord oranlari uyusmuyor.')
+            group=groups.setdefault(key,{'row':dict(row),'nodes':{}})
+            node=group['nodes'].setdefault(v['Re_aday'],{'row':dict(row),'values':v,'curve':{}})
+            for k,value in v.items():
+                if not math.isclose(value,node['values'][k],rel_tol=1e-9,abs_tol=1e-10):
+                    raise LLTError(f'Ayni geometri/Re icin celisen {k}')
+            angle,cl=num(row,'alpha_deg'),num(row,'CL')
+            if angle in node['curve'] and not math.isclose(cl,node['curve'][angle],rel_tol=1e-9,abs_tol=1e-10):
+                raise LLTError('Ayni geometri/Re/alpha icin celisen CL.')
+            node['curve'][angle]=cl
+        if not groups: raise LLTError('LLT CSV bos.')
+        self.groups=list(groups.values()); self.by_profile={}
         for group in self.groups:
-            if len(group['curve']) < 2:
-                raise LLTError('LLT CSV: en az iki farkli alpha satiri gerekli.')
+            group['vt_nodes']={}
+            for node in group['nodes'].values():
+                if len(node['curve'])<2: raise LLTError('En az iki alpha noktasi gerekli.')
+                v=node['values']; r=v['Re_VT_kullanilan']
+                pair=(v['CL_alpha_VT_per_deg'],v['e_VT'])
+                old=group['vt_nodes'].setdefault(r,pair)
+                if any(not math.isclose(x,y,rel_tol=1e-9,abs_tol=1e-10) for x,y in zip(old,pair)):
+                    raise LLTError('Ayni kullanilan VT Reynolds icin celisen katsayi.')
             self.by_profile.setdefault(profile(group['row']),[]).append(group)
 
     @classmethod
@@ -102,23 +109,59 @@ class LLTTable:
         return group
 
     def values_for(self, candidate, velocity, rho, mu, strict_re=False):
-        group=self.match(candidate); row=group['row']; v=group['values']
-        target={part:rho*velocity*num(candidate,chord)/mu for part,chord in
-                [('w','c_root_w_m'),('HT','c_root_HT_m'),('VT','c_root_VT_m')]}
-        refs={'w':v['Re_aday'],'HT':v['Re_HT'],'VT':v['Re_VT']}
-        aligned=all(math.isclose(target[p],refs[p],rel_tol=1e-3,abs_tol=1.) for p in refs)
-        if strict_re and not aligned:
-            raise LLTError(f'LLT Re uyusmuyor: CSV kanat Re={refs["w"]:.1f}, ucus Re={target["w"]:.1f}. Ucus kosulunda CSV uretin.')
-        wing=dict(curve=group['curve'], e=v['e_oswald'], cl_max=v['CL_max_3d_tahmini'],
-                  stall=v['alpha_stall_2d_deg'], Re_lo=refs['w'],Re_hi=refs['w'],
-                  slope=v['CL_alpha_3d_per_deg'],alpha_L0=v['alpha_L0_deg'])
-        # Kuyruk aci siniri CSV stall degeridir; negatif sinir NACA0010 simetrisi varsayimidir.
-        tail=dict(e=v['e_HT'],slope=v['CL_alpha_HT_per_deg'],cl_max=v['CL_max_HT'],
-                  stall=v['alpha_stall_HT_deg'],alpha_min=-abs(v['alpha_stall_HT_deg']),alpha_max=v['alpha_stall_HT_deg'],
-                  Re_lo=refs['HT'],Re_hi=refs['HT'])
-        meta={'llt_veri_kaynagi':self.source,'llt_katsayi_modu':'csv_sabit_katsayi',
-              'llt_Re_uyumlu':aligned,'llt_sabit_Re_varsayimi':not aligned,
-              'llt_model_notu':'' if aligned else 'CSV katsayilari kaynak Re kosulundan sabit alindi; Reynolds enterpolasyonu yapilmadi.'}
+        if any(not math.isfinite(x) or x<=0 for x in (velocity,rho,mu)):
+            raise LLTError('Hiz, yogunluk ve viskozite pozitif/sonlu olmali.')
+        group=self.match(candidate)
+        target={p:rho*velocity*num(candidate,c)/mu for p,c in [('w','c_root_w_m'),('HT','c_root_HT_m'),('VT','c_root_VT_m')]}
+        lo,hi,f,used=_bounds(group['nodes'],target['w'],allow_lower=(self.flapped and math.isclose(min(group['nodes']),200000.0,abs_tol=1e-6)))
+        a,b=group['nodes'][lo],group['nodes'][hi]
+        v={k:a['values'][k]+f*(b['values'][k]-a['values'][k]) for k in a['values']}
+        left=max(min(a['curve']),min(b['curve'])); right=min(max(a['curve']),max(b['curve']))
+        angles=sorted({x for x in set(a['curve'])|set(b['curve']) if left<=x<=right})
+        if len(angles)<2: raise LLTError('Re komsularinda ortak alpha araligi yok.')
+        curve={x:_at(a['curve'],x)+f*(_at(b['curve'],x)-_at(a['curve'],x)) for x in angles}
+        vl,vh,vf,vu=_bounds(group['vt_nodes'],target['VT'],allow_lower=True)
+        va,vb=group['vt_nodes'][vl],group['vt_nodes'][vh]
+        v['CL_alpha_VT_per_deg']=va[0]+vf*(vb[0]-va[0]);v['e_VT']=va[1]+vf*(vb[1]-va[1])
+        v['Re_VT_kullanilan']=vu
+        lower=not math.isclose(used,target['w'],rel_tol=1e-9,abs_tol=1e-6)
+        vt_lower=not math.isclose(vu,target['VT'],rel_tol=1e-9,abs_tol=1e-6)
+        if strict_re and (lower or vt_lower):
+            raise LLTError('Alt sinir katsayisi gerekiyor; --llt-re-kontrol bu varsayimi reddeder.')
+        refs={'w':used,'HT':v['Re_HT'],'VT':vu}
+        meta={'llt_veri_kaynagi':self.source,'llt_katsayi_modu':'csv_alt_sinir_kabul' if lower else ('csv_re_interpolasyon' if lo!=hi else 'csv_tam_re'),
+              'llt_Re_uyumlu':not (lower or vt_lower),'llt_Re_interpolasyon':lo!=hi,
+              'llt_sabit_Re_varsayimi':lower or vt_lower,'llt_kanat_alt_sinir_varsayimi':lower,
+              'llt_VT_alt_sinir_varsayimi':vt_lower,'llt_HT_alt_sinir_varsayimi':lower,
+              'llt_Re_w_alt':lo,'llt_Re_w_ust':hi,'llt_Re_agirlik':f,
+              'llt_Re_HT_alt':a['values']['Re_HT'],'llt_Re_HT_ust':b['values']['Re_HT'],
+              'llt_Re_VT_alt':vl,'llt_Re_VT_ust':vh,
+              'llt_model_notu':'; '.join(s for s in [
+                 f'Kanat Re={target["w"]:.1f}, alt sinir {used:.1f} satiri ve buna ait HT katsayilari kullanildi.' if lower else '',
+                 f'VT Re={target["VT"]:.1f}, alt sinir {vu:.1f} katsayilari kullanildi.' if vt_lower else ''] if s)}
         for p in refs:
-            meta['llt_Re_'+p+'_kaynak']=refs[p]; meta['llt_Re_'+p+'_ucus']=target[p]
-        return wing,tail,meta,row
+            meta['llt_Re_'+p+'_kaynak']=refs[p];meta['llt_Re_'+p+'_kullanilan']=refs[p];meta['llt_Re_'+p+'_ucus']=target[p]
+        wing=dict(curve=curve,e=v['e_oswald'],cl_max=v['CL_max_3d_tahmini'],stall=v['alpha_stall_2d_deg'],
+                  Re_lo=lo,Re_hi=hi,slope=v['CL_alpha_3d_per_deg'],alpha_L0=v['alpha_L0_deg'])
+        tail=dict(e=v['e_HT'],slope=v['CL_alpha_HT_per_deg'],cl_max=v['CL_max_HT'],stall=v['alpha_stall_HT_deg'],
+                  alpha_min=-abs(v['alpha_stall_HT_deg']),alpha_max=v['alpha_stall_HT_deg'],
+                  Re_lo=a['values']['Re_HT'],Re_hi=b['values']['Re_HT'])
+        record={**a['row'],**v};record['Re_aday']=used
+        return wing,tail,meta,record
+
+
+def _bounds(values, target, allow_lower=False):
+    xs=sorted(values)
+    for x in xs:
+        if math.isclose(x,target,rel_tol=1e-9,abs_tol=1e-7): return x,x,0.0,x
+    if target<xs[0] and allow_lower: return xs[0],xs[0],0.0,xs[0]
+    if target<xs[0] or target>xs[-1]:
+        raise LLTError(f'Re/alpha hedefi {target:.6g}, veri araligi disinda [{xs[0]:.6g}, {xs[-1]:.6g}].')
+    for lo,hi in zip(xs,xs[1:]):
+        if lo<target<hi: return lo,hi,(target-lo)/(hi-lo),target
+    raise LLTError('Re/alpha araligi bulunamadi.')
+
+
+def _at(curve, alpha):
+    lo,hi,f,_=_bounds(curve,alpha)
+    return curve[lo]+f*(curve[hi]-curve[lo])

@@ -23,8 +23,8 @@ if str(ROOT) not in sys.path:
 if str(PROJE_KLASORU) not in sys.path:
     sys.path.insert(0, str(PROJE_KLASORU))
 
-import drag_hesabi as dh
-import lifting_line_cozucu as llt
+from llt_csv_okuyucu import LLTTable, LLTError
+from tirmanis_hesabi import find_drag, calc_cd0, wing_key
 from aday_pervane import (GERILIM_V, elektrik_gucu, kimlik_alanlari,
                          performans_adaylarini_hazirla)
 
@@ -35,6 +35,13 @@ class ModelError(ValueError):
     def __init__(self, status: str, detail: str):
         super().__init__(detail)
         self.status = status
+
+
+def aday_degeri_al(row, *keys, varsayilan=None):
+    for key in keys:
+        if row.get(key) not in (None,''): return number(row,key)
+    if varsayilan is not None: return float(varsayilan)
+    raise ModelError('veri_hatasi',f'Eksik alan: {keys}')
 
 
 def number(row: dict, key: str, positive: bool = False) -> float:
@@ -121,31 +128,27 @@ def solve_takeoff_for_mass(
     llt_cache: dict,
 ) -> dict:
     weight_n = mass_kg * args.g
-    sw = llt.aday_degeri_al(aday, 'S_w_m2')
-    sh = llt.aday_degeri_al(aday, 'S_HT_m2', 'S_h_m2')
-    bw = llt.aday_degeri_al(aday, 'b_w_m')
-    cw = llt.aday_degeri_al(aday, 'c_root_w_m', 'c_w_m')
-    arw = llt.aday_degeri_al(aday, 'AR_w')
-    arh = llt.aday_degeri_al(aday, 'AR_HT', 'AR_h', varsayilan=4.0)
+    sw = aday_degeri_al(aday, 'S_w_m2')
+    sh = aday_degeri_al(aday, 'S_HT_m2', 'S_h_m2')
+    bw = aday_degeri_al(aday, 'b_w_m')
+    cw = aday_degeri_al(aday, 'c_root_w_m', 'c_w_m')
+    arw = aday_degeri_al(aday, 'AR_w')
+    arh = aday_degeri_al(aday, 'AR_HT', 'AR_h', varsayilan=4.0)
 
-    def get_flapped_wing(re_val: float) -> dict:
-        key = ('w_flap', kanat_profil.lower(), flap_profil.lower(), round(arw, 6), round(oran_flap, 4), round(re_val, 1))
-        if key not in llt_cache:
-            llt_cache[key] = llt.flapli_kanat_coz_re(
-                kanat_profil, flap_profil, arw, oran_flap, re_val, flapsiz_indeks, flapli_indeks
-            )
-        return llt_cache[key]
-
-    def get_tail(re_val: float) -> dict:
-        key = ('ht', kuyruk_profil.lower(), round(arh, 6), round(re_val, 1))
-        if key not in llt_cache:
-            llt_cache[key] = llt.kuyruk_coz_re(kuyruk_profil, arh, re_val, flapsiz_indeks)
-        return llt_cache[key]
+    table = llt_cache['_csv']
+    local_cache = {}
+    def state_at_re(re_val):
+        if re_val not in local_cache:
+            velocity = re_val*args.mu/(args.rho*cw)
+            local_cache[re_val] = table.values_for(aday,velocity,args.rho,args.mu,args.llt_re_kontrol)
+        return local_cache[re_val]
+    def get_flapped_wing(re_val):
+        return state_at_re(re_val)[0]
 
     # 1) Stall Hızı (V_S1) ve Re_stall Sabit Nokta İterasyonu
     v_stall = 10.0
     wing_stall = None
-    for _ in range(8):
+    for _ in range(80):
         re_stall = (args.rho * max(v_stall, 1.0) * cw) / args.mu
         wing_stall = get_flapped_wing(re_stall)
         v_new = math.sqrt((2.0 * weight_n) / (args.rho * sw * wing_stall['cl_max']))
@@ -154,16 +157,19 @@ def solve_takeoff_for_mass(
             break
         v_stall = v_new
 
+    else:
+        raise ModelError("stall_yakinsamadi", "Reynolds/stall hizi iterasyonu yakinsamadi.")
+    wing_stall = get_flapped_wing(args.rho*v_stall*cw/args.mu)
     v_lof = args.v_lof_katsayi * v_stall
     v_eff = v_lof / math.sqrt(2.0)  # Gudmundsson Denklem (18-22) etkin ortalama hız
 
     # 2) Etkin Hızda (V_eff) Gerçek Reynolds ile OpenVSP CD0 ve Flaplı LLT
-    cd0_info = dh.aday_cd0_hesapla(
-        aday, hiz_ms=v_eff, rho=args.rho, mu=args.mu,
-        flapli_mi=True, flap_profil_adi=flap_profil, oran_flap=oran_flap,
-    )
-    wing_eff = get_flapped_wing(cd0_info['Re_w'])
-    tail_eff = get_tail(cd0_info['Re_HT'])
+    drag_row = find_drag(aday,llt_cache['_drag'].get(wing_key(aday),[]))
+    cd0_info = calc_cd0(aday,drag_row,v_eff,args.rho,args.mu)
+    wing_eff,tail_eff,llt_meta,_ = state_at_re(cd0_info['Re_w'])
+    stall_meta=state_at_re(args.rho*v_stall*cw/args.mu)[2]
+    llt_meta.update(llt_Re_w_stall=stall_meta['llt_Re_w_ucus'],
+                    llt_stall_alt_sinir_varsayimi=stall_meta['llt_kanat_alt_sinir_varsayimi'])
 
     cl_w_to = interp_curve(wing_eff['curve'], args.alpha_to)
     cl_ht_to = tail_eff['slope'] * (args.alpha_to + args.kuyruk_oturma)
@@ -239,6 +245,7 @@ def solve_takeoff_for_mass(
     kural_puani_20 = 20.0 if kutu_icinde else 5.0
 
     return {
+        'llt_meta': llt_meta,
         'CL_max_flapli': wing_stall['cl_max'],
         'alpha_stall_deg': wing_stall['stall'],
         'V_stall_m_s': v_stall,
@@ -278,9 +285,12 @@ def solve_takeoff_for_mass(
 
 def calculate(mass_rows: list[dict], prop_map: dict[str, dict[float, dict]], args) -> list[dict]:
     mass_rows = performans_adaylarini_hazirla(mass_rows, args.pervane)
-    flapsiz_indeks = llt.polar_klasorunu_indeksle(llt.POLAR_KLASORU)
-    flapli_indeks = llt.polar_klasorunu_indeksle(llt.FLAP_POLAR_KLASORU)
-    llt_cache: dict = {}
+    flapsiz_indeks = flapli_indeks = None
+    table = LLTTable.read(resolve_input(args.llt,['llt_flapli_coklu_re.csv']),flapped=True)
+    drags=read_csv(resolve_input(args.drag,['openvsp_llt_flapli_aday_ozet.csv','openvsp_llt_flapli_polar_detay.csv']))
+    drag_index={}
+    for row in drags: drag_index.setdefault(wing_key(row),[]).append(row)
+    llt_cache={'_csv':table,'_drag':drag_index}
 
     output = []
     aday_sayaci = 0
@@ -326,13 +336,13 @@ def calculate(mass_rows: list[dict], prop_map: dict[str, dict[float, dict]], arg
                 m_susuz = float(mass.get('total_susuz_kutle_kg') or m_yuklu) + args.ek_cihaz_kutlesi_kg
                 m_su_kg = max(0.0, m_yuklu - m_susuz)
 
-                sw = llt.aday_degeri_al(mass, 'S_w_m2')
-                sh = llt.aday_degeri_al(mass, 'S_HT_m2', 'S_h_m2')
-                bw = llt.aday_degeri_al(mass, 'b_w_m')
-                arw = llt.aday_degeri_al(mass, 'AR_w')
-                arh = llt.aday_degeri_al(mass, 'AR_HT', 'AR_h', varsayilan=4.0)
-                l_govde = llt.aday_degeri_al(mass, 'govde_uzunlugu_m', varsayilan=1.2)
-                b_flap = llt.aday_degeri_al(mass, 'b_flap_m', varsayilan=min(1.0, bw))
+                sw = aday_degeri_al(mass, 'S_w_m2')
+                sh = aday_degeri_al(mass, 'S_HT_m2', 'S_h_m2')
+                bw = aday_degeri_al(mass, 'b_w_m')
+                arw = aday_degeri_al(mass, 'AR_w')
+                arh = aday_degeri_al(mass, 'AR_HT', 'AR_h', varsayilan=4.0)
+                l_govde = aday_degeri_al(mass, 'govde_uzunlugu_m', varsayilan=1.2)
+                b_flap = aday_degeri_al(mass, 'b_flap_m', varsayilan=min(1.0, bw))
                 oran_flap = b_flap / bw
 
                 out.update(
@@ -362,11 +372,22 @@ def calculate(mass_rows: list[dict], prop_map: dict[str, dict[float, dict]], arg
                     oran_flap, prop_map[prop], flapsiz_indeks, flapli_indeks, args, llt_cache,
                 )
 
-                # Mission 1 & 3 (Susuz)
-                m1 = solve_takeoff_for_mass(
-                    m_susuz, mass, kanat_profil, flap_profil, kuyruk_profil,
-                    oran_flap, prop_map[prop], flapsiz_indeks, flapli_indeks, args, llt_cache,
-                )
+                # M1 verisi eksikse M2 fiziksel sonucu korunur, tam gorev puani verilmez.
+                m1_error = None
+                try:
+                    m1 = solve_takeoff_for_mass(
+                        m_susuz, mass, kanat_profil, flap_profil, kuyruk_profil,
+                        oran_flap, prop_map[prop], flapsiz_indeks, flapli_indeks, args, llt_cache,
+                    )
+                except (ModelError, LLTError) as exc:
+                    m1_error = str(exc)
+                    m1 = {key:None for key in m2}
+                    m1['llt_meta'] = {}
+                out.update(m2['llt_meta'])
+                out.update({k+'_M1':v for k,v in m1['llt_meta'].items()})
+                out.update(M1_durum='hesaplanamadi' if m1_error else 'hesaplandi',
+                           M1_aciklama=m1_error or '', M2_durum='uygun' if m2['kutu_20m_icinde'] else 'mesafe_asimi_20m',
+                           tum_kalkis_gorevleri_hesaplandi=m1_error is None)
 
                 if m2['V_LOF_m_s'] > MAX_AIRSPEED_40KTS_MS:
                     raise ModelError(
@@ -377,7 +398,7 @@ def calculate(mass_rows: list[dict], prop_map: dict[str, dict[float, dict]], arg
                 puan_m1 = m1['kural_puani_20']
                 puan_m2 = m2['kural_puani_20']
                 puan_m3 = m1['kural_puani_20']
-                resmi_toplam_60 = puan_m1 + puan_m2 + puan_m3
+                resmi_toplam_60 = None if m1_error else puan_m1 + puan_m2 + puan_m3
                 basarili_20m = m2['kutu_20m_icinde']
 
                 out.update(
@@ -422,13 +443,13 @@ def calculate(mass_rows: list[dict], prop_map: dict[str, dict[float, dict]], arg
                     puan_M2_yuklu_kalkis_20=puan_m2,
                     puan_M3_manuel_kalkis_20=puan_m3,
                     resmi_kalkis_puani_60=resmi_toplam_60,
-                    durum='uygun' if basarili_20m else 'mesafe_asimi_20m',
+                    durum='kismi_sonuc_M1_hesaplanamadi' if m1_error else ('uygun' if basarili_20m else 'mesafe_asimi_20m'),
                     aciklama=(
-                        '' if basarili_20m
+                        ('M1: '+m1_error) if m1_error else '' if basarili_20m
                         else f'M2 Yuklu S_G={m2["S_G_kriter_m"]:.2f} m > 20 m (Kural M3.3.1: 20 yerine 5 puan)'
                     ),
                 )
-            except (ModelError, KeyError, FileNotFoundError) as exc:
+            except (ModelError, LLTError, KeyError, FileNotFoundError) as exc:
                 status = getattr(exc, 'status', 'veri_hatasi')
                 out['durum'], out['aciklama'] = status, str(exc)
             output.append(out)
@@ -450,7 +471,7 @@ def calculate(mass_rows: list[dict], prop_map: dict[str, dict[float, dict]], arg
             r['tasarim_kalkis_puani_100'] = round(100.0 * (0.50 * s_skor + 0.35 * e_skor + 0.15 * v_skor), 4)
 
     for r in output:
-        if not r.get('kalkis_20m_basarili') and r.get('resmi_kalkis_puani_60', 0.0) > 0:
+        if not r.get('kalkis_20m_basarili') and (r.get('resmi_kalkis_puani_60') or 0.0) > 0:
             r['tasarim_kalkis_puani_100'] = round(
                 25.0 * (r['resmi_kalkis_puani_60'] / 60.0) * (args.hedef_mesafe / max(r.get('S_G_M2_kriter_m', 40.0), args.hedef_mesafe)),
                 4,
@@ -476,7 +497,7 @@ def resolve_input(explicit, names):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    for flag in ('kutle', 'itki'):
+    for flag in ('kutle', 'itki', 'llt', 'drag'):
         parser.add_argument('--' + flag, type=Path)
     parser.add_argument('--cikti', type=Path, default=ROOT / 'kalkis_sonuclari.csv')
     for flag, default in [
@@ -503,6 +524,7 @@ def main(argv=None):
                         help='20m baraji ve puanlama icin baz alinacak yontem (her iki yontem de CSVye yazilir).')
     parser.add_argument('--tablo-degeri', choices=['auto', 'akim_a', 'guc_w'], default='auto',
                         help='auto: guc_w/power_w varsa W, yoksa akim_a * gerilim.')
+    parser.add_argument('--llt-re-kontrol',action='store_true',help='Alt sinir katsayisi kabullerini reddet.')
     args = parser.parse_args(argv)
 
     try:

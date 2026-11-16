@@ -2,7 +2,7 @@
 
 Python 3.10+, yalniz standart kutuphane. Ornek: python tirmanis_hesabi.py
 Varsayilanlar: Vx=15, Vz=4 m/s, dh=50 m; gerilim ortak ayardan, pervane aday satirindan.
-Kanat ve kuyruk katsayilari llt_flapsiz_aday_re.csv dosyasindan alinir.
+Kanat ve kuyruk katsayilari llt_flapsiz_coklu_re.csv dosyasindan alinir.
 Trim/downwash yok; i_HT=0, NACA0010 icin alpha_L0_HT=0.
 Itki tablosunda guc_w/power_w watt, akim_a amperdir; auto modu sutuna gore okur.
 """
@@ -301,7 +301,7 @@ def main(argv=None):
     parser.add_argument('--pervane',help='Yalniz pervane alani bos eski adaylar icin acik varsayilan.')
     parser.add_argument('--tablo-degeri',choices=['auto','guc_w','akim_a'],default='auto',
                         help='auto: guc_w/power_w varsa W, yoksa akim_a * gerilim.')
-    parser.add_argument('--llt-re-kontrol',action='store_true',help='CSV ve ucus Re farkliysa adayi reddet.')
+    parser.add_argument('--llt-re-kontrol',action='store_true',help='Alt sinir katsayisi kabulu gerektiginde adayi reddet.')
     args = parser.parse_args(argv)
     for name in ('vx','vz','irtifa','gerilim','rho','mu','g'):
         val = getattr(args,name)
@@ -311,7 +311,7 @@ def main(argv=None):
         parser.error('kuyruk-oturma sonlu olmali.')
     try:
         masses = read_csv(resolve_input(args.kutle,['kanat_kuyruk_govde_kutleli.csv']))
-        wings = LLTTable.read(resolve_input(args.llt,['llt_flapsiz_aday_re.csv']))
+        wings = LLTTable.read(resolve_input(args.llt,['llt_flapsiz_coklu_re.csv']))
         drag = read_csv(resolve_input(args.drag,['openvsp_llt_flapsiz_aday_ozet.csv','openvsp_llt_flapsiz_polar_detay.csv']))
         props = read_csv(resolve_input(args.itki,['itki_tablosu.csv']))
         output = calculate(masses,wings,drag,props,args)

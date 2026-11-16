@@ -1,5 +1,8 @@
 """
-LLT ÇÖZÜCÜ - BELLEK İÇİ (IN-MEMORY) MOTOR VE ADAY RE (-5°..+15°) CSV ÜRETİCİ
+LLT COKLU RE: flapsiz 200000..500000, flapli 200000..400000, adim 50000.
+Kanat Re taranir; kuyruk Re ayni ucus hizinda kendi korduna gore hesaplanir.
+Dikey kuyruk Re alt sinirin altinda ise en dusuk polar kullanilir ve varsayim raporlanir.
+Diger aralik disi kuyruk katsayilari bos birakilir.
 ====================================================================
 Yeni '<kanat_airfoil>_flap' adlandırma standardına göre güncellenmiştir:
 - Örneğin 'clarkysm-il' kanat profilinin flaplı karşılığı doğrudan 'clarkysm-il_flap'
@@ -22,6 +25,9 @@ import numpy as np
 
 
 # ==================================================== AYARLAR ====================================================
+FLAPSIZ_RE_DIZISI = tuple(range(200000, 500001, 50000))
+FLAPLI_RE_DIZISI = tuple(range(200000, 400001, 50000))
+
 SEYIR_HIZI_MS = 18.0        # Flapsız aday_re.csv referans seyir hızı (m/s)
 KALKIS_HIZI_MS = 12.0       # Flaplı aday_re.csv referans kalkış hızı (m/s)
 RHO = 1.175                 # Hava yoğunluğu (kg/m^3)
@@ -160,13 +166,8 @@ def reynolds_hesapla(
 
 
 def _re_degerini_normallestir(ham_re: int) -> int:
-    if ham_re == 4000000:
-        return 400000
-    if ham_re == 4500000:
-        return 450000
-    if ham_re == 50000:
-        return 500000
     return ham_re
+
 
 
 def _norm_profil_anahtari(metin: str) -> str:
@@ -432,21 +433,14 @@ def re_interpolasyonu(
         if isinstance(v, np.ndarray) and k != "alfa_dizisi_deg"
     ]
 
-    if re_hedef <= sirali_re[0]:
-        durum = f"ekstrapolasyon (< {sirali_re[0]})"
-        secilen = re_sonuclari[sirali_re[0]]
+    if not np.isfinite(re_hedef) or re_hedef < sirali_re[0] or re_hedef > sirali_re[-1]:
+        raise ValueError(f'Re={re_hedef:g}, polar araligi disinda: {sirali_re[0]}..{sirali_re[-1]}')
+    if re_hedef in re_sonuclari:
+        secilen = re_sonuclari[re_hedef]
         sonuc = {k: float(secilen[k]) for k in skaler_anahtarlar}
         for k in dizi_anahtarlar:
             sonuc[k] = np.array(secilen[k], dtype=float)
-        return sonuc, durum
-
-    if re_hedef >= sirali_re[-1]:
-        durum = f"ekstrapolasyon (> {sirali_re[-1]})"
-        secilen = re_sonuclari[sirali_re[-1]]
-        sonuc = {k: float(secilen[k]) for k in skaler_anahtarlar}
-        for k in dizi_anahtarlar:
-            sonuc[k] = np.array(secilen[k], dtype=float)
-        return sonuc, durum
+        return sonuc, 'tam_eslesme'
 
     idx = 0
     for j in range(len(sirali_re) - 1):
@@ -635,6 +629,23 @@ def kuyruk_coz_re(
     }
 
 
+
+def kuyruk_csv_coz(profil, ar, hedef, indeks, alt_siniri_kullan=False):
+    harita = profil_re_haritasi_al(indeks, profil)
+    alt, ust = min(harita), max(harita)
+    kullanilan = alt if alt_siniri_kullan and hedef < alt else hedef
+    if kullanilan < alt or kullanilan > ust:
+        return dict(CL_alpha_per_deg=None, e=None, stall=None, cl_max=None,
+                    Re_durumu='polar_araligi_disinda', Re_alt=alt, Re_ust=ust,
+                    Re_kullanilan=None, alt_sinir_varsayimi=False)
+    result = kuyruk_coz_re(profil, ar, kullanilan, indeks)
+    result.update(Re_alt=alt, Re_ust=ust, Re_kullanilan=kullanilan,
+                  alt_sinir_varsayimi=kullanilan != hedef)
+    if kullanilan != hedef:
+        result['Re_durumu'] = 'alt_sinir_sabit_katsayi'
+    return result
+
+
 def csv_yaz(satirlar: list[dict], dosya_yolu: Path) -> None:
     if not satirlar:
         return
@@ -694,45 +705,56 @@ def flapsiz_adaylari_coz_ve_yaz(
         ar_vt = aday_degeri_al(aday, "AR_VT", "AR_v", varsayilan=4.0)
         re_vt = reynolds_hesapla(c_vt, hiz_ms=SEYIR_HIZI_MS)
 
-        kanat_cozum = flapsiz_kanat_coz_re(profil_adi, ar_w, re_aday, polar_indeksi)
-        ht_cozum = kuyruk_coz_re(kuyruk_profil_adi, ar_ht, re_ht, polar_indeksi)
-        vt_cozum = kuyruk_coz_re(kuyruk_profil_adi, ar_vt, re_vt, polar_indeksi)
+        for re_aday in FLAPSIZ_RE_DIZISI:
+            hiz_ms = re_aday * MU / (RHO * c_w)
+            re_ht = re_aday * c_ht / c_w
+            re_vt = re_aday * c_vt / c_w
+            kanat_cozum = flapsiz_kanat_coz_re(profil_adi, ar_w, re_aday, polar_indeksi)
+            ht_cozum = kuyruk_csv_coz(kuyruk_profil_adi, ar_ht, re_ht, polar_indeksi)
+            vt_cozum = kuyruk_csv_coz(kuyruk_profil_adi, ar_vt, re_vt, polar_indeksi, alt_siniri_kullan=True)
 
-        cl_dizisi = kanat_cozum["CL_dizisi"]
-        for k, alfa_deg in enumerate(ALFA_DIZISI_DEG):
-            aday_re_satirlari.append({
-                "aday_no": idx,
-                "profil": profil_adi,
-                "kanat_airfoil": profil_adi,
-                "b_w_m": b_w,
-                "AR_w": ar_w,
-                "S_w_m2": s_w,
-                "c_w_m": c_w,
-                "Re_aday": re_aday,
-                "Re_durumu": kanat_cozum["Re_durumu"],
-                "alpha_deg": float(alfa_deg),
-                "a0_2d_per_deg": kanat_cozum["a0_2d_per_deg"],
-                "alpha_L0_deg": kanat_cozum["alpha_L0_deg"],
-                "CL_max_2d": kanat_cozum["CL_max_2d"],
-                "alpha_stall_2d_deg": kanat_cozum["alpha_stall_2d_deg"],
-                "CL_alpha_3d_per_deg": kanat_cozum["CL_alpha_3d_per_deg"],
-                "e_oswald": kanat_cozum["e_oswald"],
-                "CL": float(cl_dizisi[k]),
-                "CL_seyir": kanat_cozum["CL_seyir"],
-                "CL_max_3d_tahmini": kanat_cozum["CL_max_3d_tahmini"],
-                "c_HT_m": c_ht,
-                "S_HT_m2": s_ht,
-                "Re_HT": re_ht,
-                "CL_alpha_HT_per_deg": ht_cozum["CL_alpha_per_deg"],
-                "e_HT": ht_cozum["e"],
-                "alpha_stall_HT_deg": ht_cozum["stall"],
-                "CL_max_HT": ht_cozum["cl_max"],
-                "c_VT_m": c_vt,
-                "S_VT_m2": s_vt,
-                "Re_VT": re_vt,
-                "CL_alpha_VT_per_deg": vt_cozum["CL_alpha_per_deg"],
-                "e_VT": vt_cozum["e"],
-            })
+            cl_dizisi = kanat_cozum["CL_dizisi"]
+            for k, alfa_deg in enumerate(ALFA_DIZISI_DEG):
+                aday_re_satirlari.append({
+                    **{key: aday.get(key, "") for key in ("temel_aday_id", "konfigurasyon_id", "pervane")},
+                    "aday_no": idx,
+                    "hiz_ms": hiz_ms,
+                    "Re_HT_durumu": ht_cozum["Re_durumu"],
+                    "Re_VT_durumu": vt_cozum["Re_durumu"],
+                    "Re_VT_kullanilan": vt_cozum["Re_kullanilan"],
+                    "VT_alt_sinir_varsayimi": vt_cozum["alt_sinir_varsayimi"],
+                    "kuyruk_verisi_tam": ht_cozum["e"] is not None and vt_cozum["e"] is not None,
+                    "profil": profil_adi,
+                    "kanat_airfoil": profil_adi,
+                    "b_w_m": b_w,
+                    "AR_w": ar_w,
+                    "S_w_m2": s_w,
+                    "c_w_m": c_w,
+                    "Re_aday": re_aday,
+                    "Re_durumu": kanat_cozum["Re_durumu"],
+                    "alpha_deg": float(alfa_deg),
+                    "a0_2d_per_deg": kanat_cozum["a0_2d_per_deg"],
+                    "alpha_L0_deg": kanat_cozum["alpha_L0_deg"],
+                    "CL_max_2d": kanat_cozum["CL_max_2d"],
+                    "alpha_stall_2d_deg": kanat_cozum["alpha_stall_2d_deg"],
+                    "CL_alpha_3d_per_deg": kanat_cozum["CL_alpha_3d_per_deg"],
+                    "e_oswald": kanat_cozum["e_oswald"],
+                    "CL": float(cl_dizisi[k]),
+                    "CL_seyir": kanat_cozum["CL_seyir"],
+                    "CL_max_3d_tahmini": kanat_cozum["CL_max_3d_tahmini"],
+                    "c_HT_m": c_ht,
+                    "S_HT_m2": s_ht,
+                    "Re_HT": re_ht,
+                    "CL_alpha_HT_per_deg": ht_cozum["CL_alpha_per_deg"],
+                    "e_HT": ht_cozum["e"],
+                    "alpha_stall_HT_deg": ht_cozum["stall"],
+                    "CL_max_HT": ht_cozum["cl_max"],
+                    "c_VT_m": c_vt,
+                    "S_VT_m2": s_vt,
+                    "Re_VT": re_vt,
+                    "CL_alpha_VT_per_deg": vt_cozum["CL_alpha_per_deg"],
+                    "e_VT": vt_cozum["e"],
+                })
 
     csv_yaz(aday_re_satirlari, yol_aday_re)
     return toplam_tum_satir, len(aday_re_satirlari)
@@ -776,60 +798,71 @@ def flapli_adaylari_coz_ve_yaz(
         ar_vt = aday_degeri_al(aday, "AR_VT", "AR_v", varsayilan=4.0)
         re_vt = reynolds_hesapla(c_vt, hiz_ms=KALKIS_HIZI_MS)
 
-        kanat_cozum = flapli_kanat_coz_re(
-            profil_adi, flap_profil_adi, ar_w, oran_flap, re_flapsiz,
-            flapsiz_polar_indeksi, flapli_polar_indeksi,
-        )
-        ht_cozum = kuyruk_coz_re(kuyruk_profil_adi, ar_ht, re_ht, flapsiz_polar_indeksi)
-        vt_cozum = kuyruk_coz_re(kuyruk_profil_adi, ar_vt, re_vt, flapsiz_polar_indeksi)
+        for re_flapsiz in FLAPLI_RE_DIZISI:
+            hiz_ms = re_flapsiz * MU / (RHO * c_w)
+            re_ht = re_flapsiz * c_ht / c_w
+            re_vt = re_flapsiz * c_vt / c_w
+            kanat_cozum = flapli_kanat_coz_re(
+                profil_adi, flap_profil_adi, ar_w, oran_flap, re_flapsiz,
+                flapsiz_polar_indeksi, flapli_polar_indeksi,
+            )
+            ht_cozum = kuyruk_csv_coz(kuyruk_profil_adi, ar_ht, re_ht, flapsiz_polar_indeksi)
+            vt_cozum = kuyruk_csv_coz(kuyruk_profil_adi, ar_vt, re_vt, flapsiz_polar_indeksi, alt_siniri_kullan=True)
 
-        cl_birl = kanat_cozum["CL_dizisi"]
-        cl_flapsiz = kanat_cozum["CL_dizisi_flapsiz"]
-        cl_flapli = kanat_cozum["CL_dizisi_flapli"]
+            cl_birl = kanat_cozum["CL_dizisi"]
+            cl_flapsiz = kanat_cozum["CL_dizisi_flapsiz"]
+            cl_flapli = kanat_cozum["CL_dizisi_flapli"]
 
-        for k, alfa_deg in enumerate(ALFA_DIZISI_DEG):
-            aday_re_satirlari.append({
-                "aday_no": idx,
-                "kanat_airfoil": profil_adi,
-                "flap_airfoil": flap_profil_adi,
-                "b_w_m": b_w,
-                "AR_w": ar_w,
-                "S_w_m2": s_w,
-                "c_w_m": c_w,
-                "b_flap_m": b_flap,
-                "b_flapsiz_toplam_m": b_flapsiz,
-                "S_flap_m2": s_flap,
-                "S_flapsiz_m2": s_flapsiz,
-                "flap_aciklik_orani": oran_flap,
-                "Re_aday": re_flapsiz,
-                "Re_flapsiz": re_flapsiz,
-                "Re_durumu": kanat_cozum["Re_durumu"],
-                "alpha_deg": float(alfa_deg),
-                "alpha_L0_deg": kanat_cozum["alpha_L0_deg"],
-                "alpha_stall_2d_deg": kanat_cozum["alpha_stall_2d_deg"],
-                "CL_alpha_3d_kanat_per_deg": kanat_cozum["CL_alpha_3d_per_deg"],
-                "CL_alpha_3d_per_deg": kanat_cozum["CL_alpha_3d_per_deg"],
-                "e_oswald_kanat": kanat_cozum["e_oswald"],
-                "e_oswald": kanat_cozum["e_oswald"],
-                "CL_flapsiz_kisim": float(cl_flapsiz[k]),
-                "CL_flapli_kisim": float(cl_flapli[k]),
-                "CL_kanat": float(cl_birl[k]),
-                "CL": float(cl_birl[k]),
-                "CL_seyir": kanat_cozum["CL_seyir"],
-                "CL_max_3d_tahmini": kanat_cozum["CL_max_3d_tahmini"],
-                "c_HT_m": c_ht,
-                "S_HT_m2": s_ht,
-                "Re_HT": re_ht,
-                "CL_alpha_HT_per_deg": ht_cozum["CL_alpha_per_deg"],
-                "e_HT": ht_cozum["e"],
-                "alpha_stall_HT_deg": ht_cozum["stall"],
-                "CL_max_HT": ht_cozum["cl_max"],
-                "c_VT_m": c_vt,
-                "S_VT_m2": s_vt,
-                "Re_VT": re_vt,
-                "CL_alpha_VT_per_deg": vt_cozum["CL_alpha_per_deg"],
-                "e_VT": vt_cozum["e"],
-            })
+            for k, alfa_deg in enumerate(ALFA_DIZISI_DEG):
+                aday_re_satirlari.append({
+                    **{key: aday.get(key, "") for key in ("temel_aday_id", "konfigurasyon_id", "pervane")},
+                    "aday_no": idx,
+                    "hiz_ms": hiz_ms,
+                    "Re_HT_durumu": ht_cozum["Re_durumu"],
+                    "Re_VT_durumu": vt_cozum["Re_durumu"],
+                    "Re_VT_kullanilan": vt_cozum["Re_kullanilan"],
+                    "VT_alt_sinir_varsayimi": vt_cozum["alt_sinir_varsayimi"],
+                    "kuyruk_verisi_tam": ht_cozum["e"] is not None and vt_cozum["e"] is not None,
+                    "kanat_airfoil": profil_adi,
+                    "flap_airfoil": flap_profil_adi,
+                    "b_w_m": b_w,
+                    "AR_w": ar_w,
+                    "S_w_m2": s_w,
+                    "c_w_m": c_w,
+                    "b_flap_m": b_flap,
+                    "b_flapsiz_toplam_m": b_flapsiz,
+                    "S_flap_m2": s_flap,
+                    "S_flapsiz_m2": s_flapsiz,
+                    "flap_aciklik_orani": oran_flap,
+                    "Re_aday": re_flapsiz,
+                    "Re_flapsiz": re_flapsiz,
+                    "Re_durumu": kanat_cozum["Re_durumu"],
+                    "alpha_deg": float(alfa_deg),
+                    "alpha_L0_deg": kanat_cozum["alpha_L0_deg"],
+                    "alpha_stall_2d_deg": kanat_cozum["alpha_stall_2d_deg"],
+                    "CL_alpha_3d_kanat_per_deg": kanat_cozum["CL_alpha_3d_per_deg"],
+                    "CL_alpha_3d_per_deg": kanat_cozum["CL_alpha_3d_per_deg"],
+                    "e_oswald_kanat": kanat_cozum["e_oswald"],
+                    "e_oswald": kanat_cozum["e_oswald"],
+                    "CL_flapsiz_kisim": float(cl_flapsiz[k]),
+                    "CL_flapli_kisim": float(cl_flapli[k]),
+                    "CL_kanat": float(cl_birl[k]),
+                    "CL": float(cl_birl[k]),
+                    "CL_seyir": kanat_cozum["CL_seyir"],
+                    "CL_max_3d_tahmini": kanat_cozum["CL_max_3d_tahmini"],
+                    "c_HT_m": c_ht,
+                    "S_HT_m2": s_ht,
+                    "Re_HT": re_ht,
+                    "CL_alpha_HT_per_deg": ht_cozum["CL_alpha_per_deg"],
+                    "e_HT": ht_cozum["e"],
+                    "alpha_stall_HT_deg": ht_cozum["stall"],
+                    "CL_max_HT": ht_cozum["cl_max"],
+                    "c_VT_m": c_vt,
+                    "S_VT_m2": s_vt,
+                    "Re_VT": re_vt,
+                    "CL_alpha_VT_per_deg": vt_cozum["CL_alpha_per_deg"],
+                    "e_VT": vt_cozum["e"],
+                })
 
     csv_yaz(aday_re_satirlari, yol_aday_re)
     return toplam_tum_satir, len(aday_re_satirlari)
@@ -837,6 +870,7 @@ def flapli_adaylari_coz_ve_yaz(
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cikti-klasoru", type=Path, default=SCRIPT_DIR)
     args = parser.parse_args(argv)
 
     print("(1) 2B polar klasorleri indeksleniyor (sadece CL verileri)...")
@@ -845,17 +879,17 @@ def main(argv=None) -> None:
     print(f"  - {POLAR_KLASORU.name}: {len(flapsiz_indeks)} anahtar indekslendi.")
     print(f"  - {FLAP_POLAR_KLASORU.name}: {len(flapli_indeks)} flapli anahtar indekslendi.")
 
-    print("\n2) Flapsiz kanat + kuyruk adaylari LLT ile cozuluyor (-5..15° aday Re)...")
+    print("\n2) Flapsiz kanat + kuyruk adaylari LLT ile cozuluyor (-5..15 derece, coklu Reynolds)...")
     flapsiz_adaylar = adaylari_yukle(FLAPSIZ_ADAY_CSV_ADI, flapli_mi=False)
-    yol_flapsiz_aday = PROJE_KLASORU / "llt_flapsiz_aday_re.csv"
+    yol_flapsiz_aday = args.cikti_klasoru / "llt_flapsiz_coklu_re.csv"
     _, n_aday_flapsiz = flapsiz_adaylari_coz_ve_yaz(
         flapsiz_adaylar, flapsiz_indeks, None, yol_flapsiz_aday
     )
     print(f"  - Kaydedildi: {yol_flapsiz_aday} ({n_aday_flapsiz} satir)")
 
-    print("\n3) Flapli kanat + kuyruk adaylari LLT ile cozuluyor (-5..15° aday Re)...")
+    print("\n3) Flapli kanat + kuyruk adaylari LLT ile cozuluyor (-5..15 derece, coklu Reynolds)...")
     flapli_adaylar = adaylari_yukle(FLAPLI_ADAY_CSV_ADI, flapli_mi=True)
-    yol_flapli_aday = PROJE_KLASORU / "llt_flapli_aday_re.csv"
+    yol_flapli_aday = args.cikti_klasoru / "llt_flapli_coklu_re.csv"
     _, n_aday_flapli = flapli_adaylari_coz_ve_yaz(
         flapli_adaylar, flapsiz_indeks, flapli_indeks, None, yol_flapli_aday
     )

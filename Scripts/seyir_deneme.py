@@ -121,7 +121,7 @@ def find_csv_file(filename, required=True):
 def load_all_databases(llt_csv_path=None):
     itki_path = find_csv_file("itki_tablosu.csv")
     vsp_path = find_csv_file("openvsp_llt_flapsiz_polar_detay.csv")
-    llt_path = str(llt_csv_path) if llt_csv_path is not None else find_csv_file("llt_flapsiz_aday_re.csv")
+    llt_path = str(llt_csv_path) if llt_csv_path is not None else find_csv_file("llt_flapsiz_coklu_re.csv")
     kutle_path = find_csv_file("kanat_kuyruk_govde_kutleli.csv")
 
     itki_df = pd.read_csv(itki_path, sep=";")
@@ -158,8 +158,8 @@ def load_takeoff_and_climb_tables():
                 # Kriter alanlari kalkista secilen ortalama/sayisal yontemi tasir.
                 wh = number("enerji_M2_kriter_Wh")
                 table[key] = {
-                    "durum": status,
-                    "kalkis_uygun": status in ("uygun", "mesafe_asimi_20m"),
+                    "durum": str(row.get("M2_durum",status)),
+                    "kalkis_uygun": str(row.get("M2_durum",status)) in ("uygun", "mesafe_asimi_20m"),
                     "kalkis_20m_basarili": str(row.get("kalkis_20m_basarili", "")).lower() in ("true", "1", "1.0"),
                     "S_G_M2_m": number("S_G_M2_kriter_m"),
                     "sure_M2_s": number("sure_M2_kriter_s"),
@@ -294,7 +294,7 @@ def build_lookup_tables(itki_df, vsp_df, llt_df):
         raise ValueError("OpenVSP tablosu bos olamaz.")
 
     # Aday-Re CSV: kanat/kuyruk katsayilari aynen korunur, polar yeniden cozulmez.
-    llt_lookup = LLTTable(llt_df.to_dict('records'),source='llt_flapsiz_aday_re.csv')
+    llt_lookup = LLTTable(llt_df.to_dict('records'),source='llt_flapsiz_coklu_re.csv')
 
     # --- B. OpenVSP CD0 Tablosu: tum kimlikleri tara, 20 m/s hizda dinamik CD0 hesapla ---
     vsp_lookup = LookupTable()
@@ -659,7 +659,7 @@ def compute_electrical_power_and_current(T_req_N, thrust_info):
 
 
 def load_tail_lookup(explicit=None):
-    path = Path(explicit) if explicit is not None else Path(find_csv_file('llt_flapsiz_aday_re.csv'))
+    path = Path(explicit) if explicit is not None else Path(find_csv_file('llt_flapsiz_coklu_re.csv'))
     return LLTTable.read(path)
 
 
@@ -796,7 +796,7 @@ def run_full_cruise_mission_optimization(tail_csv_path=None, llt_csv_path=None, 
     itki_df, vsp_df, llt_df, kutle_df = load_all_databases(llt_csv_path)
     llt_lookup, vsp_lookup, thrust_tables = build_lookup_tables(itki_df, vsp_df, llt_df)
     kutle_df = pd.DataFrame(performans_adaylarini_hazirla(kutle_df.to_dict("records")))
-    llt_lookup.source = str(Path(llt_csv_path or find_csv_file("llt_flapsiz_aday_re.csv")).resolve())
+    llt_lookup.source = str(Path(llt_csv_path or find_csv_file("llt_flapsiz_coklu_re.csv")).resolve())
     tail_lookup = load_tail_lookup(tail_csv_path) if tail_csv_path else llt_lookup
     kalkis_map, tirmanis_map = load_takeoff_and_climb_tables()
 
@@ -1087,7 +1087,7 @@ def run_full_cruise_mission_optimization(tail_csv_path=None, llt_csv_path=None, 
     if not results:
         raise ValueError("Değerlendirilecek aday yok: kütle tablosunu ve veri eşleşmelerini kontrol edin.")
     res_df = pd.DataFrame(results)
-    print("Kuyruk: llt_flapsiz_aday_re.csv katsayıları doğrudan kullanıldı. "
+    print("Kuyruk: llt_flapsiz_coklu_re.csv katsayıları uçuş Reynolds'una göre interpolasyonla alındı. "
           "Kuyruk CL_max ve stall sınırı CSVden alındı; uygunluk CSV koşulundaki model kapsamındadır.")
     if "kuyruk_Re_uyumlu" in res_df:
         mismatch = res_df["kuyruk_Re_uyumlu"].eq(False).sum()
@@ -1257,9 +1257,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--rota", action="store_true", help="CSV veritabanları olmadan örnek rotayı göster")
-    parser.add_argument("--kuyruk-llt", type=Path, help="Kuyruk katsayıları: llt_flapsiz_aday_re.csv")
+    parser.add_argument("--kuyruk-llt", type=Path, help="Kuyruk katsayıları: llt_flapsiz_coklu_re.csv")
     parser.add_argument('--llt',type=Path,help='Kanat/kuyruk aday-Re LLT CSV dosyasi')
-    parser.add_argument('--llt-re-kontrol',action='store_true',help='CSV/ucus Re farkinda adayi reddet')
+    parser.add_argument('--llt-re-kontrol',action='store_true',help='Alt sinir katsayisi kabulunde adayi reddet')
     parser.add_argument('--grafik-yok',action='store_true',help='Yalniz sonuc CSV dosyasini uret')
     parser.add_argument('--cikti',type=Path,default=Path('seyir_optimizasyon_sonuclari.csv'))
     args = parser.parse_args()
