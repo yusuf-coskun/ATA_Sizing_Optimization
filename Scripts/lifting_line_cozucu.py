@@ -25,10 +25,10 @@ import numpy as np
 
 
 # ==================================================== AYARLAR ====================================================
-FLAPSIZ_RE_DIZISI = tuple(range(200000, 500001, 50000))
-FLAPLI_RE_DIZISI = tuple(range(200000, 400001, 50000))
+FLAPSIZ_RE_DIZISI = tuple(range(150000, 500001, 50000))
+FLAPLI_RE_DIZISI = tuple(range(150000, 400001, 50000))
 
-SEYIR_HIZI_MS = 18.0        # Flapsız aday_re.csv referans seyir hızı (m/s)
+SEYIR_HIZI_MS = 20.0        # Flapsız aday_re.csv referans seyir hızı (m/s)
 KALKIS_HIZI_MS = 12.0       # Flaplı aday_re.csv referans kalkış hızı (m/s)
 RHO = 1.175                 # Hava yoğunluğu (kg/m^3)
 MU = 1.789e-5               # Havanın dinamik viskozitesi (Pa.s)
