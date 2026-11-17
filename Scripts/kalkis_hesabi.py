@@ -24,17 +24,11 @@ if str(PROJE_KLASORU) not in sys.path:
     sys.path.insert(0, str(PROJE_KLASORU))
 
 from llt_csv_okuyucu import LLTTable, LLTError
-from tirmanis_hesabi import find_drag, calc_cd0, wing_key
+from tirmanis_hesabi import ModelError, find_drag, calc_cd0, wing_key
 from aday_pervane import (GERILIM_V, elektrik_gucu, kimlik_alanlari,
                          performans_adaylarini_hazirla)
 
 MAX_AIRSPEED_40KTS_MS = 40.0 * 0.514444  # Kural T2.6.1: 40 kts = 20.5778 m/s
-
-
-class ModelError(ValueError):
-    def __init__(self, status: str, detail: str):
-        super().__init__(detail)
-        self.status = status
 
 
 def aday_degeri_al(row, *keys, varsayilan=None):

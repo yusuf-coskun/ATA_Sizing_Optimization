@@ -1,8 +1,8 @@
 """
-LLT COKLU RE: flapsiz 200000..500000, flapli 200000..400000, adim 50000.
+LLT COKLU RE: flapsiz 150000..500000, flapli 150000..400000, adim 50000.
 Kanat Re taranir; kuyruk Re ayni ucus hizinda kendi korduna gore hesaplanir.
-Dikey kuyruk Re alt sinirin altinda ise en dusuk polar kullanilir ve varsayim raporlanir.
-Diger aralik disi kuyruk katsayilari bos birakilir.
+Yatay ve dikey kuyruk Re alt sinirin altinda ise en dusuk polar kullanilir ve varsayim raporlanir.
+Ust siniri asan kuyruk katsayilari bos birakilir.
 ====================================================================
 Yeni '<kanat_airfoil>_flap' adlandırma standardına göre güncellenmiştir:
 - Örneğin 'clarkysm-il' kanat profilinin flaplı karşılığı doğrudan 'clarkysm-il_flap'
@@ -710,7 +710,7 @@ def flapsiz_adaylari_coz_ve_yaz(
             re_ht = re_aday * c_ht / c_w
             re_vt = re_aday * c_vt / c_w
             kanat_cozum = flapsiz_kanat_coz_re(profil_adi, ar_w, re_aday, polar_indeksi)
-            ht_cozum = kuyruk_csv_coz(kuyruk_profil_adi, ar_ht, re_ht, polar_indeksi)
+            ht_cozum = kuyruk_csv_coz(kuyruk_profil_adi, ar_ht, re_ht, polar_indeksi, alt_siniri_kullan=True)
             vt_cozum = kuyruk_csv_coz(kuyruk_profil_adi, ar_vt, re_vt, polar_indeksi, alt_siniri_kullan=True)
 
             cl_dizisi = kanat_cozum["CL_dizisi"]
@@ -720,6 +720,8 @@ def flapsiz_adaylari_coz_ve_yaz(
                     "aday_no": idx,
                     "hiz_ms": hiz_ms,
                     "Re_HT_durumu": ht_cozum["Re_durumu"],
+                    "Re_HT_kullanilan": ht_cozum["Re_kullanilan"],
+                    "HT_alt_sinir_varsayimi": ht_cozum["alt_sinir_varsayimi"],
                     "Re_VT_durumu": vt_cozum["Re_durumu"],
                     "Re_VT_kullanilan": vt_cozum["Re_kullanilan"],
                     "VT_alt_sinir_varsayimi": vt_cozum["alt_sinir_varsayimi"],
@@ -806,7 +808,7 @@ def flapli_adaylari_coz_ve_yaz(
                 profil_adi, flap_profil_adi, ar_w, oran_flap, re_flapsiz,
                 flapsiz_polar_indeksi, flapli_polar_indeksi,
             )
-            ht_cozum = kuyruk_csv_coz(kuyruk_profil_adi, ar_ht, re_ht, flapsiz_polar_indeksi)
+            ht_cozum = kuyruk_csv_coz(kuyruk_profil_adi, ar_ht, re_ht, flapsiz_polar_indeksi, alt_siniri_kullan=True)
             vt_cozum = kuyruk_csv_coz(kuyruk_profil_adi, ar_vt, re_vt, flapsiz_polar_indeksi, alt_siniri_kullan=True)
 
             cl_birl = kanat_cozum["CL_dizisi"]
@@ -819,6 +821,8 @@ def flapli_adaylari_coz_ve_yaz(
                     "aday_no": idx,
                     "hiz_ms": hiz_ms,
                     "Re_HT_durumu": ht_cozum["Re_durumu"],
+                    "Re_HT_kullanilan": ht_cozum["Re_kullanilan"],
+                    "HT_alt_sinir_varsayimi": ht_cozum["alt_sinir_varsayimi"],
                     "Re_VT_durumu": vt_cozum["Re_durumu"],
                     "Re_VT_kullanilan": vt_cozum["Re_kullanilan"],
                     "VT_alt_sinir_varsayimi": vt_cozum["alt_sinir_varsayimi"],
