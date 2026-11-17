@@ -3,6 +3,10 @@
 Bu dosyayı govde_boyutlandirma.py ile aynı klasöre koyup çalıştırın:
     python govde_agirlik_tahmini.py
 
+Mevcut birleşik kütle CSV’sini yerinde güncellemek için:
+    python govde_agirlik_tahmini.py --kutle-csv kanat_kuyruk_govde_kutleli.csv
+Ayrı çıktı için bu komuta --csv yeni_kutle.csv ekleyin.
+
 Kaynak boyutlandırma dosyası ve parametreleri değiştirilmez.
 Entegrasyon: sonuclar = geometriden_agirlik_hesapla(geometri_modulu)
 Çıktılar gram cinsindedir; bataryalar dahil sabit aviyonik kütlesi eklenir.
@@ -15,6 +19,7 @@ import runpy
 from collections.abc import Mapping
 from math import floor, isfinite, pi
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 DIS_KABUK_GSM = 395.9  # Kürlenmiş karbon/cam/karbon: 176.7 + 42.5 + 176.7.
 ISKELET_GSM = 802.8
@@ -151,12 +156,104 @@ def csv_kaydet(sonuclar, yol):
         yazici.writerows(sonuclar)
 
 
+def kutle_csv_guncelle(kaynak, hedef=None):
+    """Birleşik uçak CSV'sini güncel motor/pervane kütleleriyle yeniler.
+
+    Geometri, kanat/kuyruk, aviyonik ve diğer bileşenler korunur.
+    Toplamlar bileşenlerden hesaplanır; tekrar çalıştırmak ek fark yaratmaz.
+    Hedef verilmezse kaynak dosya, tüm satırlar doğrulandıktan sonra değiştirilir.
+    """
+    kaynak = Path(kaynak)
+    hedef = Path(hedef) if hedef is not None else kaynak
+    sabit_alanlar = (
+        "govde_pervane_g", "govde_arka_inis_takimi_g", "govde_motor_g",
+        "govde_servolar_g", "govde_yapistirici_ve_diger_g",
+        "govde_aviyonik_toplam_g",
+    )
+    yapisal_alanlar = ("govde_dis_kabuk_g", "govde_iskelet_g", "govde_karbon_boru_g")
+    toplam_alanlar = (
+        "govde_sabit_toplam_g", "govde_susuz_toplam_g", "govde_toplam_g",
+        "govde_toplam_kg", "total_kutle_g", "total_kutle_kg",
+        "total_susuz_kutle_g", "total_susuz_kutle_kg",
+    )
+    gerekli = set(sabit_alanlar + yapisal_alanlar + toplam_alanlar
+                  + ("govde_su_g", "agirlik_toplam_g"))
+    with kaynak.open("r", encoding="utf-8-sig", newline="") as dosya:
+        baslik = dosya.readline()
+        dosya.seek(0)
+        ayirici = ";" if baslik.count(";") > baslik.count(",") else ","
+        okuyucu = csv.DictReader(dosya, delimiter=ayirici)
+        alanlar = okuyucu.fieldnames
+        if not alanlar or len(set(alanlar)) != len(alanlar):
+            raise ValueError("CSV başlıkları boş veya yinelenmiş.")
+        eksik = gerekli - set(alanlar)
+        if eksik:
+            raise ValueError("CSV sütunları eksik: " + ", ".join(sorted(eksik)))
+        satirlar = list(okuyucu)
+    if not satirlar:
+        raise ValueError("CSV içinde güncellenecek aday yok.")
+
+    pervane = _sayi(PERVANE_G, "PERVANE_G")
+    motor = _sayi(MOTOR_G, "MOTOR_G")
+    for no, satir in enumerate(satirlar, start=2):
+        if None in satir or any(v is None for v in satir.values()):
+            raise ValueError(f"CSV satır {no}: sütun sayısı başlıkla uyuşmuyor.")
+
+        def sayi(ad):
+            return _sayi(satir[ad], f"CSV satır {no}, {ad}", sifir_olabilir=True)
+
+        satir["govde_pervane_g"] = pervane
+        satir["govde_motor_g"] = motor
+        sabit = sum(sayi(ad) for ad in sabit_alanlar)
+        susuz = sum(sayi(ad) for ad in yapisal_alanlar) + sabit
+        toplam = susuz + sayi("govde_su_g")
+        kanat_kuyruk = sayi("agirlik_toplam_g")
+        satir.update({
+            "govde_sabit_toplam_g": sabit,
+            "govde_susuz_toplam_g": susuz,
+            "govde_toplam_g": toplam,
+            "govde_toplam_kg": toplam / 1000.0,
+            "total_kutle_g": kanat_kuyruk + toplam,
+            "total_kutle_kg": (kanat_kuyruk + toplam) / 1000.0,
+            "total_susuz_kutle_g": kanat_kuyruk + susuz,
+            "total_susuz_kutle_kg": (kanat_kuyruk + susuz) / 1000.0,
+        })
+        for ad in toplam_alanlar:
+            _sayi(satir[ad], f"CSV satır {no}, {ad}", sifir_olabilir=True)
+
+    # Hata halinde mevcut dosyanın kısmen yazılmış durumda kalmasını önler.
+    gecici = None
+    try:
+        with NamedTemporaryFile(mode="w", encoding="utf-8-sig", newline="",
+                                dir=hedef.resolve().parent, delete=False) as dosya:
+            gecici = Path(dosya.name)
+            yazici = csv.DictWriter(dosya, fieldnames=alanlar, delimiter=ayirici)
+            yazici.writeheader()
+            yazici.writerows(satirlar)
+        gecici.replace(hedef)
+    finally:
+        if gecici is not None:
+            gecici.unlink(missing_ok=True)
+    return len(satirlar)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gövde geometrisinden kütle hesabı; bataryalar ve aviyonik dahil.")
     parser.add_argument("--geometri", type=Path,
                         default=Path(__file__).resolve().with_name("govde_boyutlandirma.py"))
     parser.add_argument("--csv", type=Path, help="İstenirse sonuç CSV dosyasının yolu.")
+    parser.add_argument("--kutle-csv", type=Path,
+                        help="Mevcut birleşik kütle CSV’sini yenile. --csv yoksa aynı dosyaya yazılır.")
     args = parser.parse_args()
+    if args.kutle_csv is not None:
+        hedef = args.csv if args.csv is not None else args.kutle_csv
+        try:
+            adet = kutle_csv_guncelle(args.kutle_csv, hedef)
+        except (OSError, ValueError, csv.Error) as hata:
+            parser.error(str(hata))
+        print(f"{adet} satır güncellendi: {hedef.resolve()}")
+        print(f"Pervane: {PERVANE_G:g} g | Motor: {MOTOR_G:g} g")
+        return
     if not args.geometri.is_file():
         parser.error(f"Geometri dosyası bulunamadı: {args.geometri}. İki dosyayı aynı klasöre koyun.")
     try:
