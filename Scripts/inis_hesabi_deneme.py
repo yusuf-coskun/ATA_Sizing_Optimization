@@ -1,19 +1,19 @@
-"""Frensiz ve tum surec boyunca flapli yer kosusuna sahip ucak adaylari icin Gudmundsson Bolum 23 ve IMechE 2027 inis modulu.
+"""Frensiz ve tum surec boyunca flapli yer kosusuna sahip ucak adaylari icin Gudmundsson Bolum 16/23 ve IMechE 2027 inis modulu.
 
 Fiziksel Senaryo:
 - Havada yaklasma, teker koyma ve tum yer kosusu boyunca FLAPLAR ACIKTIR (llt_flapli_coklu_re.csv
   ve openvsp_llt_flapli_aday_ozet.csv kullanilir).
+- Plain flap (duz flap) acilmasindan kaynaklanan basinc/akis ayrilmasi ek parazit suruklemesi (Delta_CD0_flap)
+  Gudmundsson / McCormick / Roskam duz flap formuluyle (b_flap = 1.0 m, cf/c = 0.30, delta_f = 30 deg)
+  hesaplanarak toplam suruklemeye eklenir:
+    * gudmundsson_sin2 (Varsayilan):
+      Delta_CD0_flap = 0.90 * (cf / c)^1.38 * (S_flap / S_w) * sin^2(delta_f)
+    * gudmundsson_lineer (Gudmundsson Denklem 16-59):
+      Delta_CD0_flap = 0.0016 * (cf / c) * (S_flap / S_w) * max(0, delta_f_deg - 10)
 - Susuz kutlede V_S0, V_REF = 1.3 * V_S0, V_TD = 1.1 * V_S0 ve V_eff = V_TD / sqrt(2) hesaplanir.
 - Tekerlek freni ve ters flap yoktur; ucak flapli kanat aerodinamigi ve frensiz yuvarlanma
   surtunmesiyle (mu_pist = 0.08, Gudmundsson Tablo 23-3 Wet grass brakes off) yavaslayip durur.
 - Puanlama (IMechE 2027): M1 (M3.2.3: 60p) + M2 (M3.3.5: 60p) + M3 (M3.4.4: 20p) = Toplam 140 puan.
-  * Kural M3.2.3 & M3.3.5 (M1/M2 Otonom Inis):
-    - 20 m kutu icinde teker koyup tam durma (S_G <= 20 m): 60 puan
-    - 20 m kutu icinde teker koyup kutu disinda durma (S_G > 20 m): 40 puan
-    - Kutu disinda otonom inis: 20 puan
-    - Manuel inis veya hasarli inis: 10 puan
-  * Kural M3.4.4 (M3 Manuel Ucus Degerlendirmesi Inisi):
-    - Maksimum 20 puan (ilk yarim gun hazirsa 20 tam puan, son gun 10 yarim puan; M3'te 20m kutu kesintisi yoktur).
 """
 from __future__ import annotations
 
@@ -108,6 +108,37 @@ def validate_geometry_consistency(aday: dict) -> None:
             raise ModelError("geometri_hatasi", f"{ar_key} boyutlarla uyusmuyor: {b}^2/{s} != {ar}")
 
 
+def hesapla_plain_flap_ek_cd0(
+    b_w_m: float,
+    b_flap_m: float = 1.0,
+    cf_c: float = 0.30,
+    delta_f_deg: float = 30.0,
+    model: str = "gudmundsson_sin2",
+    manuel_ek: float = 0.0,
+) -> float:
+    """Plain flap (duz flap) acilmasindan kaynaklanan ek parazit surukleme katsayisini (Delta_CD0_flap) hesaplar.
+
+    Parametreler:
+      - b_w_m: Kanat acikligi [m]
+      - b_flap_m: Toplam flap acikligi [m] (varsayilan: 1.0 m -> S_flap / S_w = b_flap / b_w)
+      - cf_c: Flap veterinin kanat veterine orani (cf / c, varsayilan: 0.30 yani %30)
+      - delta_f_deg: Flap sapma acisi [deg] (varsayilan: 30.0 derece)
+      - model:
+          * 'gudmundsson_sin2': Delta_CD0_flap = 0.90 * (cf/c)^1.38 * (S_flap/S_w) * sin^2(delta_f)
+          * 'gudmundsson_lineer': Delta_CD0_flap = 0.0016 * (cf/c) * (S_flap/S_w) * max(0, delta_f - 10)
+          * 'kapali': 0.0 (yalniz manuel_ek kullanilir)
+    """
+    s_flap_orani = min(max(b_flap_m / b_w_m, 0.0), 1.0)
+    delta_rad = math.radians(max(delta_f_deg, 0.0))
+    if model == "gudmundsson_sin2":
+        cd0_flap = 0.90 * (cf_c ** 1.38) * s_flap_orani * (math.sin(delta_rad) ** 2)
+    elif model == "gudmundsson_lineer":
+        cd0_flap = 0.0016 * cf_c * s_flap_orani * max(0.0, delta_f_deg - 10.0)
+    else:
+        cd0_flap = 0.0
+    return cd0_flap + manuel_ek
+
+
 def solve_landing_for_mass(
     mass_kg: float,
     aday: dict,
@@ -121,6 +152,7 @@ def solve_landing_for_mass(
     cw = aday_degeri_al(aday, "c_root_w_m", "c_w_m")
     arw = aday_degeri_al(aday, "AR_w")
     arh = aday_degeri_al(aday, "AR_HT", "AR_h", varsayilan=4.0)
+    b_flap = aday_degeri_al(aday, "b_flap_m", varsayilan=min(args.b_flap_m, bw))
 
     flap_table = llt_cache["_csv_flap"]
     flap_local_cache: dict = {}
@@ -174,7 +206,17 @@ def solve_landing_for_mass(
     cdi_w = phi_d * (cl_w_ldg ** 2) / (math.pi * arw * wing_eff["e"])
     cdi_ht = phi_d * (sh / sw) * (cl_ht_ldg ** 2) / (math.pi * arh * tail_eff["e"])
     cdi_ldg = cdi_w + cdi_ht
-    cd_ldg = cd0_info["CD0_toplam"] + args.cd_ldg + args.cd_flap_ek + cdi_ldg
+
+    # Plain flap ek parazit suruklemesi (1 m aciklik, %30 veter, 30 derece sapma)
+    cd0_flap_ek = hesapla_plain_flap_ek_cd0(
+        b_w_m=bw,
+        b_flap_m=b_flap,
+        cf_c=args.flap_veter_orani,
+        delta_f_deg=args.flap_acisi_deg,
+        model=args.flap_drag_modeli,
+        manuel_ek=args.cd_flap_ek,
+    )
+    cd_ldg = cd0_info["CD0_toplam"] + cd0_flap_ek + args.cd_ldg + cdi_ldg
 
     # 3) Referans Yaklasma ve Flare (Denklem 23-9..23-13, SI birimlerinde)
     gamma_app_rad = math.radians(args.gamma_app_deg)
@@ -241,12 +283,6 @@ def solve_landing_for_mass(
     s_g_kriter = s_g_num if args.yontem == "sayisal" else s_g_avg
     t_g_kriter = t_g_num if args.yontem == "sayisal" else t_g_avg
 
-    # Kural T2.8.1, M3.2.3 & M3.3.5 (Otonom M1 & M2):
-    # - 20 m kutu icinde teker koyup tam durma: 60 puan
-    # - 20 m kutu icinde teker koyup kutu disinda durma: 40 puan
-    # - Kutu disinda otonom inis: 20 puan
-    # Kural M3.4.4 (M3 Manuel Degerlendirme Inisi):
-    # - M3'te 20 m kutu kesintisi yoktur; ilk yarim gun ucusa hazir olan takima tam 20 puan verilir.
     tam_kutu_icinde = s_g_kriter <= args.hedef_mesafe
     teker_kutu_icinde = s_fr <= args.hedef_mesafe
     if tam_kutu_icinde:
@@ -270,6 +306,7 @@ def solve_landing_for_mass(
         "CL_HT_LDG": cl_ht_ldg,
         "CL_LDG": cl_ldg,
         "CD0_toplam": cd0_info["CD0_toplam"],
+        "CD0_flap_ek": cd0_flap_ek,
         "CDi_LDG": cdi_ldg,
         "CD_LDG": cd_ldg,
         "L_eff_N": lift_eff,
@@ -312,7 +349,6 @@ def calculate(mass_rows: list[dict], args) -> list[dict]:
         "_csv_flap": flap_table,
         "_drag_flap": drag_flap_idx,
     }
-    # Inis itkiden bagimsiz oldugu icin ayni temel_aday_id (farkli pervaneler) icin sonucu onbellekle.
     base_landing_cache: dict[str, dict | Exception] = {}
 
     output = []
@@ -327,11 +363,15 @@ def calculate(mass_rows: list[dict], args) -> list[dict]:
             "durum": "",
             "aciklama": "",
             "inis_20m_basarili": False,
+            "S_G_inis_kriter_m": "",
+            "S_G_inis_ort_ivme_m": "",
+            "S_G_inis_sayisal_m": "",
             "puan_M1_inis_60": 0.0,
             "puan_M2_inis_60": 0.0,
             "puan_M3_manuel_inis_20": 0.0,
             "resmi_inis_puani_140": 0.0,
             "yontem": args.yontem,
+            "flap_drag_modeli": args.flap_drag_modeli,
             "rho_kg_m3": args.rho,
             "mu_pist_frensiz": args.mu_pist,
             "alpha_LDG_deg": args.alpha_ldg,
@@ -355,7 +395,7 @@ def calculate(mass_rows: list[dict], args) -> list[dict]:
             sw = aday_degeri_al(mass, "S_w_m2")
             bw = aday_degeri_al(mass, "b_w_m")
             l_govde = aday_degeri_al(mass, "govde_uzunlugu_m", varsayilan=1.2)
-            b_flap = aday_degeri_al(mass, "b_flap_m", varsayilan=min(1.0, bw))
+            b_flap = aday_degeri_al(mass, "b_flap_m", varsayilan=min(args.b_flap_m, bw))
 
             out.update(
                 kutle_inis_susuz_kg=m_susuz,
@@ -363,6 +403,8 @@ def calculate(mass_rows: list[dict], args) -> list[dict]:
                 b_w_m=bw,
                 b_flap_m=b_flap,
                 flap_aciklik_orani=b_flap / bw,
+                flap_veter_orani=args.flap_veter_orani,
+                flap_acisi_deg=args.flap_acisi_deg,
                 AR_w=aday_degeri_al(mass, "AR_w"),
                 L_govde_m=l_govde,
                 govde_aday_no=mass.get("govde_aday_no", ""),
@@ -383,7 +425,6 @@ def calculate(mass_rows: list[dict], args) -> list[dict]:
             if isinstance(cached, Exception):
                 raise cached
             res = cached
-            out.update(res["llt_meta"])
 
             if res["V_REF_m_s"] > MAX_AIRSPEED_40KTS_MS:
                 raise ModelError(
@@ -404,6 +445,7 @@ def calculate(mass_rows: list[dict], args) -> list[dict]:
                 Re_w_eff=res["Re_w_eff"],
                 CL_LDG=res["CL_LDG"],
                 CD0_toplam=res["CD0_toplam"],
+                CD0_flap_ek=res["CD0_flap_ek"],
                 CDi_LDG=res["CDi_LDG"],
                 CD_LDG=res["CD_LDG"],
                 L_eff_N=res["L_eff_N"],
@@ -433,6 +475,7 @@ def calculate(mass_rows: list[dict], args) -> list[dict]:
                     else f'Flapli/frensiz S_G_inis={res["S_G_inis_kriter_m"]:.2f} m > 20 m (M1/M2: {puan_60:.0f}/60, M3: {puan_m3_20:.0f}/20)'
                 ),
             )
+            out.update(res["llt_meta"])
         except (ModelError, LLTError, KeyError, FileNotFoundError) as exc:
             status = getattr(exc, "status", "veri_hatasi")
             out["durum"], out["aciklama"] = status, str(exc)
@@ -464,23 +507,32 @@ def main(argv=None):
     for flag, default in [
         ("hedef-mesafe", 20.0),
         ("v-td-katsayi", 1.1),
-        ("t-tepki", 0.0),         # Flaplar tum surec boyunca acik kaldigi icin tepki gecikmesi 0 s
+        ("t-tepki", 0.0),
         ("rho", 1.175),
         ("mu", 1.789e-5),
         ("g", 9.80665),
-        ("mu-pist", 0.08),        # Tablo 23-3: Wet grass (Brakes off) - T2.7.1 & T2.8.3 (Hard turf: 0.05)
+        ("mu-pist", 0.08),
         ("alpha-ldg", 0.0),
         ("kuyruk-oturma", 0.0),
         ("h-kanat", 0.0),
-        ("cd-ldg", 0.0),          # Varsa inis takimi ek parazit suruklemesi
-        ("cd-flap-ek", 0.0),      # Varsa ek flap parazit suruklemesi
+        ("b-flap-m", 1.0),          # 1.0 metre toplam plain flap acikligi
+        ("flap-veter-orani", 0.30), # %30 veter (cf / c = 0.30)
+        ("flap-acisi-deg", 30.0),   # 30 derece plain flap sapma acisi
+        ("cd-ldg", 0.0),
+        ("cd-flap-ek", 0.0),        # Model uzerine eklenecek manuel ekstra terim
         ("itki-rolanti-n", 0.0),
         ("gamma-app-deg", 3.0),
-        ("h-engel-m", 0.0),       # Kural T2.8.1: Engel asma sarti yok
+        ("h-engel-m", 0.0),
         ("pist-egim-deg", 0.0),
         ("ek-cihaz-kutlesi-kg", 0.0),
     ]:
         parser.add_argument("--" + flag, type=float, default=default)
+    parser.add_argument(
+        "--flap-drag-modeli",
+        choices=["gudmundsson_sin2", "gudmundsson_lineer", "kapali"],
+        default="gudmundsson_sin2",
+        help="Plain flap ek parazit surukleme formulu (varsayilan: gudmundsson_sin2).",
+    )
     parser.add_argument("--pervane", help="Yalniz pervane alani bos eski adaylar icin acik varsayilan.")
     parser.add_argument("--yontem", choices=["ort_ivme", "sayisal"], default="ort_ivme",
                         help="20m baraji ve puanlama icin baz alinacak yontem (her iki yontem de CSVye yazilir).")
