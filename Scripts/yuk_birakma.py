@@ -262,15 +262,15 @@ def calculate(mass_rows, llt, drag_rows, prop_rows, settings, default_prop=None,
                    'dt_ust_sinir_s':a.dt, 'yardimci_guc_W':a.yardimci_guc,
                    'gecisler_dahil':False, 'trim_cozuldu':False, 'downwash_deg':0.0,
                    'kuyruk_oturma_deg':a.kuyruk_oturma, 'tuketim_mAh':None,
-                   'puan_kg_katsayisi':40.0, 'puan_ust_siniri':120.0,
+                   'puan_kg_katsayisi':30.0, 'puan_ust_siniri':120.0,
                    'model_notu':'Ruzgar, seyirden yavaslama, tirmanisa giris/cikis, trim, su cikis tepkisi ve yere dusme hesabi yok. Yumusak dalista az dahil.'}
         try:
             model = AdayModeli(candidate,llt,drag_index.get(wing_key(candidate),[]),prop_rows,a,prop_cache)
             water, dry, loaded = model.water, model.dry, model.loaded
             rate = water/a.birakma_suresi
             summary.update(dolu_kutle_kg=loaded, susuz_kutle_kg=dry, birakilan_su_kg=water,
-                           su_debisi_kg_s=rate, ham_puan=water*40,
-                           puan=min(water*40,120.0), puan_turu='planlanan_su_tam_birakilirsa',
+                           su_debisi_kg_s=rate, ham_puan=water*30,
+                           puan=min(water*30,120.0), puan_turu='planlanan_su_tam_birakilirsa',
                            hiz_azaltmada_kinetik_enerji_farki_J=.5*loaded*(a.seyir_hizi**2-(a.vx**2 if a.dalis_profili=='yumusak' else a.vx**2+a.vz**2)))
             cruise = model.point(loaded,a.seyir_hizi,0.0,'seyir_karsilastirma')
             for field in ('alpha_deg','D_N','gaz_yuzde','guc_W','durum'):
