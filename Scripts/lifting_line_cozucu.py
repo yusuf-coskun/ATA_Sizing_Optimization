@@ -1,15 +1,17 @@
 """
 LLT COKLU RE: flapsiz 150000..500000, flapli 150000..400000, adim 50000.
 Kanat Re taranir; kuyruk Re ayni ucus hizinda kendi korduna gore hesaplanir.
-Yatay ve dikey kuyruk Re alt sinirin altinda ise en dusuk polar kullanilir ve varsayim raporlanir.
-Ust siniri asan kuyruk katsayilari bos birakilir.
+Yatay (HT) ve dikey (VT) kuyruk Re alt sinirin altinda ise en dusuk polar
+kullanilir ve varsayim CSV'de raporlanir.
 ====================================================================
-Yeni '<kanat_airfoil>_flap' adlandırma standardına göre güncellenmiştir:
-- Örneğin 'clarkysm-il' kanat profilinin flaplı karşılığı doğrudan 'clarkysm-il_flap'
-  olarak eşleştirilir.
-- Eğer 'airfoils_polar_flap' klasöründeki .pol dosyaları henüz eski isimlerindeyse
-  (ör. 'CLARK-Y 11.7%_flap smoothed_re100000.pol') veya yeni isimlerine ('clarkysm-il_flap_re100000.pol')
-  geçirildiyse her iki durumu da otomatik tanır ve birbirine bağlar.
+Birlestirilmis En Iyi Ozellikler:
+1) Flapli profillerde erken akis ayrilmasina karsi [-4, +2.5] derece dar
+   lineer bolge secimi ve dusuk egim (a0 < 4.5 /rad) korumasi.
+2) LLT Fourier katsayilarindan (A_n) analitik yerel Cl(theta)/CL dagilimi ile
+   AR'ye duyarli k_clmax_llt hesabi (CL_max_3d = k_clmax_llt * CL_max_2d).
+3) 3B downwash etkisini iceren geometrik stall acisi hesabi:
+   alpha_stall_3d = alpha_L0 + CL_max_3d / CL_alpha_3d.
+4) Hem HT hem de VT icin alt Re siniri korumasi ve detayli durum raporlamasi.
 """
 from __future__ import annotations
 
@@ -28,8 +30,8 @@ import numpy as np
 FLAPSIZ_RE_DIZISI = tuple(range(150000, 500001, 50000))
 FLAPLI_RE_DIZISI = tuple(range(150000, 400001, 50000))
 
-SEYIR_HIZI_MS = 20.0        # Flapsız aday_re.csv referans seyir hızı (m/s)
-KALKIS_HIZI_MS = 12.0       # Flaplı aday_re.csv referans kalkış hızı (m/s)
+SEYIR_HIZI_MS = 20.0        # Flapsız referans seyir hızı (m/s)
+KALKIS_HIZI_MS = 12.0       # Flaplı referans kalkış hızı (m/s)
 RHO = 1.175                 # Hava yoğunluğu (kg/m^3)
 MU = 1.789e-5               # Havanın dinamik viskozitesi (Pa.s)
 SEYIR_ALPHA_DEG = 0.0       # CL_seyir referans hücum açısı (0 derece)
@@ -169,7 +171,6 @@ def _re_degerini_normallestir(ham_re: int) -> int:
     return ham_re
 
 
-
 def _norm_profil_anahtari(metin: str) -> str:
     return re.sub(r"[^a-z0-9]", "", metin.lower())
 
@@ -204,11 +205,25 @@ def profil_ozellikleri_cikar(
     alfa: np.ndarray,
     cl: np.ndarray,
 ) -> dict:
-    maske = (alfa >= LINEER_ALPHA_MIN) & (alfa <= LINEER_ALPHA_MAX)
+    # Flapli profillerde +2..+6 derece arasinda erken akis ayrilmasi egimi dusurdugu icin,
+    # eger [-4, +2.5] derece araliginda yeterli nokta varsa dogrusal egimi bu tutunmus akis bolgesinden hesapla.
+    dar_maske = (alfa >= LINEER_ALPHA_MIN) & (alfa <= 2.5)
+    maske = (
+        dar_maske
+        if int(dar_maske.sum()) >= 5
+        else ((alfa >= LINEER_ALPHA_MIN) & (alfa <= LINEER_ALPHA_MAX))
+    )
     if int(maske.sum()) < 3:
         maske = np.ones_like(alfa, dtype=bool)
 
     a0_rad, b_kesisim = np.polyfit(np.deg2rad(alfa[maske]), cl[maske], 1)
+
+    # XFOIL flapli polari yalniz stall platosu yakininda yakinsadiysa (a0 < 4.5 /rad),
+    # teorik ince profil egimi (5.7 /rad) ile koru:
+    if a0_rad < 4.5:
+        idx_ref = int(np.argmin(np.abs(alfa - float(alfa[maske][0]))))
+        a0_rad = 5.7
+        b_kesisim = float(cl[idx_ref] - a0_rad * np.deg2rad(alfa[idx_ref]))
     if a0_rad <= 0:
         alt_maske = alfa <= 4.0
         if int(alt_maske.sum()) >= 3:
@@ -230,6 +245,7 @@ def profil_ozellikleri_cikar(
 
 
 _polar_indeks_onbellek: dict[Path, dict[str, dict[int, dict]]] = {}
+
 
 def polar_klasorunu_indeksle(polar_klasoru: Path = POLAR_KLASORU) -> dict[str, dict[int, dict]]:
     polar_klasoru = Path(polar_klasoru).resolve()
@@ -324,7 +340,7 @@ def en_yakin_polar_sec(
 # ---------------------------------------------------------------------------------
 # 3) LLT MATRİS ÇÖZÜCÜ VE REYNOLDS İNTERPOLASYONU
 # ---------------------------------------------------------------------------------
-_llt_onbellek: dict[tuple[float, float, int], tuple[float, float]] = {}
+_llt_onbellek: dict[tuple[float, float, int], tuple[float, float, float]] = {}
 _yuzey_cozum_onbellek: dict[tuple[str, int, float], dict] = {}
 
 
@@ -332,7 +348,7 @@ def llt_dikdortgen_kanat(
     ar: float,
     a0_rad: float,
     n_terim: int = LLT_TERIM_SAYISI,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     anahtar = (round(float(ar), 6), round(float(a0_rad), 6), int(n_terim))
     if anahtar in _llt_onbellek:
         return _llt_onbellek[anahtar]
@@ -348,12 +364,17 @@ def llt_dikdortgen_kanat(
 
     cl_alpha_3d = float(np.pi * ar * A[0])
     e_span = 1.0 / (1.0 + float(np.sum(n[1:] * (A[1:] / A[0]) ** 2)))
-    k_fus = 0.995   # Gövde blokajı düzeltmesi (d_fus=0.14m silindirik orta gövde, b=2.70-3.00m için 1 - 2*(d_fus/b)^2)
+    k_fus = 0.995   # Gövde blokajı düzeltmesi (d_fus=0.14m silindirik orta gövde, b=2.70-3.00m için)
     k_visc = 0.007  # Taşımaya bağlı viskoz profil sürükleme artış katsayısı (Kroo/Raymer)
     e_oswald = float(1.0 / (1.0 / (e_span * k_fus) + np.pi * ar * k_visc))
 
-    _llt_onbellek[anahtar] = (cl_alpha_3d, e_oswald)
-    return cl_alpha_3d, e_oswald
+    # LLT Fourier katsayılarından (A_n) açıklık boyunca yerel kesit Cl(theta)/CL dağılımı:
+    # Dikdörtgen kanatta kök kesit Cl(theta) = Cl_max_2d olduğunda 3B kanat stall olur:
+    cl_over_cl_dizisi = (4.0 / (np.pi * A[0])) * (np.sin(np.outer(theta, n)) @ A)
+    k_clmax_llt = float(1.0 / np.max(cl_over_cl_dizisi))
+
+    _llt_onbellek[anahtar] = (cl_alpha_3d, e_oswald, k_clmax_llt)
+    return cl_alpha_3d, e_oswald, k_clmax_llt
 
 
 def yuzey_coklu_aci_coz(
@@ -366,14 +387,16 @@ def yuzey_coklu_aci_coz(
     if onbellek_anahtari in _yuzey_cozum_onbellek:
         return _yuzey_cozum_onbellek[onbellek_anahtari]
 
-    cl_a, e = llt_dikdortgen_kanat(ar, prof["a0_rad"])
+    cl_a, e, k_clmax_llt = llt_dikdortgen_kanat(ar, prof["a0_rad"])
     cl_a_deg = float(np.deg2rad(cl_a))
 
     alfa_0_rad = np.deg2rad(SEYIR_ALPHA_DEG)
     cl_0deg = float(cl_a * (alfa_0_rad - prof["alpha_L0_rad"]))
 
-    cl_max_3d = float(cl_a * (np.deg2rad(prof["alpha_stall_deg"]) - prof["alpha_L0_rad"]))
-    cl_max_3d = min(cl_max_3d, prof["cl_max_2d"])
+    # 1) Analitik LLT sirkülasyon dağılımından 2B -> 3B CL_max dönüşümü:
+    cl_max_3d = float(k_clmax_llt * prof["cl_max_2d"])
+    # 2) 3B sonlu kanatta downwash (indüklenmiş hücum açısı) etkisiyle geometrik stall açısı:
+    alpha_stall_3d_deg = float(np.rad2deg(prof["alpha_L0_rad"] + cl_max_3d / cl_a))
 
     alfa_rad_dizisi = np.deg2rad(alfa_dizisi_deg)
     cl_dizisi = np.clip(
@@ -387,7 +410,7 @@ def yuzey_coklu_aci_coz(
         "a0_2d_per_deg": float(np.deg2rad(prof["a0_rad"])),
         "alpha_L0_deg": float(prof["alpha_L0_deg"]),
         "CL_max_2d": float(prof["cl_max_2d"]),
-        "alpha_stall_2d_deg": float(prof["alpha_stall_deg"]),
+        "alpha_stall_2d_deg": float(alpha_stall_3d_deg),
         "CL_alpha_3d_per_deg": cl_a_deg,
         "e_oswald": float(e),
         "CL_seyir": cl_0deg,
@@ -400,16 +423,14 @@ def yuzey_coklu_aci_coz(
 
 
 def kuyruk_yuzey_coz(ar: float, prof: dict) -> dict:
-    cl_a, e = llt_dikdortgen_kanat(ar, prof["a0_rad"])
+    cl_a, e, k_clmax_llt = llt_dikdortgen_kanat(ar, prof["a0_rad"])
     cl_a_deg = float(np.deg2rad(cl_a))
-    cl_max_3d = min(
-        float(cl_a * (np.deg2rad(prof["alpha_stall_deg"]) - prof["alpha_L0_rad"])),
-        float(prof["cl_max_2d"]),
-    )
+    cl_max_3d = float(k_clmax_llt * prof["cl_max_2d"])
+    alpha_stall_3d_deg = float(np.rad2deg(prof["alpha_L0_rad"] + cl_max_3d / cl_a))
     return {
         "CL_alpha_per_deg": cl_a_deg,
         "e": float(e),
-        "alpha_stall_deg": float(prof["alpha_stall_deg"]),
+        "alpha_stall_deg": alpha_stall_3d_deg,
         "CL_max_3d": cl_max_3d,
         "alpha_min_deg": float(prof["alfa"].min()),
         "alpha_max_deg": float(prof["alfa"].max()),
@@ -434,13 +455,13 @@ def re_interpolasyonu(
     ]
 
     if not np.isfinite(re_hedef) or re_hedef < sirali_re[0] or re_hedef > sirali_re[-1]:
-        raise ValueError(f'Re={re_hedef:g}, polar araligi disinda: {sirali_re[0]}..{sirali_re[-1]}')
+        raise ValueError(f"Re={re_hedef:g}, polar araligi disinda: {sirali_re[0]}..{sirali_re[-1]}")
     if re_hedef in re_sonuclari:
         secilen = re_sonuclari[re_hedef]
         sonuc = {k: float(secilen[k]) for k in skaler_anahtarlar}
         for k in dizi_anahtarlar:
             sonuc[k] = np.array(secilen[k], dtype=float)
-        return sonuc, 'tam_eslesme'
+        return sonuc, "tam_eslesme"
 
     idx = 0
     for j in range(len(sirali_re) - 1):
@@ -539,24 +560,22 @@ def flapli_kanat_coz_re(
         )
         alpha_l0_birl = -cl_0deg_birl / cl_a_birl if cl_a_birl > 0 else 0.0
 
-        alpha_stall_kritik = min(
-            sol_flapli["alpha_stall_2d_deg"],
-            sol_flapsiz["alpha_stall_2d_deg"],
-        )
-
         cl_dizisi_flapsiz = sol_flapsiz["CL_dizisi"]
         cl_dizisi_flapli = sol_flapli["CL_dizisi"]
         cl_dizisi_birl = (
             cl_dizisi_flapli * oran_flap
             + cl_dizisi_flapsiz * oran_flapsiz
         )
-
-        stall_maske = ALFA_DIZISI_DEG <= (alpha_stall_kritik + 1e-6)
-        if np.any(stall_maske):
-            cl_max_birl = float(np.max(cl_dizisi_birl[stall_maske]))
-        else:
-            cl_max_birl = float(np.max(cl_dizisi_birl))
+        cl_max_birl = float(
+            sol_flapsiz["CL_max_3d_tahmini"] * oran_flapsiz
+            + sol_flapli["CL_max_3d_tahmini"] * oran_flap
+        )
         cl_dizisi_birl = np.minimum(cl_dizisi_birl, cl_max_birl)
+        alpha_stall_kritik = (
+            float(alpha_l0_birl + cl_max_birl / cl_a_birl)
+            if cl_a_birl > 0
+            else float(sol_flapli["alpha_stall_2d_deg"])
+        )
 
         sonuclar_birlesik_re[r_pol] = {
             "Re_polar": r_pol,
@@ -629,20 +648,23 @@ def kuyruk_coz_re(
     }
 
 
-
-def kuyruk_csv_coz(profil, ar, hedef, indeks, alt_siniri_kullan=False):
+def kuyruk_csv_coz(profil: str, ar: float, hedef: float, indeks: dict, alt_siniri_kullan: bool = True) -> dict:
     harita = profil_re_haritasi_al(indeks, profil)
     alt, ust = min(harita), max(harita)
     kullanilan = alt if alt_siniri_kullan and hedef < alt else hedef
     if kullanilan < alt or kullanilan > ust:
-        return dict(CL_alpha_per_deg=None, e=None, stall=None, cl_max=None,
-                    Re_durumu='polar_araligi_disinda', Re_alt=alt, Re_ust=ust,
-                    Re_kullanilan=None, alt_sinir_varsayimi=False)
+        return dict(
+            CL_alpha_per_deg=None, e=None, stall=None, cl_max=None,
+            Re_durumu="polar_araligi_disinda", Re_alt=alt, Re_ust=ust,
+            Re_kullanilan=None, alt_sinir_varsayimi=False,
+        )
     result = kuyruk_coz_re(profil, ar, kullanilan, indeks)
-    result.update(Re_alt=alt, Re_ust=ust, Re_kullanilan=kullanilan,
-                  alt_sinir_varsayimi=kullanilan != hedef)
+    result.update(
+        Re_alt=alt, Re_ust=ust, Re_kullanilan=kullanilan,
+        alt_sinir_varsayimi=(kullanilan != hedef),
+    )
     if kullanilan != hedef:
-        result['Re_durumu'] = 'alt_sinir_sabit_katsayi'
+        result["Re_durumu"] = "alt_sinir_sabit_katsayi"
     return result
 
 
@@ -693,17 +715,14 @@ def flapsiz_adaylari_coz_ve_yaz(
         ar_w = aday_degeri_al(aday, "AR_w")
         s_w = aday_degeri_al(aday, "S_w_m2")
         c_w = aday_degeri_al(aday, "c_root_w_m", "c_w_m")
-        re_aday = reynolds_hesapla(c_w, hiz_ms=SEYIR_HIZI_MS)
 
         c_ht = aday_degeri_al(aday, "c_root_HT_m", "c_root_h_m", "c_HT_m")
         s_ht = aday_degeri_al(aday, "S_HT_m2", "S_h_m2")
         ar_ht = aday_degeri_al(aday, "AR_HT", "AR_h", varsayilan=4.0)
-        re_ht = reynolds_hesapla(c_ht, hiz_ms=SEYIR_HIZI_MS)
 
         c_vt = aday_degeri_al(aday, "c_root_VT_m", "c_root_v_m", "c_VT_m")
         s_vt = aday_degeri_al(aday, "S_VT_m2", "S_v_m2")
         ar_vt = aday_degeri_al(aday, "AR_VT", "AR_v", varsayilan=4.0)
-        re_vt = reynolds_hesapla(c_vt, hiz_ms=SEYIR_HIZI_MS)
 
         for re_aday in FLAPSIZ_RE_DIZISI:
             hiz_ms = re_aday * MU / (RHO * c_w)
@@ -788,17 +807,13 @@ def flapli_adaylari_coz_ve_yaz(
         s_flapsiz = s_w - s_flap
         oran_flap = b_flap / b_w
 
-        re_flapsiz = reynolds_hesapla(c_w, hiz_ms=KALKIS_HIZI_MS)
-
         c_ht = aday_degeri_al(aday, "c_root_HT_m", "c_root_h_m", "c_HT_m")
         s_ht = aday_degeri_al(aday, "S_HT_m2", "S_h_m2")
         ar_ht = aday_degeri_al(aday, "AR_HT", "AR_h", varsayilan=4.0)
-        re_ht = reynolds_hesapla(c_ht, hiz_ms=KALKIS_HIZI_MS)
 
         c_vt = aday_degeri_al(aday, "c_root_VT_m", "c_root_v_m", "c_VT_m")
         s_vt = aday_degeri_al(aday, "S_VT_m2", "S_v_m2")
         ar_vt = aday_degeri_al(aday, "AR_VT", "AR_v", varsayilan=4.0)
-        re_vt = reynolds_hesapla(c_vt, hiz_ms=KALKIS_HIZI_MS)
 
         for re_flapsiz in FLAPLI_RE_DIZISI:
             hiz_ms = re_flapsiz * MU / (RHO * c_w)
