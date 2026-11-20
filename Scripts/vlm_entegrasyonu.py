@@ -61,6 +61,34 @@ from aday_siralama import (
     sayi_al as _ham_sayi_al,
 )
 
+# [DEĞİŞİKLİK 2026-11-18 | Görev A] Yeni VSPAERO modülü (OpenVSP Python API ile).
+# Eski elle yazılan .vspaero akışının yerine geçti; ayrıntılar vspaero_cozucu.py başında.
+from vspaero_cozucu import vspaero_api_coz, vspaero_hazir_mi
+from vspaero_cozucu import vspaero_api_coz_richardson  # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+
+# [DEĞİŞİKLİK 2026-11-18 | Görev A] VSPAERO davranış ayarları (main() içinde komut satırından doldurulur).
+# VSPAERO_ZORUNLU=True -> VSPAERO hata verirse program DURUR (NumPy'a geçmez).
+# VSPAERO_KUYRUK_DAHIL=True -> modele yatay kuyruk da eklenir (varsayılan: sadece kanat).
+VSPAERO_ZORUNLU = False
+VSPAERO_KUYRUK_DAHIL = False
+VSPAERO_MODEL_KLASORU: Optional[Path] = None
+VSPAERO_HATALARI: List[str] = []  # hangi geometride neden NumPy'a düşüldü
+VSPAERO_SPAN_PANEL: Optional[int] = None
+VSPAERO_UC_SIK: Optional[float] = None
+VSPAERO_RICHARDSON: Optional[Tuple[int, int]] = (24, 48)  # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson] None = tek ağ (VSPAERO_SPAN_PANEL)
+VSPAERO_E_KAYNAGI: str = "iz"                               # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson] "iz" | "yuzey"
+VSPAERO_VETER_TESS: Optional[int] = None
+# [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] Flaplı α0 için flap verimi (eta) ve CL eğrisi kurma yöntemi.
+#   FLAP_VERIMI: VSPAERO (sürtünmesiz) 30° flabın α0 kaymasını abartıyor; XFOIL/ince profil karşılaştırması
+#                (flap_alpha0_kontrol.py, 29 profil) ortanca eta: Re=200k 0.530, Re=250k (kalkış, v11) 0.531 -> 0.53.
+#                α0_flapli = α0_flapsiz + eta·(α0_flapli_VSPAERO − α0_flapsiz). 1.0 = düzeltme yok (ham VSPAERO).
+#   EGRI_YONTEMI: "otomatik" (VSPAERO: flapsız "kaydir", flaplı "dogrusal"; diğer çözücüler eski "olcekle"),
+#                 "kaydir", "dogrusal", "olcekle".
+FLAP_VERIMI: float = 0.53
+EGRI_YONTEMI: str = "otomatik"
+VSPAERO_GOVDE: Optional[Dict[str, Any]] = None  # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde] None = sadece kanat; dolu = her adaya gövde (tam akış)
+VSPAERO_E_VISKOZ: float = 0.995                 # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde] e viskoz düzeltmesindeki k çarpanı                    # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson] veter yönü panel (Tess_W)  # [DEĞİŞİKLİK 2026-11-18 v6 | inceleme-2 düzeltmeleri] kanat ucuna panel sıklaştırma (OutCluster)  # [DEĞİŞİKLİK 2026-11-18 v5 | gövde] açıklık yönü panel sayısı (None = varsayılan)
+
 
 def _anahtarlari_duzlestir(
     anahtarlar: Tuple[Any, ...],
@@ -165,16 +193,17 @@ def kullanilabilir_vlm_motoru_sec(tercih: str = "auto") -> str:
     tercih_norm = (tercih or "auto").strip().lower()
 
     if tercih_norm in ("vspaero", "auto"):
-        vspaero_bin = shutil.which("vspaero")
-        try:
-            import openvsp  # type: ignore # noqa: F401
-            openvsp_var = True
-        except ImportError:
-            openvsp_var = False
-        if vspaero_bin and openvsp_var:
+        # [DEĞİŞİKLİK 2026-11-18 | Görev A] Eskiden yalnızca PATH'te "vspaero" arıyordu (Windows'ta genelde
+        # PATH'te olmaz) ve nedenini söylemeden yedeğe geçiyordu. Artık kontrol
+        # vspaero_cozucu.vspaero_hazir_mi() ile yapılıyor ve sebep ekrana yazılıyor.
+        # --cozucu vspaero açıkça seçildiyse VSPAERO yoksa program durur.
+        hazir, mesaj = vspaero_hazir_mi()
+        if hazir:
+            print(f"[VSPAERO] Hazır: {mesaj}")
             return "vspaero"
+        print(f"[UYARI] VSPAERO kullanılamıyor: {mesaj}")
         if tercih_norm == "vspaero":
-            print("[UYARI] VSPAERO veya OpenVSP Python API bulunamadı; yedek VLM motoruna geçiliyor.")
+            raise RuntimeError(f"--cozucu vspaero seçildi ama VSPAERO hazır değil: {mesaj}")
 
     if tercih_norm in ("aerosandbox", "vspaero", "auto"):
         try:
@@ -572,16 +601,73 @@ def vspaero_cli_coz(
     flap_aciklik_orani: float = 0.0,
     alpha_l0_flap_2d_deg: Optional[float] = None,
     cl_max_flap_2d: Optional[float] = None,
+    ek_geometri: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """OpenVSP + VSPAERO CLI çözücüsü (flapsız ve flap kontrol yüzeyli analiz destekli)."""
-    vspaero_bin = shutil.which("vspaero")
+    """
+    [DEĞİŞİKLİK 2026-11-18 | Görev A] Fonksiyon gövdesi tamamen yenilendi.
+    ESKİ HAL (yedekler/vlm_entegrasyonu_YEDEK_2026-11-18_gorevA_oncesi.py) sorunları:
+      - .polar dosyasında AoA yerine Mach, CL yerine AoA sütununu okuyordu,
+      - kuyruk ve kanat profili modele eklenmiyordu,
+      - flaba gerçek sapma açısı yerine Δα0 veriliyordu,
+      - her hatada SESSİZCE NumPy çözücüsüne dönüyordu.
+    YENİ HAL: işi vspaero_cozucu.vspaero_api_coz() yapar (OpenVSP API, profil
+    dosyaları, flaplı profil, sonuçları sütun ADIYLA okuma). Hata olursa ekrana
+    yazılır, VSPAERO_HATALARI listesine eklenir; VSPAERO_ZORUNLU ise program durur.
+    alpha_l0_2d_deg / alpha_l0_flap_2d_deg artık kullanılmaz: VSPAERO α0'ı profil
+    kamburluğundan kendisi hesaplar (imza geriye dönük uyumluluk için korundu).
+    """
+    ek = dict(ek_geometri or {})
+    profil = str(ek.get("profil", "")).strip()
+    geo_etiket = f"{profil} b={b_w:.3f} S={s_w:.3f} flap_orani={flap_aciklik_orani:.3f}"
     try:
-        import openvsp as vsp  # type: ignore
-    except ImportError:
-        vsp = None
-
-    if vsp is None or vspaero_bin is None:
-        return aerosandbox_vlm_coz(
+        if not profil:
+            raise ValueError("ek_geometri içinde 'profil' yok")
+        # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde] Tam akışta gövde: ölçüler adayın kütle satırından, bilinmeyenler komut satırı parametrelerinden
+        _govde_kw: Dict[str, Any] = {}
+        if VSPAERO_GOVDE:
+            _D = float(ek.get("govde_D", 0.0) or 0.0)
+            _L = float(ek.get("govde_L", 0.0) or 0.0)
+            if _D <= 0 or _L <= 0:
+                raise ValueError("Gövde ölçüleri (govde_D_m, govde_L_toplam_m) kütle tablosunda bulunamadı")
+            _g = {"D": _D, "L_toplam": _L}
+            _g.update({k: v for k, v in VSPAERO_GOVDE.items()
+                       if k in ("L_aviyonik", "L_kuyruk", "D_min", "kanat_x", "kanat_z", "gomme")})
+            _govde_kw = {"govde": _g, "zcg": VSPAERO_GOVDE.get("zcg"),
+                         "flap_ic_y": (0.5 * _D if VSPAERO_GOVDE.get("flap_baslangic") == "govde_kenari" else 0.0)}
+        _coz = vspaero_api_coz  # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson] Richardson açıksa iki ağla çöz
+        _ek: Dict[str, Any] = {"span_panel": VSPAERO_SPAN_PANEL}
+        if VSPAERO_RICHARDSON:
+            _coz = vspaero_api_coz_richardson
+            _ek = {"n_kaba": VSPAERO_RICHARDSON[0], "n_ince": VSPAERO_RICHARDSON[1]}
+        return _coz(
+            **_ek,
+            e_kaynagi=VSPAERO_E_KAYNAGI,    # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+            viskoz_e_carpani=VSPAERO_E_VISKOZ,  # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
+            **_govde_kw,                        # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
+            veter_tess=VSPAERO_VETER_TESS,  # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+            profil=profil,
+            b_w=b_w,
+            c_w=c_w,
+            s_w=s_w,
+            cl_max_2d=cl_max_2d,
+            flap_aciklik_orani=flap_aciklik_orani,
+            cl_max_flap_2d=cl_max_flap_2d,
+            kuyruk_dahil=VSPAERO_KUYRUK_DAHIL,
+            b_ht=float(ek.get("b_ht", b_ht) or 0.0),
+            c_ht=float(ek.get("c_ht", c_ht) or 0.0),
+            tail_arm=float(ek.get("tail_arm", tail_arm) or 0.0),
+            kuyruk_profil=str(ek.get("kuyruk_profil", "naca0010") or "naca0010"),
+            model_klasoru=VSPAERO_MODEL_KLASORU,
+            uc_sik=VSPAERO_UC_SIK,          # [DEĞİŞİKLİK 2026-11-18 v6 | inceleme-2 düzeltmeleri]
+        )
+    except Exception as exc:
+        mesaj = f"{geo_etiket}: {type(exc).__name__}: {exc}"
+        VSPAERO_HATALARI.append(mesaj)
+        print(f"[VSPAERO-HATA] {mesaj}")
+        if VSPAERO_ZORUNLU:
+            raise
+        print("[VSPAERO-HATA] Bu geometri için NumPy VLM yedeğine geçiliyor (sonuçta 'cozucu' sütununa bakın).")
+        sonuc = numpy_3d_vlm_coz(
             b_w=b_w,
             c_w=c_w,
             s_w=s_w,
@@ -594,141 +680,8 @@ def vspaero_cli_coz(
             alpha_l0_flap_2d_deg=alpha_l0_flap_2d_deg,
             cl_max_flap_2d=cl_max_flap_2d,
         )
-
-    flap_orani = float(np.clip(flap_aciklik_orani, 0.0, 1.0))
-    alpha_l0_flap_deg = (
-        float(alpha_l0_flap_2d_deg)
-        if alpha_l0_flap_2d_deg is not None
-        else float(alpha_l0_2d_deg)
-    )
-    cl_max_flap_kesit = (
-        float(cl_max_flap_2d)
-        if (cl_max_flap_2d is not None and cl_max_flap_2d > 0.1)
-        else float(cl_max_2d)
-    )
-
-    try:
-        with tempfile.TemporaryDirectory(prefix="vspaero_run_") as tmpdir:
-            tmp_path = Path(tmpdir)
-            vsp.VSPCheckSetup()
-            vsp.ClearVSPModel()
-
-            wid = vsp.AddGeom("WING")
-            vsp.SetParmVal(wid, "Span", "XSec_1", float(0.5 * b_w))
-            vsp.SetParmVal(wid, "Root_Chord", "XSec_1", float(c_w))
-            vsp.SetParmVal(wid, "Tip_Chord", "XSec_1", float(c_w))
-
-            if flap_orani > 1e-4:
-                try:
-                    ss_id = vsp.AddSubSurf(wid, vsp.SS_CONTROL)
-                    vsp.SetParmVal(wid, "UStart", ss_id, 0.0)
-                    vsp.SetParmVal(wid, "UEnd", ss_id, float(np.clip(flap_orani, 0.1, 0.95)))
-                    vsp.SetParmVal(wid, "Length_C_Start", ss_id, 0.30)
-                except Exception:
-                    pass
-
-            vsp.Update()
-
-            degen_base = str(tmp_path / "aday")
-            vsp.SetComputationFileName(vsp.DEGEN_GEOM_CSV_TYPE, degen_base + "_DegenGeom.csv")
-            vsp.ComputeDegenGeom(vsp.SET_ALL, vsp.DEGEN_GEOM_CSV_TYPE)
-
-            vspaero_input = tmp_path / "aday_DegenGeom.vspaero"
-            vspaero_lines = [
-                f"Sref = {s_w:.6f}",
-                f"Cref = {c_w:.6f}",
-                f"Bref = {b_w:.6f}",
-                f"X_cg = {0.25 * c_w:.6f}",
-                "Y_cg = 0.0",
-                "Z_cg = 0.0",
-                "Mach = 0.0588",
-                "AoA = 0.0, 4.0",
-                "Beta = 0.0",
-                "Vinf = 20.0",
-                "Rho = 1.175",
-                "ReCref = 250000",
-                "ClMax = -1.0",
-                "MaxTurningAngle = -1.0",
-                "Symmetry = Y",
-                "FarDist = -1.0",
-                "NumWakeNodes = 32",
-                "WakeIters = 3",
-            ]
-            if flap_orani > 1e-4:
-                delta_alpha_0 = float(alpha_l0_2d_deg - alpha_l0_flap_deg)
-                vspaero_lines.extend(
-                    [
-                        "NumberOfControlGroups = 1",
-                        "FlapGroup",
-                        "WingGeom_Surf0_SubSurf0",
-                        "1.0",
-                        f"{max(delta_alpha_0, 0.0):.4f}",
-                    ]
-                )
-            vspaero_input.write_text("\n".join(vspaero_lines) + "\n", encoding="utf-8")
-
-            subprocess.run(
-                [vspaero_bin, "-omp", "4", str(tmp_path / "aday_DegenGeom")],
-                cwd=str(tmp_path),
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=30,
-            )
-
-            polar_file = tmp_path / "aday_DegenGeom.polar"
-            if polar_file.is_file():
-                lines = [
-                    ln.strip()
-                    for ln in polar_file.read_text(encoding="utf-8", errors="ignore").splitlines()
-                    if ln.strip() and not ln.strip().startswith("#")
-                ]
-                data_rows = []
-                for ln in lines:
-                    parts = ln.split()
-                    try:
-                        vals = [float(x) for x in parts]
-                        if len(vals) >= 9:
-                            data_rows.append(vals)
-                    except ValueError:
-                        continue
-                if len(data_rows) >= 2:
-                    aoa0, cl0 = data_rows[0][1], data_rows[0][2]
-                    aoa1, cl1 = data_rows[1][1], data_rows[1][2]
-                    e1 = data_rows[1][8]
-                    cl_alpha = max((cl1 - cl0) / max(aoa1 - aoa0, 1e-4), 1e-4)
-                    e_oswald = float(np.clip(e1, 0.50, 0.98))
-                    alpha_l0_eff = (
-                        float(alpha_l0_2d_deg - flap_orani * (alpha_l0_2d_deg - alpha_l0_flap_deg))
-                        if flap_orani > 1e-4
-                        else float(alpha_l0_2d_deg)
-                    )
-                    cl_max_eff_2d = flap_orani * cl_max_flap_kesit + (1.0 - flap_orani) * float(cl_max_2d)
-                    return {
-                        "cozucu": "vspaero_cli",
-                        "CL_alpha_3d_per_deg": round(cl_alpha, 6),
-                        "alpha_L0_deg": round(alpha_l0_eff, 4),
-                        "e_oswald": round(e_oswald, 5),
-                        "CL_max_3d_tahmini": round(cl_max_eff_2d * (0.90 if flap_orani > 1e-4 else 0.92), 5),
-                        "peak_cl_ratio": 1.087,
-                        "flap_aciklik_orani": round(flap_orani, 4),
-                    }
-    except Exception:
-        pass
-
-    return numpy_3d_vlm_coz(
-        b_w=b_w,
-        c_w=c_w,
-        s_w=s_w,
-        b_ht=b_ht,
-        c_ht=c_ht,
-        tail_arm=tail_arm,
-        alpha_l0_2d_deg=alpha_l0_2d_deg,
-        cl_max_2d=cl_max_2d,
-        flap_aciklik_orani=flap_aciklik_orani,
-        alpha_l0_flap_2d_deg=alpha_l0_flap_2d_deg,
-        cl_max_flap_2d=cl_max_flap_2d,
-    )
+        sonuc["cozucu"] = "numpy_3d_vlm_VSPAERO_HATASI_SONRASI_YEDEK"
+        return sonuc
 
 
 def _secilen_vlm_cozucu_cagir(
@@ -746,10 +699,12 @@ def _secilen_vlm_cozucu_cagir(
     flap_aciklik_orani: float = 0.0,
     alpha_l0_flap_2d_deg: Optional[float] = None,
     cl_max_flap_2d: Optional[float] = None,
+    ek_geometri: Optional[Dict[str, Any]] = None,  # [DEĞİŞİKLİK 2026-11-18 | Görev A] VSPAERO için profil/kuyruk bilgisi
 ) -> Dict[str, Any]:
     """Seçilen VLM motorunu flapsız veya flaplı parametrelerle çalıştırır."""
     if motor == "vspaero":
         return vspaero_cli_coz(
+            ek_geometri=ek_geometri,  # [DEĞİŞİKLİK 2026-11-18 | Görev A]
             b_w=b_w,
             c_w=c_w,
             s_w=s_w,
@@ -844,6 +799,8 @@ def ilk_500_aday_vlm_analizi(
     cozucu_tercihi: str = "auto",
     n_span: int = 24,
     n_chord: int = 4,
+    kutle_satirlari: Optional[List[Dict[str, Any]]] = None,  # [DEĞİŞİKLİK 2026-11-18 | Görev A] VSPAERO kuyruk/profil bilgisi için
+    geometri_limiti: int = 0,  # [DEĞİŞİKLİK 2026-11-18 | Görev A] >0 ise sadece ilk N geometri çözülür (hızlı test)
 ) -> Dict[Tuple[str, float, float, float], Dict[str, Any]]:
     """
     İlk 500 adaydaki benzersiz kanat-kuyruk geometrileri için hem flapsız 3B VLM
@@ -866,10 +823,21 @@ def ilk_500_aday_vlm_analizi(
 
     vlm_sonuc_haritasi: Dict[Tuple[str, float, float, float], Dict[str, Any]] = {}
 
+    # [DEĞİŞİKLİK 2026-11-18 | Görev A] Kütle tablosundan (kanat_kuyruk_govde_kutleli.csv) gerçek kuyruk kolu,
+    # kuyruk profili ve yatay kuyruk ölçüleri alınır. Sadece VSPAERO kullanır;
+    # NumPy/AeroSandbox çözücülerinin girdileri DEĞİŞMEDİ (test tabanı bozulmasın diye).
+    kutle_geo_indeks: Dict[Tuple[str, float, float, float], Dict[str, Any]] = {}
+    for kr in (kutle_satirlari or []):
+        kk = _geometri_anahtari(kr)
+        if kk[0] and kk not in kutle_geo_indeks:
+            kutle_geo_indeks[kk] = kr
+
     for row in vlm_aday_satirlari:
         g_key = _geometri_anahtari(row)
         if not g_key[0] or g_key[1] <= 0.0 or g_key in vlm_sonuc_haritasi:
             continue
+        if geometri_limiti > 0 and len(vlm_sonuc_haritasi) >= geometri_limiti:  # [DEĞİŞİKLİK 2026-11-18 | Görev A]
+            break
 
         profil, b_w, s_w, c_w = g_key
         if c_w <= 0.0:
@@ -913,6 +881,18 @@ def ilk_500_aday_vlm_analizi(
             cl_max_3d_llt = 1.35
         cl_max_2d_tahmin = max(cl_max_3d_llt / 0.92, 0.90)
 
+        # [DEĞİŞİKLİK 2026-11-18 | Görev A] VSPAERO'ya giden ek geometri bilgisi
+        kutle_ref = kutle_geo_indeks.get(g_key, {})
+        ek_geometri = {
+            "profil": profil,
+            "tail_arm": sayi_al(kutle_ref, "tail_arm_m", varsayilan=tail_arm),
+            "b_ht": sayi_al(kutle_ref, "b_HT_m", varsayilan=b_ht),
+            "c_ht": sayi_al(kutle_ref, "c_root_HT_m", "c_HT_m", varsayilan=c_ht),
+            "kuyruk_profil": Path(metin_al(kutle_ref, "kuyruk_airfoil", varsayilan="naca0010")).stem,
+            "govde_D": sayi_al(kutle_ref, "govde_D_m", varsayilan=0.0),           # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
+            "govde_L": sayi_al(kutle_ref, "govde_L_toplam_m", "govde_L_m", varsayilan=0.0),    # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
+        }
+
         # 1) Flapsız 3B VLM Çözümü
         vlm_flapsiz = _secilen_vlm_cozucu_cagir(
             motor=motor,
@@ -927,6 +907,7 @@ def ilk_500_aday_vlm_analizi(
             n_span=n_span,
             n_chord=n_chord,
             flap_aciklik_orani=0.0,
+            ek_geometri=ek_geometri,  # [DEĞİŞİKLİK 2026-11-18 | Görev A]
         )
 
         cl_alpha_vlm = float(vlm_flapsiz["CL_alpha_3d_per_deg"])
@@ -1002,12 +983,21 @@ def ilk_500_aday_vlm_analizi(
             flap_aciklik_orani=oran_flap,
             alpha_l0_flap_2d_deg=alpha_l0_flap_kesit_2d,
             cl_max_flap_2d=cl_max_flap_kesit_2d,
+            ek_geometri=ek_geometri,  # [DEĞİŞİKLİK 2026-11-18 | Görev A]
         )
 
         cl_alpha_flap_vlm = float(vlm_flapli["CL_alpha_3d_per_deg"])
         e_flap_vlm = float(vlm_flapli["e_oswald"])
         cl_max_flap_vlm = float(vlm_flapli["CL_max_3d_tahmini"])
         alpha_l0_flap_vlm = float(vlm_flapli["alpha_L0_deg"])
+        # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] Flap verimi düzeltmesi (yalnız VSPAERO sonucuna):
+        # sürtünmesiz çözücü 30° flabın α0 kaymasını abartır (≈ −11.6° yerine XFOIL'e göre ≈ −6°).
+        alpha_l0_flap_ham = alpha_l0_flap_vlm
+        flap_verimi_uygulanan = 1.0
+        if str(vlm_flapli.get("cozucu", "")).startswith("vspaero") and oran_flap > 1e-4:
+            _a0_temiz = float(vlm_flapsiz["alpha_L0_deg"])
+            flap_verimi_uygulanan = float(FLAP_VERIMI)
+            alpha_l0_flap_vlm = _a0_temiz + flap_verimi_uygulanan * (alpha_l0_flap_ham - _a0_temiz)
 
         cl_alpha_flap_orani = cl_alpha_flap_vlm / max(cl_alpha_flap_llt, 1e-5)
         e_flap_orani = e_flap_vlm / max(e_flap_llt, 1e-5)
@@ -1026,6 +1016,8 @@ def ilk_500_aday_vlm_analizi(
             "flap_aciklik_orani": round(oran_flap, 4),
             "CL_alpha_3d_flapli_per_deg": round(cl_alpha_flap_vlm, 6),
             "alpha_L0_flapli_deg": round(alpha_l0_flap_vlm, 4),
+            "alpha_L0_flapli_ham_deg": round(alpha_l0_flap_ham, 4),        # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] düzeltme öncesi
+            "flap_verimi": round(flap_verimi_uygulanan, 4),                # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] 1.0 = düzeltme yok
             "e_oswald_flapli": round(e_flap_vlm, 5),
             "CL_max_3d_flapli_tahmini": round(cl_max_flap_vlm, 5),
             "CL_alpha_flapli_llt": round(cl_alpha_flap_llt, 6),
@@ -1034,6 +1026,10 @@ def ilk_500_aday_vlm_analizi(
             "cl_alpha_flapli_orani": round(cl_alpha_flap_orani, 5),
             "e_oswald_flapli_orani": round(e_flap_orani, 5),
             "cl_max_flapli_orani": round(cl_max_flap_orani, 5),
+            # [DEĞİŞİKLİK 2026-11-18 | Görev A] Hangi çözücünün kullanıldığı + VSPAERO model dosyaları (Görev B karşılaştırması için)
+            "cozucu_flapli": vlm_flapli.get("cozucu", ""),
+            "vsp3_flapsiz": vlm_flapsiz.get("vsp3_dosyasi", ""),
+            "vsp3_flapli": vlm_flapli.get("vsp3_dosyasi", ""),
         }
 
     print(
@@ -1062,6 +1058,63 @@ def _tek_mod_tablolari_guncelle(
     cl_max_key = "CL_max_3d_flapli_tahmini" if flapli_mi else "CL_max_3d_tahmini"
     cl_orani_key = "cl_alpha_flapli_orani" if flapli_mi else "cl_alpha_orani"
 
+    # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] "kaydir" yönteminde her LLT eğrisi (aday + hız + Re) ayrı ele alınır:
+    # eğrinin kendi doğrusal bölgesinden eğim ve α0 bulunur, sonra eğri VLM α0'ına KAYDIRILIR ve VLM eğimine
+    # ÖLÇEKLENİR. Böylece kalkış/iniş/tırmanışın kullandığı CL eğrisi ile seyirin kullandığı CLα/α0 sütunları
+    # aynı sayıyı verir; stall bölgesinin şekli LLT'den korunur. Eski yöntem ("olcekle") yalnız eğimi
+    # düzeltiyor, LLT α0'ını eğride bırakıyordu (flaplıda CL ≈ %45 eksik çıkabiliyordu).
+    cozucu_alan = "cozucu_flapli" if flapli_mi else "cozucu"
+    egri_gruplari: Dict[Tuple[Any, ...], List[Tuple[float, float]]] = {}
+    egri_parametreleri: Dict[Tuple[Any, ...], Optional[Tuple[float, float, float, float]]] = {}
+
+    def _egri_anahtari(row: Dict[str, Any], g_key: Tuple[str, float, float, float]) -> Tuple[Any, ...]:
+        return (g_key, metin_al(row, "temel_aday_id", varsayilan=""), metin_al(row, "konfigurasyon_id", varsayilan=""),
+                metin_al(row, "hiz_ms", varsayilan=""), metin_al(row, "Re_aday", varsayilan=""))
+
+    def _yontem(vlm: Dict[str, Any]) -> str:
+        if EGRI_YONTEMI in ("kaydir", "olcekle", "dogrusal"):
+            return EGRI_YONTEMI
+        if not str(vlm.get(cozucu_alan, vlm.get("cozucu", ""))).startswith("vspaero"):
+            return "olcekle"
+        # Flaplı LLT eğrileri güvenilir değil: düşük açılarda düz taban (60/1044 eğri) ve eğimi sütundan farklı
+        # kıvrımlı bölgeler var -> flaplıda doğru + CL_max sınırı; flapsızda LLT stall şekli korunur.
+        return "dogrusal" if flapli_mi else "kaydir"
+
+    for row in llt_satirlar:
+        g_key = _geometri_anahtari(row)
+        if _vlm_eslesmesi_bul(vlm_haritasi, g_key) is None or str(row.get("CL", "")).strip() == "":
+            continue
+        egri_gruplari.setdefault(_egri_anahtari(row, g_key), []).append(
+            (sayi_al(row, "alpha_deg", varsayilan=0.0), sayi_al(row, "CL", varsayilan=0.0)))
+
+    def _egri_dogrusu(noktalar: List[Tuple[float, float]]) -> Optional[Tuple[float, float, float, float]]:
+        """(eğim, α0, en küçük α, en büyük α) — eğrinin doğrusal bölgesi: baştan CL ≤ 0.7·CL_max'a kadar."""
+        nk = sorted(set(noktalar))
+        while len(nk) >= 2 and abs(nk[1][1] - nk[0][1]) < 1e-9:  # baştaki düz tabanı (LLT kırpması) at
+            nk = nk[1:]
+        if len(nk) < 3:
+            return None
+        cl_tepe = max(c for _, c in nk)
+        sec: List[Tuple[float, float]] = []
+        for a, c in nk:
+            if c > 0.7 * cl_tepe and len(sec) >= 3:
+                break
+            sec.append((a, c))
+        egim, kes = np.polyfit([a for a, _ in sec], [c for _, c in sec], 1)
+        if egim <= 1e-6:
+            return None
+        return float(egim), float(-kes / egim), nk[0][0], nk[-1][0]
+
+    def _egri_deger(noktalar: List[Tuple[float, float]], prm: Tuple[float, float, float, float], a: float) -> float:
+        """Eğriden ara değer; aralık altında doğrusal uzatma, üstünde son değer (stall platosu)."""
+        egim, a0, a_min, a_max = prm
+        nk = sorted(set(noktalar))
+        if a <= a_min:
+            return egim * (a - a0) + (nk[0][1] - egim * (a_min - a0))
+        if a >= a_max:
+            return nk[-1][1]
+        return float(np.interp(a, [p for p, _ in nk], [c for _, c in nk]))
+
     yeni_llt: List[Dict[str, Any]] = []
     for row in llt_satirlar:
         g_key = _geometri_anahtari(row)
@@ -1072,6 +1125,35 @@ def _tek_mod_tablolari_guncelle(
             continue
 
         r_copy = dict(row)
+        # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] kaydır + ölçekle (flapsız) / doğru + CL_max sınırı (flaplı)
+        _ym = _yontem(vlm)
+        if _ym in ("kaydir", "dogrusal") and str(r_copy.get("CL", "")).strip() != "":
+            ek = _egri_anahtari(row, g_key)
+            if _ym == "kaydir" and ek not in egri_parametreleri:
+                egri_parametreleri[ek] = _egri_dogrusu(egri_gruplari.get(ek, []))
+            prm = egri_parametreleri.get(ek) if _ym == "kaydir" else None
+            if _ym == "dogrusal" or prm is not None:
+                cla_v, a0_v = float(vlm[cl_alpha_key]), float(vlm[alpha_l0_key])
+                alfa = sayi_al(r_copy, "alpha_deg", varsayilan=0.0)
+                if _ym == "kaydir":
+                    kayma = a0_v - prm[1]
+                    cl_yeni = (cla_v / prm[0]) * _egri_deger(egri_gruplari[ek], prm, alfa - kayma)
+                else:
+                    cl_yeni = min(cla_v * (alfa - a0_v), float(vlm[cl_max_key]))
+                r_copy["e_oswald"] = f"{float(vlm[e_key]):.6f}"
+                r_copy["CL_alpha_3d_per_deg"] = f"{cla_v:.6f}"
+                r_copy["alpha_L0_deg"] = f"{a0_v:.4f}"
+                r_copy["CL_max_3d_tahmini"] = f"{float(vlm[cl_max_key]):.6f}"
+                if flapli_mi:
+                    if "flap_airfoil" not in r_copy or not str(r_copy.get("flap_airfoil", "")).strip():
+                        r_copy["flap_airfoil"] = f"{g_key[0]}_flap"
+                    if "b_flap_m" not in r_copy or not str(r_copy.get("b_flap_m", "")).strip():
+                        r_copy["b_flap_m"] = f"{float(vlm['b_flap_m']):.4f}"
+                r_copy["CL"] = f"{cl_yeni:.6f}"
+                if "CL_kanat" in r_copy:
+                    r_copy["CL_kanat"] = r_copy["CL"]
+                yeni_llt.append(r_copy)
+                continue
         r_copy["e_oswald"] = f"{float(vlm[e_key]):.6f}"
         r_copy["CL_alpha_3d_per_deg"] = f"{float(vlm[cl_alpha_key]):.6f}"
         r_copy["alpha_L0_deg"] = f"{float(vlm[alpha_l0_key]):.4f}"
@@ -1766,6 +1848,22 @@ def vlm_adaylarini_yeniden_puanla(
                 "llt_sira": eski_sira,
                 "sira_degisimi": eski_sira - yeni_sira,
                 "vlm_cozucu": vlm.get("cozucu", ""),
+                "vlm_cozucu_flapli": vlm.get("cozucu_flapli", ""),          # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+                "e_kaynagi_vlm": vlm.get("e_kaynagi", ""),                  # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+                "e_span_ham_vlm": vlm.get("e_span_vspaero_ham", ""),        # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+                "e_yuzey_vlm": vlm.get("e_yuzey", ""),                      # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+                "richardson_vlm": vlm.get("richardson", ""),                # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+                "vlm_kalite": vlm.get("kalite", ""),                        # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+                "vlm_govde_dahil": vlm.get("govde_dahil", ""),              # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
+                "vlm_kanat_x_ceyrek_m": vlm.get("kanat_x_ceyrek_m", ""),    # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
+                "vlm_kanat_z_m": vlm.get("kanat_z_m", ""),                  # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
+                "vlm_Cm_alpha_per_deg": vlm.get("Cm_alpha_per_deg", ""),    # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
+                "alpha_L0_flapli_ham_vlm": vlm.get("alpha_L0_flapli_ham_deg", ""),  # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı]
+                "flap_verimi_vlm": vlm.get("flap_verimi", ""),                   # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı]
+                "egri_yontemi_vlm": EGRI_YONTEMI,                                # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı]
+                "CL_max_kaynak": vlm.get("CL_max_kaynak", ""),              # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+                "vsp3_flapsiz": vlm.get("vsp3_flapsiz", ""),                # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+                "vsp3_flapli": vlm.get("vsp3_flapli", ""),                  # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
                 "e_oswald_llt": e_llt,
                 "CL_alpha_3d_vlm": vlm.get("CL_alpha_3d_per_deg", ""),
                 "alpha_L0_vlm": vlm.get("alpha_L0_deg", ""),
@@ -1914,6 +2012,153 @@ def argumanlari_coz(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=0.0,
         help="İniş fazı için ek batarya tüketim bütçesi (mAh)",
     )
+    # [DEĞİŞİKLİK 2026-11-18 | Görev A] Görev A için yeni komut satırı seçenekleri
+    parser.add_argument(
+        "--vspaero-zorunlu",
+        dest="vspaero_zorunlu",
+        action="store_true",
+        default=False,
+        help="VSPAERO herhangi bir geometride hata verirse NumPy'a geçmeden programı durdur.",
+    )
+    parser.add_argument(
+        "--vspaero-kuyruk",
+        dest="vspaero_kuyruk",
+        action="store_true",
+        default=False,
+        help="VSPAERO modeline yatay kuyruğu da ekle (varsayılan: sadece kanat).",
+    )
+    parser.add_argument(
+        "--vlm-test",
+        dest="vlm_test",
+        type=int,
+        default=0,
+        help="Sadece ilk N geometriyi seçilen çözücü + NumPy ile çöz, karşılaştırma CSV'si yaz ve çık "
+             "(performans modülleri çalışmaz, ana çıktı dosyalarına dokunulmaz).",
+    )
+    # [DEĞİŞİKLİK 2026-11-18 v5 | gövde] Gövde ve panel seçenekleri
+    parser.add_argument(
+        "--vspaero-govde",
+        dest="vspaero_govde",
+        action="store_true",
+        default=False,
+        help="[DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde] VSPAERO modeline gövdeyi ekle. --vlm-test N ile: gövdeli/gövdesiz KARŞILAŞTIRMA testi. "
+             "Tek başına (tam akış): HER adaya gövde eklenir ve tablolara KANAT+GÖVDE katsayıları gider. "
+             "Bilinmeyenler: --kanat-x, --kanat-z, --govde-gomme, --zcg, --flap-baslangic, --govde-l-aviyonik, "
+             "--govde-l-kuyruk, --govde-d-min, --e-viskoz-carpan.",
+    )
+    parser.add_argument(
+        "--kanat-x",
+        dest="kanat_x",
+        type=float,
+        default=None,
+        help="Kanat 1/4 veterinin burundan uzaklığı [m]. Verilmezse su haznesinin ortası.",
+    )
+    parser.add_argument(
+        "--kanat-z",
+        dest="kanat_z",
+        default="alt_gomulu",  # [DEĞİŞİKLİK 2026-11-18 v7 | ekip kararı: kanat yeri] ekip: kanat gövdenin içinde, alt yüzeye olabildiğince yakın (eskiden "ust")
+        help="[DEĞİŞİKLİK 2026-11-18 v6 | inceleme-2 düzeltmeleri] Kanadın gövdeye göre dikey yeri: ust (gerçek yüksek kanat) | ust_gomulu | orta | alt "
+             "(gerçek alçak kanat) | alt_gomulu | hepsi | virgüllü liste (ör. ust,alt) veya sayı [m]. "
+             "Konum profil kalınlığından hesaplanır (bkz. vspaero_cozucu.kanat_z_hesapla).",
+    )
+    parser.add_argument(
+        "--govde-gomme",
+        dest="govde_gomme",
+        type=float,
+        default=None,
+        help="[DEĞİŞİKLİK 2026-11-18 v6 | inceleme-2 düzeltmeleri] Kanadın gövdeye gömülme payı [m] (varsayılan 0.005).",
+    )
+    parser.add_argument(
+        "--zcg",
+        dest="zcg",
+        default=None,
+        help="[DEĞİŞİKLİK 2026-11-18 v6 | inceleme-2 düzeltmeleri] Moment referans yüksekliği: sayı [m] (gövde ekseni = 0, varsayılan) veya 'kanat'.",
+    )
+    parser.add_argument(
+        "--flap-baslangic",
+        dest="flap_baslangic",
+        choices=("merkez", "govde_kenari"),
+        default="merkez",  # [DEĞİŞİKLİK 2026-11-19 v11 | flap ve k diğer kodlardan] kanat_boyutlandirma.py ile aynı: flap kanadın ortasında, y ∈ [−b_flap/2, +b_flap/2] (v8'de govde_kenari idi)
+        help="[DEĞİŞİKLİK 2026-11-18 v6 | inceleme-2 düzeltmeleri] Flabın başladığı yer (flap boyu 1 m sabit; govde_kenari'nda flap dışa kayar). Varsayılan: merkez (kanat_boyutlandirma.py / LLT ile aynı).",  # [DEĞİŞİKLİK 2026-11-19 v11 | flap ve k diğer kodlardan]  # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] yardım metni düzeltildi
+    )
+    parser.add_argument(
+        "--vspaero-richardson",
+        dest="vspaero_richardson",
+        default="evet",
+        help="[DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson] e için iki ağlı Richardson: 'evet' (VARSAYILAN: ince = --vspaero-span-panel, kaba = yarısı; "
+             "48 -> 24/48), 'kaba,ince' (ör. 32,64) veya 'yok' (tek ağ). Süreyi ~1.5 katına çıkarır.",
+    )
+    parser.add_argument(
+        "--vspaero-e-kaynagi",
+        dest="vspaero_e_kaynagi",
+        choices=("iz", "yuzey"),
+        default="iz",
+        help="[DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson] e kaynağı: iz (Trefftz, CLiw/CDiw — önerilen) veya yuzey (eski; panel arttıkça ıraksıyor).",
+    )
+    parser.add_argument(
+        "--vspaero-veter-tess",
+        dest="vspaero_veter_tess",
+        type=int,
+        default=None,
+        help="[DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson] Kanat veter yönü panel ayarı (OpenVSP Tess_W; varsayılan 33). Test değerleri: 17, 33, 65.",
+    )
+    parser.add_argument(
+        "--govde-l-aviyonik", dest="govde_l_aviyonik", type=float, default=0.30,
+        help="[DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde] Gövde aviyonik silindiri boyu [m] (govde_boyutlandirma.py: 0.30).",
+    )
+    parser.add_argument(
+        "--govde-l-kuyruk", dest="govde_l_kuyruk", type=float, default=1.00,
+        help="[DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde] Gövde kuyruk konisi boyu [m] (govde_boyutlandirma.py: 1.0).",
+    )
+    parser.add_argument(
+        "--govde-d-min", dest="govde_d_min", type=float, default=0.08,
+        help="[DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde] Kuyruk konisi uç çapı [m] (govde_boyutlandirma.py: 0.08).",
+    )
+    parser.add_argument(
+        "--e-viskoz-carpan", dest="e_viskoz_carpan", type=float, default=None,  # [DEĞİŞİKLİK 2026-11-19 v11 | flap ve k diğer kodlardan] None = gövde modelliyse 1.0, değilse 0.995
+        help="[DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde] e düzeltmesindeki k: 1/e = 1/(k·e_span) + 0.007·π·AR. Gövde VSPAERO'da modellenince "
+             "Verilmezse: gövde VSPAERO'da modelliyse 1.0, değilse 0.995 (lifting_line_cozucu.py'de k_fus=0.995 'gövde blokajı düzeltmesi'; "
+             "gövde modellenince iki kez sayılmasın).",
+    )
+    parser.add_argument(
+        "--vspaero-uc-sik",
+        dest="vspaero_uc_sik",
+        type=float,
+        default=None,
+        help="[DEĞİŞİKLİK 2026-11-18 v6 | inceleme-2 düzeltmeleri] Kanat ucuna doğru panel sıklaştırma (OutCluster, ör. 0.5). Varsayılan: OpenVSP varsayılanı.",
+    )
+    parser.add_argument(
+        "--vspaero-yontem",
+        dest="vspaero_yontem",
+        choices=("vlm", "panel", "hepsi"),
+        default="vlm",
+        help="Gövde testinde VSPAERO yöntemi: vlm (ince yüzey), panel (kalın yüzey) veya hepsi.",
+    )
+    parser.add_argument(
+        "--vspaero-span-panel",
+        dest="vspaero_span_panel",
+        type=int,
+        default=48,  # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson] eskiden None (OpenVSP varsayılanı 6 şerit/bölüm — çok kaba)
+        help="[DEĞİŞİKLİK 2026-11-18 v6 | inceleme-2 düzeltmeleri] YARIM KANADIN toplam açıklık yönü şerit sayısı (bölümlere boyla orantılı dağıtılır). "
+             "Panel yakınsama testi için (ör. 6, 12, 24, 48).",
+    )
+    parser.add_argument(  # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı]
+        "--flap-verimi",
+        dest="flap_verimi",
+        type=float,
+        default=0.53,
+        help="[DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] VSPAERO flaplı α0 kaymasına uygulanan flap verimi (eta). "
+             "0.53 = XFOIL/ince profil karşılaştırmasının ortancası (flap_alpha0_kontrol.py). 1.0 = ham VSPAERO.",
+    )
+    parser.add_argument(  # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı]
+        "--egri-yontemi",
+        dest="egri_yontemi",
+        choices=("otomatik", "kaydir", "dogrusal", "olcekle"),
+        default="otomatik",
+        help="[DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] LLT CL eğrisinin VLM ile güncellenmesi: kaydir = VLM α0'ına kaydır + "
+             "VLM eğimine ölçekle (LLT stall şekli korunur); dogrusal = CLα·(α−α0), CL_max'ta sınırlı; olcekle = eski yöntem (yalnız eğim, "
+             "LLT α0'ı eğride kalır); otomatik = VSPAERO'da flapsız kaydir + flaplı dogrusal, diğer çözücülerde olcekle.",
+    )
     parser.add_argument(
         "--analitik-olcekleme",
         dest="analitik_olcekleme",
@@ -1954,8 +2199,280 @@ def _hedef_geometriler_icin_csv_oku(
         return []
 
 
+def _vspaero_hata_ozeti_yaz() -> None:
+    """[DEĞİŞİKLİK 2026-11-18 | Görev A] VSPAERO'nun hata verip NumPy'a düştüğü geometrileri özetler (sessiz yedek yok)."""
+    if VSPAERO_HATALARI:
+        print(f"\n[VSPAERO-ÖZET] {len(VSPAERO_HATALARI)} çözümde VSPAERO hata verdi, NumPy yedeği kullanıldı:")
+        for m in VSPAERO_HATALARI[:10]:
+            print(f"   - {m}")
+        if len(VSPAERO_HATALARI) > 10:
+            print(f"   ... (+{len(VSPAERO_HATALARI) - 10} tane daha)")
+
+
+def _vlm_test_modu(
+    args: argparse.Namespace,
+    ilk_500: List[Dict[str, Any]],
+    llt_flapsiz_satirlar: List[Dict[str, Any]],
+    llt_flapli_satirlar: List[Dict[str, Any]],
+    kutle_satirlari: List[Dict[str, Any]],
+) -> int:
+    """
+    [DEĞİŞİKLİK 2026-11-18 | Görev A] Hızlı test: ilk N geometri seçilen çözücüyle VE NumPy ile çözülür,
+    sonuçlar yan yana `vlm_sonuclari/vlm_test_karsilastirma.csv` dosyasına yazılır.
+    Ana çıktı dosyalarına (vlm_nihai_ucak_siralamasi.csv vb.) DOKUNULMAZ.
+    Görev B (arayüzlü OpenVSP) sonuçları bu dosyadaki değerlerle karşılaştırılır.
+    """
+    n = int(args.vlm_test)
+    print(f"[VLM-TEST] İlk {n} geometri '{args.cozucu}' ve 'numpy_vlm' ile çözülüyor...")
+    ortak = dict(
+        vlm_aday_satirlari=ilk_500,
+        llt_flapsiz_satirlar=llt_flapsiz_satirlar,
+        llt_flapli_satirlar=llt_flapli_satirlar,
+        n_span=args.n_span,
+        n_chord=args.n_chord,
+        kutle_satirlari=kutle_satirlari,
+        geometri_limiti=n,
+    )
+    secilen = ilk_500_aday_vlm_analizi(cozucu_tercihi=args.cozucu, **ortak)
+    _vspaero_hata_ozeti_yaz()
+    numpy_sonuc = ilk_500_aday_vlm_analizi(cozucu_tercihi="numpy_vlm", **ortak)
+
+    alanlar = [
+        ("CL_alpha_3d_per_deg", "CLa_flapsiz"),
+        ("alpha_L0_deg", "a0_flapsiz"),
+        ("e_oswald", "e_flapsiz"),
+        ("CL_max_3d_tahmini", "CLmax_flapsiz"),
+        ("CL_alpha_3d_flapli_per_deg", "CLa_flapli"),
+        ("alpha_L0_flapli_deg", "a0_flapli"),
+        ("e_oswald_flapli", "e_flapli"),
+        ("CL_max_3d_flapli_tahmini", "CLmax_flapli"),
+    ]
+    satirlar: List[Dict[str, Any]] = []
+    for g_key, s in secilen.items():
+        npy = numpy_sonuc.get(g_key, {})
+        r: Dict[str, Any] = {
+            "profil": g_key[0], "b_w_m": g_key[1], "S_w_m2": g_key[2], "c_w_m": g_key[3],
+            "AR_w": round(g_key[1] ** 2 / max(g_key[2], 1e-9), 4),
+            "b_flap_m": s.get("b_flap_m", ""),
+            "cozucu_flapsiz": s.get("cozucu", ""), "cozucu_flapli": s.get("cozucu_flapli", ""),
+        }
+        for k, kisa in alanlar:
+            r[f"{kisa}_secilen"] = s.get(k, "")
+            r[f"{kisa}_numpy"] = npy.get(k, "")
+            r[f"{kisa}_llt"] = s.get(
+                {"CL_alpha_3d_per_deg": "CL_alpha_llt", "e_oswald": "e_oswald_llt",
+                 "CL_max_3d_tahmini": "CL_max_3d_llt", "CL_alpha_3d_flapli_per_deg": "CL_alpha_flapli_llt",
+                 "e_oswald_flapli": "e_oswald_flapli_llt", "CL_max_3d_flapli_tahmini": "CL_max_3d_flapli_llt"}.get(k, "_"), "")
+        r["vsp3_flapsiz"] = s.get("vsp3_flapsiz", "")
+        r["vsp3_flapli"] = s.get("vsp3_flapli", "")
+        satirlar.append(r)
+
+    vk = Path(args.vlm_klasoru)
+    vk = vk if vk.is_absolute() else SCRIPT_DIR / vk
+    cikti = vk / "vlm_test_karsilastirma.csv"
+    csv_yaz(satirlar, cikti)
+    print(f"\n[VLM-TEST] Karşılaştırma yazıldı: {cikti}")
+    for r in satirlar:
+        print(
+            f"  {r['profil']:<14} b={r['b_w_m']:.3f}  "
+            f"CLa {r['CLa_flapsiz_secilen']} / numpy {r['CLa_flapsiz_numpy']} | "
+            f"a0 {r['a0_flapsiz_secilen']} / {r['a0_flapsiz_numpy']} | "
+            f"e {r['e_flapsiz_secilen']} / {r['e_flapsiz_numpy']} | "
+            f"flapli a0 {r['a0_flapli_secilen']} / {r['a0_flapli_numpy']}  [{r['cozucu_flapsiz']}]"
+        )
+    return 0
+
+
+def _govde_test_modu(
+    args: argparse.Namespace,
+    ilk_500: List[Dict[str, Any]],
+    kutle_satirlari: List[Dict[str, Any]],
+) -> int:
+    """
+    [DEĞİŞİKLİK 2026-11-18 v5 | gövde] Kanat + gövde VSPAERO testi (sadece --vlm-test ile).
+    [DEĞİŞİKLİK 2026-11-18 v6 | inceleme-2 düzeltmeleri] Yeniden yazıldı (önceki hali:
+    yedekler/vlm_entegrasyonu_YEDEK_2026-11-18_v5_duzeltme_oncesi.py):
+      - Referans (sadece kanat) modeline de gövde kenarında (y=R) bölüm sınırı konur → iki model AYNI ağla
+        çözülür, fark yalnızca gövdeden gelir.
+      - Sonuç hesaplanamasa bile satır yazılır ve "kalite" sütununda işaretlenir (eskiden atılıyordu).
+      - İz tabanlı (CLwtot/CDiw) CLα, α0, e ve farkları da yazılır; kanat yüzey/alt-üst z, Zcg, panel ayarları,
+        flap başlangıcı, sonuç kaynağı sütunları eklendi.
+      - Yeni seçenekler: --kanat-z (ust/ust_gomulu/orta/alt/alt_gomulu/hepsi), --govde-gomme, --zcg,
+        --flap-baslangic, --vspaero-span-panel (yarım kanat toplam), --vspaero-uc-sik.
+    Sonuçlar vlm_sonuclari/vlm_test_govde_karsilastirma.csv dosyasına yazılır; performans tablolarına İŞLENMEZ.
+    """
+    from vspaero_cozucu import KANAT_Z_SECENEKLERI
+
+    hazir, mesaj = vspaero_hazir_mi()
+    if not hazir:
+        print(f"[HATA] Gövde testi VSPAERO gerektirir: {mesaj}")
+        return 1
+    print(f"[VSPAERO] Hazır: {mesaj}")
+
+    ham_z = str(args.kanat_z or "alt_gomulu").strip().lower()  # [DEĞİŞİKLİK 2026-11-18 v7 | ekip kararı: kanat yeri]
+    z_listesi: List[Any] = list(KANAT_Z_SECENEKLERI) if ham_z == "hepsi" else []
+    if not z_listesi:
+        for parca in ham_z.split(","):
+            parca = parca.strip()
+            if not parca:
+                continue
+            try:
+                z_listesi.append(float(parca))
+            except ValueError:
+                if parca not in KANAT_Z_SECENEKLERI:
+                    print(f"[HATA] --kanat-z değeri anlaşılamadı: {parca} (geçerli: {', '.join(KANAT_Z_SECENEKLERI)}, hepsi, sayı)")
+                    return 1
+                z_listesi.append(parca)
+    yontemler = ["vlm", "panel"] if args.vspaero_yontem == "hepsi" else [args.vspaero_yontem]
+    zcg: Any = None
+    if args.zcg is not None:
+        zcg = "kanat" if str(args.zcg).strip().lower() == "kanat" else float(args.zcg)
+
+    kutle_geo: Dict[Tuple[str, float, float, float], Dict[str, Any]] = {}
+    for kr in kutle_satirlari:
+        kk = _geometri_anahtari(kr)
+        if kk[0] and kk not in kutle_geo:
+            kutle_geo[kk] = kr
+
+    geometriler: List[Tuple[str, float, float, float]] = []
+    for r in ilk_500:
+        gk = _geometri_anahtari(r)
+        if gk[0] and gk[1] > 0 and gk not in geometriler:
+            geometriler.append(gk)
+        if len(geometriler) >= int(args.vlm_test):
+            break
+
+    def _f(v: Any) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    satirlar: List[Dict[str, Any]] = []
+    for gk in geometriler:
+        profil, b_w, s_w, c_w = gk
+        kr = kutle_geo.get(gk, {})
+        D = sayi_al(kr, "govde_D_m", varsayilan=0.14)
+        L = sayi_al(kr, "govde_L_toplam_m", "govde_L_m", varsayilan=1.56)
+        R = 0.5 * D
+        b_flap = min(1.0, b_w)
+        flap_ic = R if args.flap_baslangic == "govde_kenari" else 0.0
+        for durum, oran in (("flapsiz", 0.0), ("flapli", b_flap / max(b_w, 1e-9))):
+            for yontem in yontemler:
+                vakalar: List[Tuple[str, Optional[Dict[str, Any]]]] = [("sadece_kanat", None)]
+                for z in z_listesi:
+                    etiket = z if isinstance(z, str) else f"z{z:+.3f}"
+                    vakalar.append((etiket, {"D": D, "L_toplam": L, "kanat_x": args.kanat_x, "kanat_z": z,
+                                             "gomme": args.govde_gomme,
+                                             "L_aviyonik": args.govde_l_aviyonik, "L_kuyruk": args.govde_l_kuyruk,
+                                             "D_min": args.govde_d_min}))  # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
+                referans: Optional[Dict[str, Any]] = None
+                for yerlesim, gv in vakalar:
+                    print(f"[GÖVDE-TEST] {profil} {durum} {yontem} {yerlesim} ...")
+                    try:
+                        r = vspaero_api_coz(
+                            profil=profil, b_w=b_w, c_w=c_w, s_w=s_w, cl_max_2d=1.4,
+                            flap_aciklik_orani=oran, model_klasoru=VSPAERO_MODEL_KLASORU,
+                            govde=gv, yontem=yontem, span_panel=args.vspaero_span_panel,
+                            uc_sik=args.vspaero_uc_sik, zcg=zcg, flap_ic_y=flap_ic,
+                            ek_kesit_y=([] if gv else [R]),  # referans da aynı bölüm sınırını alır
+                            gecersize_izin=True,
+                            e_kaynagi=args.vspaero_e_kaynagi,       # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+                            viskoz_e_carpani=(args.e_viskoz_carpan if args.e_viskoz_carpan is not None
+                                              else (1.0 if gv else 0.995)),  # [DEĞİŞİKLİK 2026-11-19 v11 | flap ve k diğer kodlardan] gövdeli 1.0, gövdesiz 0.995
+                            veter_tess=args.vspaero_veter_tess,     # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+                        )
+                    except Exception as exc:
+                        print(f"[VSPAERO-HATA] {profil} {durum} {yontem} {yerlesim}: {type(exc).__name__}: {exc}")
+                        if VSPAERO_ZORUNLU:
+                            raise
+                        satirlar.append({"profil": profil, "durum": durum, "yontem": yontem, "yerlesim": yerlesim,
+                                         "kalite": f"HATA: {type(exc).__name__}: {exc}"})
+                        continue
+                    satir: Dict[str, Any] = {
+                        "profil": profil, "b_w_m": b_w, "S_w_m2": s_w, "c_w_m": c_w,
+                        "durum": durum, "yontem": yontem, "yerlesim": yerlesim, "kalite": r["kalite"],
+                        "govde_D_m": r.get("govde_D_m", ""), "govde_L_m": r.get("govde_L_m", ""),
+                        "kanat_x_ceyrek_m": r.get("kanat_x_ceyrek_m", ""), "kanat_z_m": r.get("kanat_z_m", ""),
+                        "kanat_ust_z_m": r.get("kanat_ust_z_m", ""), "kanat_alt_z_m": r.get("kanat_alt_z_m", ""),
+                        "govde_tepe_z_m": r.get("govde_tepe_z_m", ""), "gomme_m": r.get("gomme_m", ""),
+                        "zcg_m": r["zcg_m"], "flap_ic_y_m": r["flap_ic_y_m"],
+                        "CLa_per_deg": r["CL_alpha_3d_per_deg"], "a0_deg": r["alpha_L0_deg"],
+                        "e_span_ham": r["e_span_vspaero_ham"], "e_kirpildi": r["e_kirpildi"], "e_oswald": r["e_oswald"],
+                        "CLa_iz_per_deg": r["CL_alpha_iz_per_deg"], "a0_iz_deg": r["alpha_L0_iz_deg"], "e_iz": r["e_iz"],
+                        "CL_alfa4": r["CL_alfa4"], "CDi_alfa4": r["CDi_alfa4"],
+                        "Cm_alpha_per_deg": r["Cm_alpha_per_deg"], "CMy_alfa4": r["CMy_alfa4"],
+                        "span_panel": r["span_panel"], "uc_sik": r["uc_sik"],
+                        "sonuc_kaynagi": r["sonuc_kaynagi"], "vsp3": r["vsp3_dosyasi"],
+                    }
+                    if yerlesim == "sadece_kanat":
+                        referans = satir
+                    if referans is not None:
+                        for k in ("CLa_per_deg", "a0_deg", "e_span_ham", "CLa_iz_per_deg", "e_iz",
+                                  "CL_alfa4", "CDi_alfa4", "Cm_alpha_per_deg"):
+                            satir[f"fark_{k}"] = round(_f(satir[k]) - _f(referans[k]), 6)
+                        ref_cla = _f(referans["CLa_per_deg"])
+                        satir["fark_CLa_yuzde"] = round(100.0 * (_f(satir["CLa_per_deg"]) - ref_cla) / ref_cla, 3) \
+                            if ref_cla == ref_cla and abs(ref_cla) > 1e-9 else float("nan")
+                        ref_e = _f(referans["e_iz"])
+                        satir["fark_e_iz_yuzde"] = round(100.0 * (_f(satir["e_iz"]) - ref_e) / ref_e, 3) \
+                            if ref_e == ref_e and abs(ref_e) > 1e-9 else float("nan")
+                    satirlar.append(satir)
+
+    vk = Path(args.vlm_klasoru)
+    vk = vk if vk.is_absolute() else SCRIPT_DIR / vk
+    cikti = vk / "vlm_test_govde_karsilastirma.csv"
+    csv_yaz(satirlar, cikti)
+    print(f"\n[GÖVDE-TEST] Karşılaştırma yazıldı: {cikti}")
+    print(f"  {'durum':<8} {'yontem':<6} {'yerlesim':<13} {'CLa':>7} {'dCLa%':>6} {'a0':>6} "
+          f"{'e_yuz':>6} {'e_iz':>6} {'de_iz%':>7} {'Cm_a':>8}  kalite")
+    for r in satirlar:
+        if "CLa_per_deg" not in r:
+            print(f"  {r['durum']:<8} {r['yontem']:<6} {r['yerlesim']:<13} {r['kalite']}")
+            continue
+        print(f"  {r['durum']:<8} {r['yontem']:<6} {r['yerlesim']:<13} {_f(r['CLa_per_deg']):>7.4f} "
+              f"{_f(r.get('fark_CLa_yuzde', 0.0)):>6.2f} {_f(r['a0_deg']):>6.2f} {_f(r['e_span_ham']):>6.3f} "
+              f"{_f(r['e_iz']):>6.3f} {_f(r.get('fark_e_iz_yuzde', 0.0)):>7.2f} {_f(r['Cm_alpha_per_deg']):>8.4f}  {r['kalite']}")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = argumanlari_coz(argv)
+
+    # [DEĞİŞİKLİK 2026-11-18 | Görev A] Komut satırı ayarlarını VSPAERO modülüne aktar
+    global VSPAERO_ZORUNLU, VSPAERO_KUYRUK_DAHIL, VSPAERO_MODEL_KLASORU
+    VSPAERO_ZORUNLU = bool(args.vspaero_zorunlu)
+    global VSPAERO_SPAN_PANEL  # [DEĞİŞİKLİK 2026-11-18 v5 | gövde]
+    VSPAERO_SPAN_PANEL = args.vspaero_span_panel
+    global VSPAERO_UC_SIK  # [DEĞİŞİKLİK 2026-11-18 v6 | inceleme-2 düzeltmeleri]
+    VSPAERO_UC_SIK = args.vspaero_uc_sik
+    global VSPAERO_RICHARDSON, VSPAERO_E_KAYNAGI, VSPAERO_VETER_TESS  # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+    VSPAERO_E_KAYNAGI = args.vspaero_e_kaynagi
+    global VSPAERO_E_VISKOZ  # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
+    # [DEĞİŞİKLİK 2026-11-19 v11 | flap ve k diğer kodlardan] k varsayılanı: lifting_line_cozucu.py'deki k_fus = 0.995 GÖVDE düzeltmesi -> gövde VSPAERO'da modelliyse 1.0
+    VSPAERO_E_VISKOZ = float(args.e_viskoz_carpan) if args.e_viskoz_carpan is not None else (1.0 if args.vspaero_govde else 0.995)
+    VSPAERO_VETER_TESS = args.vspaero_veter_tess
+    global FLAP_VERIMI, EGRI_YONTEMI  # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı]
+    FLAP_VERIMI = float(args.flap_verimi)
+    EGRI_YONTEMI = str(args.egri_yontemi)
+    if not (0.0 < FLAP_VERIMI <= 1.0):
+        print(f"[HATA] --flap-verimi 0 ile 1 arasında olmalı (verilen: {FLAP_VERIMI}).")
+        return 1
+    print(f"[VLM] Flap verimi (VSPAERO flaplı α0 düzeltmesi): {FLAP_VERIMI} | CL eğrisi yöntemi: {EGRI_YONTEMI}")
+    _r =str(args.vspaero_richardson or "yok").strip().lower()
+    if _r in ("yok", "none", "0", ""):
+        VSPAERO_RICHARDSON = None
+    elif _r in ("evet", "var", "1"):
+        _n = int(args.vspaero_span_panel or 48)
+        VSPAERO_RICHARDSON = (max(2, _n // 2), _n)
+    else:
+        _a, _b = (int(x) for x in _r.split(","))
+        VSPAERO_RICHARDSON = (_a, _b)
+    if VSPAERO_RICHARDSON and VSPAERO_E_KAYNAGI == "yuzey":
+        print("[UYARI] Richardson + yüzey e'si birlikte güvenilmez (yüzey e'si yakınsamıyor).")
+    VSPAERO_KUYRUK_DAHIL = bool(args.vspaero_kuyruk)
+    _vk = Path(args.vlm_klasoru)
+    VSPAERO_MODEL_KLASORU = (_vk if _vk.is_absolute() else SCRIPT_DIR / _vk) / "vspaero_modelleri"
 
     girdi_yolu = dosya_yolu_coz(args.girdi)
     if not girdi_yolu.is_file():
@@ -1991,6 +2508,42 @@ def main(argv: Optional[List[str]] = None) -> int:
     drag_polar_flapli_satirlar = _hedef_geometriler_icin_csv_oku(args.drag_polar_flapli, hedef_uclu_geometriler)
     drag_ozet_flapli_satirlar = _hedef_geometriler_icin_csv_oku(args.drag_ozet_flapli, hedef_uclu_geometriler)
 
+    # [DEĞİŞİKLİK 2026-11-18 | Görev A] Kuyruk kolu / kuyruk profili için kütle tablosu (yalnızca VSPAERO kullanır)
+    _kutle_yolu = dosya_yolu_coz(args.kutle)
+    kutle_satirlari = csv_oku(_kutle_yolu) if _kutle_yolu.is_file() else []
+
+    # [DEĞİŞİKLİK 2026-11-18 | Görev A] Hızlı test modu: ilk N geometriyi seçilen çözücü + NumPy ile çöz, karşılaştır, çık.
+    if args.vlm_test > 0:
+        if args.vspaero_govde:  # [DEĞİŞİKLİK 2026-11-18 v5 | gövde]
+            return _govde_test_modu(args, ilk_500, kutle_satirlari)
+        return _vlm_test_modu(args, ilk_500, llt_flapsiz_satirlar, llt_flapli_satirlar, kutle_satirlari)
+    if args.vspaero_govde:  # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde] tam akışta gövde (eskiden: göz ardı ediliyordu)
+        global VSPAERO_GOVDE
+        _zcg: Any = None
+        if args.zcg is not None:
+            _zcg = "kanat" if str(args.zcg).strip().lower() == "kanat" else float(args.zcg)
+        _kz: Any = str(args.kanat_z or "alt_gomulu").strip().lower()
+        if "," in _kz or _kz == "hepsi":
+            print("[HATA] Tam akışta --kanat-z tek değer olmalı (ör. alt_gomulu); liste/hepsi yalnız --vlm-test ile.")
+            return 1
+        try:
+            _kz = float(_kz)
+        except ValueError:
+            pass
+        VSPAERO_GOVDE = {
+            "kanat_x": args.kanat_x, "kanat_z": _kz, "gomme": args.govde_gomme, "zcg": _zcg,
+            "flap_baslangic": args.flap_baslangic, "L_aviyonik": args.govde_l_aviyonik,
+            "L_kuyruk": args.govde_l_kuyruk, "D_min": args.govde_d_min,
+        }
+        print("[GÖVDE] Tam akışta her adaya gövde eklenecek; tablolara KANAT+GÖVDE katsayıları gidecek.")
+        print(f"[GÖVDE] Parametreler: kanat_x={args.kanat_x if args.kanat_x is not None else 'su haznesi ortası'}, "
+              f"kanat_z={_kz}, gömme={args.govde_gomme if args.govde_gomme is not None else 0.005} m, "
+              f"Zcg={_zcg if _zcg is not None else 0.0}, flap={args.flap_baslangic}, "
+              f"L_av={args.govde_l_aviyonik}, L_kuyruk={args.govde_l_kuyruk}, D_min={args.govde_d_min}, "
+              f"e_viskoz_k={VSPAERO_E_VISKOZ}")  # [DEĞİŞİKLİK 2026-11-19 v11 | flap ve k diğer kodlardan]
+        if args.cozucu not in ("vspaero", "auto"):
+            print("[UYARI] Gövde yalnızca VSPAERO ile modellenir; NumPy/AeroSandbox gövdesiz çözer.")
+
     # 1. Flapsız ve Flaplı 3B VLM Analizi
     vlm_haritasi = ilk_500_aday_vlm_analizi(
         vlm_aday_satirlari=ilk_500,
@@ -1999,7 +2552,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         cozucu_tercihi=args.cozucu,
         n_span=args.n_span,
         n_chord=args.n_chord,
+        kutle_satirlari=kutle_satirlari,  # [DEĞİŞİKLİK 2026-11-18 | Görev A]
     )
+    _vspaero_hata_ozeti_yaz()  # [DEĞİŞİKLİK 2026-11-18 | Görev A]
 
     # 2. LLT ve Drag Tablolarını (Flapsız + Flaplı) Güncelle ve Kaydet
     vlm_klasoru = Path(args.vlm_klasoru)
