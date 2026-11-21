@@ -183,21 +183,22 @@ def kimlikleri_hazirla(satirlar: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return satirlar
 
 
+class YinelenenAdayKaydi(ValueError):
+    """Bir CSV içinde aday anahtarı birden fazla kez kullanılmış."""
+
+
 def indeks_olustur(
     satirlar: List[Dict[str, Any]],
+    kaynak: str | Path = "Aday girdisi",
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[Tuple[str, str], Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    """
-    Satırları üç seviyeli arama tablosuna indeksler:
-    1) konfigurasyon_id -> satır
-    2) (temel_aday_id, pervane_norm) -> satır
-    3) temel_aday_id -> satır (pervaneden bağımsız modüller için, örn. iniş)
-    """
+    """Konfigürasyon, aday/pervane ve açıkça pervanesiz temel aday indeksleri."""
     hazir = kimlikleri_hazirla(satirlar)
     konfig_haritasi: Dict[str, Dict[str, Any]] = {}
     aday_pervane_haritasi: Dict[Tuple[str, str], Dict[str, Any]] = {}
     temel_aday_haritasi: Dict[str, Dict[str, Any]] = {}
+    ilk_kayit_numaralari: Dict[Tuple[str, Any], int] = {}
 
-    for row in hazir:
+    for kayit_no, row in enumerate(hazir, start=1):
         konf_id = metin_al(row, "konfigurasyon_id")
         temel_id = metin_al(row, "temel_aday_id")
         if not temel_id and temel_kimlik is not None:
@@ -207,12 +208,24 @@ def indeks_olustur(
                 temel_id = ""
         pervane = _normalize_pervane(metin_al(row, "pervane"))
 
+        indeksler = []
         if konf_id:
-            konfig_haritasi[konf_id] = row
+            indeksler.append(("konfigurasyon_id", konf_id, konfig_haritasi))
         if temel_id and pervane:
-            aday_pervane_haritasi[(temel_id, pervane)] = row
-        if temel_id and temel_id not in temel_aday_haritasi:
-            temel_aday_haritasi[temel_id] = row
+            indeksler.append(("temel_aday_id + pervane", (temel_id, pervane), aday_pervane_haritasi))
+        elif temel_id and not konf_id:
+            indeksler.append(("pervaneden bağımsız temel_aday_id", temel_id, temel_aday_haritasi))
+
+        for alan, anahtar, harita in indeksler:
+            numara_anahtari = (alan, anahtar)
+            ilk_kayit_no = ilk_kayit_numaralari.get(numara_anahtari)
+            if ilk_kayit_no is not None:
+                raise YinelenenAdayKaydi(
+                    f"{kaynak}: yinelenen {alan} {anahtar!r}. "
+                    f"Kayıtlar {ilk_kayit_no} ve {kayit_no} (başlık hariç)."
+                )
+            ilk_kayit_numaralari[numara_anahtari] = kayit_no
+            harita[anahtar] = row
 
     return konfig_haritasi, aday_pervane_haritasi, temel_aday_haritasi
 
@@ -254,16 +267,17 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
         )
 
     seyir_satirlari = kimlikleri_hazirla(csv_oku(seyir_yolu))
-    kalkis_indeks = indeks_olustur(csv_oku(kalkis_yolu))
-    tirmanis_indeks = indeks_olustur(csv_oku(tirmanis_yolu))
-    yuk_indeks = indeks_olustur(csv_oku(yuk_birakma_yolu))
-    inis_indeks = indeks_olustur(csv_oku(inis_yolu))
+    indeks_olustur(seyir_satirlari, kaynak=seyir_yolu)
+    kalkis_indeks = indeks_olustur(csv_oku(kalkis_yolu), kaynak=kalkis_yolu)
+    tirmanis_indeks = indeks_olustur(csv_oku(tirmanis_yolu), kaynak=tirmanis_yolu)
+    yuk_indeks = indeks_olustur(csv_oku(yuk_birakma_yolu), kaynak=yuk_birakma_yolu)
+    inis_indeks = indeks_olustur(csv_oku(inis_yolu), kaynak=inis_yolu)
 
     # İsteğe bağlı temel kütle tablosu (ek geometri sütunları için)
     kutle_indeks = None
     kutle_yolu = dosya_yolu_coz(args.kutle)
     if kutle_yolu.is_file():
-        kutle_indeks = indeks_olustur(csv_oku(kutle_yolu))
+        kutle_indeks = indeks_olustur(csv_oku(kutle_yolu), kaynak=kutle_yolu)
 
     birlestirilmis: List[Dict[str, Any]] = []
 
@@ -735,7 +749,11 @@ def argumanlari_coz(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = argumanlari_coz(argv)
-    tum_sirali, vlm_ilk_n = adaylari_degerlendir_ve_sirala(args)
+    try:
+        tum_sirali, vlm_ilk_n = adaylari_degerlendir_ve_sirala(args)
+    except YinelenenAdayKaydi as exc:
+        print(f"HATA: {exc}", file=sys.stderr)
+        return 2
 
     cikti_yolu = Path(args.cikti)
     if not cikti_yolu.is_absolute():
