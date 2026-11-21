@@ -9,7 +9,7 @@ XFOIL_EXE = "Scripts/xfoil.exe"
 
 REYNOLDS = 50000
 ALPHA_MIN = -5.0
-ALPHA_MAX = 15.0
+ALPHA_MAX = 20.0
 ALPHA_STEP = 0.5
 ITERATIONS = 300
 # ===========================================

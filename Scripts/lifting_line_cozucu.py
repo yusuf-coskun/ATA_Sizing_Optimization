@@ -3,15 +3,17 @@ LLT COKLU RE: flapsiz 150000..500000, flapli 150000..400000, adim 50000.
 Kanat Re taranir; kuyruk Re ayni ucus hizinda kendi korduna gore hesaplanir.
 Yatay (HT) ve dikey (VT) kuyruk Re alt sinirin altinda ise en dusuk polar
 kullanilir ve varsayim CSV'de raporlanir.
-====================================================================
+========================================================================
 Birlestirilmis En Iyi Ozellikler:
 1) Flapli profillerde erken akis ayrilmasina karsi [-4, +2.5] derece dar
-   lineer bolge secimi ve dusuk egim (a0 < 4.5 /rad) korumasi.
+   lineer bolge secimi, a0 <= 0 gecersiz_polar tespiti/loglamasi ve
+   0 < a0 < 4.5 /rad durumunun bayraklanmasi.
 2) LLT Fourier katsayilarindan (A_n) analitik yerel Cl(theta)/CL dagilimi ile
    AR'ye duyarli k_clmax_llt hesabi (CL_max_3d = k_clmax_llt * CL_max_2d).
 3) 3B downwash etkisini iceren geometrik stall acisi hesabi:
    alpha_stall_3d = alpha_L0 + CL_max_3d / CL_alpha_3d.
-4) Hem HT hem de VT icin alt Re siniri korumasi ve detayli durum raporlamasi.
+4) Hem HT hem de VT icin alt Re siniri korumasi, -5..20 derece AoA taramasi
+   ve stall tepesi gorulmeyen polarlar icin guvenilirlik bayragi raporlamasi.
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ import argparse
 import contextlib
 import csv
 import io
+import logging
 import re
 import sys
 from pathlib import Path
@@ -26,7 +29,7 @@ from pathlib import Path
 import numpy as np
 
 
-# ==================================================== AYARLAR ====================================================
+# =================================== AYARLAR ===================================
 FLAPSIZ_RE_DIZISI = tuple(range(150000, 500001, 50000))
 FLAPLI_RE_DIZISI = tuple(range(150000, 400001, 50000))
 
@@ -37,7 +40,7 @@ MU = 1.789e-5               # Havanın dinamik viskozitesi (Pa.s)
 SEYIR_ALPHA_DEG = 0.0       # CL_seyir referans hücum açısı (0 derece)
 
 ALPHA_MIN = -5.0
-ALPHA_MAX = 15.0
+ALPHA_MAX = 20.0
 ALPHA_STEP = 0.5
 LINEER_ALPHA_MIN = -4.0
 LINEER_ALPHA_MAX = 6.0
@@ -50,7 +53,19 @@ FLAP_POLAR_KLASORU_ADI = "airfoils_polar_flap"
 
 FLAPSIZ_ADAY_CSV_ADI = "kanat_kuyruk_adaylari.csv"
 FLAPLI_ADAY_CSV_ADI = "kanat_kuyruk_adaylari_flapli.csv"
-# =================================================================================================================
+GECERSIZ_POLAR_LOG_ADI = "gecersiz_polarlar.log"
+# ===============================================================================
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    _konsol_handler = logging.StreamHandler(sys.stdout)
+    _konsol_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+    )
+    logger.addHandler(_konsol_handler)
+    logger.setLevel(logging.INFO)
+
+GECERSIZ_POLAR_KAYITLARI: list[dict] = []
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJE_KLASORU = SCRIPT_DIR.parent if SCRIPT_DIR.name.lower() == "scripts" else SCRIPT_DIR
@@ -128,9 +143,9 @@ ESKI_POLAR_TAKMA_ADLARI: dict[str, str] = {
 }
 
 
-# ---------------------------------------------------------------------------------
-# 1) GEOMETRİ VE PROFİL ADLARINI NORMALIZE EDEN YARDIMCI FONKSİYONLAR
-# ---------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 1) GEOMETRİ VE PROFİL ADLARINI NORMALİZE EDEN YARDIMCI FONKSİYONLAR
+# -----------------------------------------------------------------------------
 def aday_degeri_al(aday: dict, *anahtarlar: str, varsayilan: float | None = None) -> float:
     for k in anahtarlar:
         if k in aday and aday[k] not in (None, ""):
@@ -153,9 +168,9 @@ def flap_airfoil_bul(aday: dict) -> str:
     raise KeyError("Aday icinde kanat_airfoil veya flap_airfoil bulunamadi.")
 
 
-# ---------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # 2) YARDIMCI VE POLAR İNDEKSLEME FONKSİYONLARI (CD İÇERMEZ)
-# ---------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def reynolds_hesapla(
     veter_m: float,
     hiz_ms: float = SEYIR_HIZI_MS,
@@ -204,6 +219,7 @@ def polar_oku(dosya: Path) -> tuple[np.ndarray, np.ndarray]:
 def profil_ozellikleri_cikar(
     alfa: np.ndarray,
     cl: np.ndarray,
+    polar_etiketi: str = "",
 ) -> dict:
     # Flapli profillerde +2..+6 derece arasinda erken akis ayrilmasi egimi dusurdugu icin,
     # eger [-4, +2.5] derece araliginda yeterli nokta varsa dogrusal egimi bu tutunmus akis bolgesinden hesapla.
@@ -216,35 +232,91 @@ def profil_ozellikleri_cikar(
     if int(maske.sum()) < 3:
         maske = np.ones_like(alfa, dtype=bool)
 
-    a0_rad, b_kesisim = np.polyfit(np.deg2rad(alfa[maske]), cl[maske], 1)
+    a0_ham_rad, b_kesisim = np.polyfit(np.deg2rad(alfa[maske]), cl[maske], 1)
+    a0_rad = float(a0_ham_rad)
 
-    # XFOIL flapli polari yalniz stall platosu yakininda yakinsadiysa (a0 < 4.5 /rad),
-    # teorik ince profil egimi (5.7 /rad) ile koru:
+    i_max = int(np.argmax(cl))
+    stall_tepesi_gorulmedi = bool(i_max == len(cl) - 1)
+
+    # Negatif veya sifir egimli polarlari 5.7/rad ile ortmek yerine gecersiz_polar olarak isaretle ve logla:
+    if not np.isfinite(a0_rad) or a0_rad <= 0.0:
+        etiket = polar_etiketi or "bilinmeyen_polar"
+        logger.warning(
+            "[gecersiz_polar] %s: 2B tasima egimi a0 <= 0 (a0_ham=%.4f /rad); polar isaretlendi ve devre disi birakildi.",
+            etiket,
+            a0_rad,
+        )
+        return {
+            "gecersiz_polar": True,
+            "polar_durumu": "gecersiz_polar",
+            "gecersizlik_nedeni": f"a0_ham <= 0 ({a0_rad:.4f} /rad)",
+            "a0_ham_rad": float(a0_ham_rad),
+            "a0_rad": float(a0_rad),
+            "a0_duzeltildi": False,
+            "alpha_L0_rad": float("nan"),
+            "alpha_L0_deg": float("nan"),
+            "cl_max_2d": float(cl[i_max]),
+            "cl_min_2d": float(cl.min()),
+            "alpha_stall_deg": float(alfa[i_max]),
+            "stall_tepesi_gorulmedi": stall_tepesi_gorulmedi,
+            "alfa": alfa,
+            "cl": cl,
+        }
+
+    # Yalnizca pozitif fakat dusuk egimli (0 < a0 < 4.5 /rad) polarlarda koruma uygula ve bayrakla:
+    a0_duzeltildi = False
     if a0_rad < 4.5:
         idx_ref = int(np.argmin(np.abs(alfa - float(alfa[maske][0]))))
         a0_rad = 5.7
         b_kesisim = float(cl[idx_ref] - a0_rad * np.deg2rad(alfa[idx_ref]))
-    if a0_rad <= 0:
-        alt_maske = alfa <= 4.0
-        if int(alt_maske.sum()) >= 3:
-            a0_rad, b_kesisim = np.polyfit(np.deg2rad(alfa[alt_maske]), cl[alt_maske], 1)
-    if a0_rad <= 0:
-        raise ValueError("2B tasima egimi (a0) pozitif degil.")
+        a0_duzeltildi = True
+        if polar_etiketi:
+            logger.warning(
+                "[a0_duzeltildi] %s: a0_ham=%.4f /rad < 4.5 -> 5.7 /rad atandi.",
+                polar_etiketi,
+                float(a0_ham_rad),
+            )
 
-    i_max = int(np.argmax(cl))
+    if stall_tepesi_gorulmedi and polar_etiketi:
+        logger.warning(
+            "[stall_tepesi_gorulmedi] %s: CL_max son ornek acida (alpha=%.2f deg, CL=%.4f).",
+            polar_etiketi,
+            float(alfa[i_max]),
+            float(cl[i_max]),
+        )
+
     return {
+        "gecersiz_polar": False,
+        "polar_durumu": "a0_duzeltildi" if a0_duzeltildi else "gecerli",
+        "gecersizlik_nedeni": "",
+        "a0_ham_rad": float(a0_ham_rad),
         "a0_rad": float(a0_rad),
+        "a0_duzeltildi": a0_duzeltildi,
         "alpha_L0_rad": float(-b_kesisim / a0_rad),
         "alpha_L0_deg": float(np.rad2deg(-b_kesisim / a0_rad)),
         "cl_max_2d": float(cl[i_max]),
         "cl_min_2d": float(cl.min()),
         "alpha_stall_deg": float(alfa[i_max]),
+        "stall_tepesi_gorulmedi": stall_tepesi_gorulmedi,
         "alfa": alfa,
         "cl": cl,
     }
 
 
 _polar_indeks_onbellek: dict[Path, dict[str, dict[int, dict]]] = {}
+
+
+def gecersiz_polar_logunu_yaz(dosya_yolu: Path) -> None:
+    if not GECERSIZ_POLAR_KAYITLARI:
+        return
+    dosya_yolu.parent.mkdir(parents=True, exist_ok=True)
+    with dosya_yolu.open("w", encoding="utf-8") as f:
+        for kayit in GECERSIZ_POLAR_KAYITLARI:
+            f.write(
+                f"gecersiz_polar | dosya={kayit['dosya']} | profil={kayit['profil_adi']} "
+                f"| Re={kayit['re_polar']} | a0_ham_rad={kayit['a0_ham_rad']:.4f} "
+                f"| neden={kayit['gecersizlik_nedeni']}\n"
+            )
 
 
 def polar_klasorunu_indeksle(polar_klasoru: Path = POLAR_KLASORU) -> dict[str, dict[int, dict]]:
@@ -270,10 +342,22 @@ def polar_klasorunu_indeksle(polar_klasoru: Path = POLAR_KLASORU) -> dict[str, d
 
         try:
             alfa, cl = polar_oku(pol_dosyasi)
-            ozellik = profil_ozellikleri_cikar(alfa, cl)
+            ozellik = profil_ozellikleri_cikar(alfa, cl, polar_etiketi=pol_dosyasi.name)
             ozellik["dosya_yolu"] = pol_dosyasi
             ozellik["profil_adi"] = profil_adi
             ozellik["re_polar"] = re_degeri
+
+            if ozellik.get("gecersiz_polar"):
+                GECERSIZ_POLAR_KAYITLARI.append({
+                    "dosya": pol_dosyasi.name,
+                    "dosya_yolu": str(pol_dosyasi),
+                    "profil_adi": profil_adi,
+                    "re_polar": re_degeri,
+                    "polar_durumu": "gecersiz_polar",
+                    "a0_ham_rad": ozellik["a0_ham_rad"],
+                    "gecersizlik_nedeni": ozellik["gecersizlik_nedeni"],
+                })
+                continue
 
             anahtar_tam = profil_adi.strip().lower()
             indeks.setdefault(anahtar_tam, {})[re_degeri] = ozellik
@@ -281,7 +365,7 @@ def polar_klasorunu_indeksle(polar_klasoru: Path = POLAR_KLASORU) -> dict[str, d
             anahtar_norm = _norm_profil_anahtari(profil_adi)
             indeks.setdefault(anahtar_norm, {})[re_degeri] = ozellik
         except Exception as exc:
-            print(f"  [UYARI] Polar okunamadi ve atlandi ({pol_dosyasi.name}): {exc}")
+            logger.warning("Polar okunamadi ve atlandi (%s): %s", pol_dosyasi.name, exc)
 
     # Yeni '<kanat>_flap' anahtarları ile eski polar adlarını çift yönlü bağla
     for yeni_ad, eski_ad in ESKI_POLAR_TAKMA_ADLARI.items():
@@ -337,9 +421,9 @@ def en_yakin_polar_sec(
     return en_yakin_re, re_haritasi[en_yakin_re]
 
 
-# ---------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # 3) LLT MATRİS ÇÖZÜCÜ VE REYNOLDS İNTERPOLASYONU
-# ---------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 _llt_onbellek: dict[tuple[float, float, int], tuple[float, float, float]] = {}
 _yuzey_cozum_onbellek: dict[tuple[str, int, float], dict] = {}
 
@@ -383,6 +467,12 @@ def yuzey_coklu_aci_coz(
     re_polar: int,
     alfa_dizisi_deg: np.ndarray = ALFA_DIZISI_DEG,
 ) -> dict:
+    if prof.get("gecersiz_polar"):
+        raise ValueError(
+            f"gecersiz_polar LLT cozumune verilemez ({prof.get('profil_adi', '')}, Re={re_polar}): "
+            f"{prof.get('gecersizlik_nedeni', '')}"
+        )
+
     onbellek_anahtari = (prof["profil_adi"].lower(), int(re_polar), round(float(ar), 6))
     if onbellek_anahtari in _yuzey_cozum_onbellek:
         return _yuzey_cozum_onbellek[onbellek_anahtari]
@@ -407,7 +497,10 @@ def yuzey_coklu_aci_coz(
 
     sonuc = {
         "Re_polar": int(re_polar),
+        "a0_ham_2d_per_deg": float(np.deg2rad(prof.get("a0_ham_rad", prof["a0_rad"]))),
         "a0_2d_per_deg": float(np.deg2rad(prof["a0_rad"])),
+        "a0_duzeltildi": bool(prof.get("a0_duzeltildi", False)),
+        "stall_tepesi_gorulmedi": bool(prof.get("stall_tepesi_gorulmedi", False)),
         "alpha_L0_deg": float(prof["alpha_L0_deg"]),
         "CL_max_2d": float(prof["cl_max_2d"]),
         "alpha_stall_2d_deg": float(alpha_stall_3d_deg),
@@ -423,6 +516,11 @@ def yuzey_coklu_aci_coz(
 
 
 def kuyruk_yuzey_coz(ar: float, prof: dict) -> dict:
+    if prof.get("gecersiz_polar"):
+        raise ValueError(
+            f"gecersiz_polar kuyruk LLT cozumune verilemez ({prof.get('profil_adi', '')}): "
+            f"{prof.get('gecersizlik_nedeni', '')}"
+        )
     cl_a, e, k_clmax_llt = llt_dikdortgen_kanat(ar, prof["a0_rad"])
     cl_a_deg = float(np.deg2rad(cl_a))
     cl_max_3d = float(k_clmax_llt * prof["cl_max_2d"])
@@ -446,8 +544,12 @@ def re_interpolasyonu(
         raise ValueError("Interpolasyon icin sonuc yok.")
 
     ornek_sozluk = re_sonuclari[sirali_re[0]]
+    bool_anahtarlar = [
+        k for k, v in ornek_sozluk.items() if isinstance(v, bool)
+    ]
     skaler_anahtarlar = [
-        k for k, v in ornek_sozluk.items() if isinstance(v, (int, float))
+        k for k, v in ornek_sozluk.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
     ]
     dizi_anahtarlar = [
         k for k, v in ornek_sozluk.items()
@@ -459,6 +561,8 @@ def re_interpolasyonu(
     if re_hedef in re_sonuclari:
         secilen = re_sonuclari[re_hedef]
         sonuc = {k: float(secilen[k]) for k in skaler_anahtarlar}
+        for k in bool_anahtarlar:
+            sonuc[k] = bool(secilen[k])
         for k in dizi_anahtarlar:
             sonuc[k] = np.array(secilen[k], dtype=float)
         return sonuc, "tam_eslesme"
@@ -477,15 +581,17 @@ def re_interpolasyonu(
     sonuc = {}
     for k in skaler_anahtarlar:
         sonuc[k] = float(s0[k] + t * (s1[k] - s0[k]))
+    for k in bool_anahtarlar:
+        sonuc[k] = bool(s0[k] or s1[k])
     for k in dizi_anahtarlar:
         sonuc[k] = s0[k] + t * (s1[k] - s0[k])
 
     return sonuc, durum
 
 
-# ---------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # 4) BELLEK İÇİ (IN-MEMORY) DOĞRUDAN ÇÖZÜCÜ API FONKSİYONLARI
-# ---------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 def flapsiz_kanat_coz_re(
     profil_adi: str,
     ar_w: float,
@@ -581,6 +687,10 @@ def flapli_kanat_coz_re(
             "Re_polar": r_pol,
             "a0_2d_flapsiz_per_deg": sol_flapsiz["a0_2d_per_deg"],
             "a0_2d_flapli_per_deg": sol_flapli["a0_2d_per_deg"],
+            "a0_duzeltildi": bool(sol_flapsiz["a0_duzeltildi"] or sol_flapli["a0_duzeltildi"]),
+            "stall_tepesi_gorulmedi": bool(
+                sol_flapsiz["stall_tepesi_gorulmedi"] or sol_flapli["stall_tepesi_gorulmedi"]
+            ),
             "alpha_L0_flapsiz_deg": sol_flapsiz["alpha_L0_deg"],
             "alpha_L0_flapli_deg": sol_flapli["alpha_L0_deg"],
             "alpha_L0_deg": alpha_l0_birl,
@@ -753,6 +863,8 @@ def flapsiz_adaylari_coz_ve_yaz(
                     "c_w_m": c_w,
                     "Re_aday": re_aday,
                     "Re_durumu": kanat_cozum["Re_durumu"],
+                    "a0_duzeltildi": kanat_cozum["a0_duzeltildi"],
+                    "stall_tepesi_gorulmedi": kanat_cozum["stall_tepesi_gorulmedi"],
                     "alpha_deg": float(alfa_deg),
                     "a0_2d_per_deg": kanat_cozum["a0_2d_per_deg"],
                     "alpha_L0_deg": kanat_cozum["alpha_L0_deg"],
@@ -856,6 +968,8 @@ def flapli_adaylari_coz_ve_yaz(
                     "Re_aday": re_flapsiz,
                     "Re_flapsiz": re_flapsiz,
                     "Re_durumu": kanat_cozum["Re_durumu"],
+                    "a0_duzeltildi": kanat_cozum["a0_duzeltildi"],
+                    "stall_tepesi_gorulmedi": kanat_cozum["stall_tepesi_gorulmedi"],
                     "alpha_deg": float(alfa_deg),
                     "alpha_L0_deg": kanat_cozum["alpha_L0_deg"],
                     "alpha_stall_2d_deg": kanat_cozum["alpha_stall_2d_deg"],
@@ -892,13 +1006,19 @@ def main(argv=None) -> None:
     parser.add_argument("--cikti-klasoru", type=Path, default=SCRIPT_DIR)
     args = parser.parse_args(argv)
 
+    GECERSIZ_POLAR_KAYITLARI.clear()
+
     print("(1) 2B polar klasorleri indeksleniyor (sadece CL verileri)...")
     flapsiz_indeks = polar_klasorunu_indeksle(POLAR_KLASORU)
     flapli_indeks = polar_klasorunu_indeksle(FLAP_POLAR_KLASORU)
     print(f"  - {POLAR_KLASORU.name}: {len(flapsiz_indeks)} anahtar indekslendi.")
     print(f"  - {FLAP_POLAR_KLASORU.name}: {len(flapli_indeks)} flapli anahtar indekslendi.")
+    if GECERSIZ_POLAR_KAYITLARI:
+        yol_log = args.cikti_klasoru / GECERSIZ_POLAR_LOG_ADI
+        gecersiz_polar_logunu_yaz(yol_log)
+        print(f"  - [UYARI] {len(GECERSIZ_POLAR_KAYITLARI)} adet gecersiz_polar tespit edildi -> {yol_log}")
 
-    print("\n2) Flapsiz kanat + kuyruk adaylari LLT ile cozuluyor (-5..15 derece, coklu Reynolds)...")
+    print("\n(2) Flapsiz kanat + kuyruk adaylari LLT ile cozuluyor (-5..20 derece, coklu Reynolds)...")
     flapsiz_adaylar = adaylari_yukle(FLAPSIZ_ADAY_CSV_ADI, flapli_mi=False)
     yol_flapsiz_aday = args.cikti_klasoru / "llt_flapsiz_coklu_re.csv"
     _, n_aday_flapsiz = flapsiz_adaylari_coz_ve_yaz(
@@ -906,7 +1026,7 @@ def main(argv=None) -> None:
     )
     print(f"  - Kaydedildi: {yol_flapsiz_aday} ({n_aday_flapsiz} satir)")
 
-    print("\n3) Flapli kanat + kuyruk adaylari LLT ile cozuluyor (-5..15 derece, coklu Reynolds)...")
+    print("\n(3) Flapli kanat + kuyruk adaylari LLT ile cozuluyor (-5..20 derece, coklu Reynolds)...")
     flapli_adaylar = adaylari_yukle(FLAPLI_ADAY_CSV_ADI, flapli_mi=True)
     yol_flapli_aday = args.cikti_klasoru / "llt_flapli_coklu_re.csv"
     _, n_aday_flapli = flapli_adaylari_coz_ve_yaz(
