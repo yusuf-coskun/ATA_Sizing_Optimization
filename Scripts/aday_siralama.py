@@ -427,7 +427,12 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
             uygunsuzluklar.append(f"seyir:{seyir_neden or 'uygunsuz'}")
 
         yuk_durum = metin_al(yuk, "durum", varsayilan="eksik")
-        yuk_uygun = (yuk is not None) and (yuk_durum.lower() == "uygun")
+        # Koşullu hesaplar sıralamada kabul edilir. Kaynak durum tanı için korunur.
+        yuk_uygun = yuk is not None and yuk_durum.lower() in (
+            "uygun",
+            "model_kapsaminda_hesaplandi",
+            "kosullu_tahmin",
+        )
         if not yuk_uygun:
             uygunsuzluklar.append(f"yuk_birakma:{yuk_durum}")
 
@@ -484,6 +489,7 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
             "tirmanis_uygun": tirmanis_uygun,
             "seyir_uygun": seyir_feasible,
             "yuk_birakma_uygun": yuk_uygun,
+            "yuk_birakma_durum": yuk_durum,
             "inis_uygun": inis_uygun,
             "batarya_uygun": batarya_uygun,
             "sure_uygun": sure_uygun,

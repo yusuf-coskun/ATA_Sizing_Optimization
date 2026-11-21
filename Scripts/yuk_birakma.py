@@ -36,9 +36,9 @@ class Ayarlar:
     g: float = 9.80665
     kuyruk_oturma: float = 0.0
     yardimci_guc: float = 0.0
-    dalis_motor_kapali: bool = False
+    dalis_motor_kapali: bool = True
     dalis_profili: str = 'sabit'
-    alt_gaz_modeli: str = 'veri'
+    alt_gaz_modeli: str = 'sifir-noktasi'
     llt_re_kontrol: bool = False
     tablo_degeri: str = 'auto'
 
@@ -405,12 +405,14 @@ def main(argv=None):
     for name in ('seyir-irtifasi','birakma-irtifasi','seyir-hizi','vx','vz','birakma-suresi',
                  'dt','gerilim','rho','mu','g','kuyruk-oturma','yardimci-guc'):
         parser.add_argument('--'+name,type=float,default=getattr(defaults,name.replace('-','_')))
-    parser.add_argument('--dalis-motor-kapali',action='store_true',
-                        help='Ek surukleme saglandigi KOSULUYLA dalista T<=0 adimlarinda motor gucunu 0 W kabul et.')
+    parser.add_argument('--dalis-motor-kapali', action=argparse.BooleanOptionalAction,
+                        default=defaults.dalis_motor_kapali,
+                        help='Ek surukleme saglandigi kosuluyla dalista T<=0 adimlarinda motor gucunu 0 W kabul et (varsayilan: acik).')
     parser.add_argument('--dalis-profili',choices=['sabit','yumusak'],default='sabit',
                         help='yumusak: Vz iki ucta 0; --vz ortalama dusus hizidir. Dikey ivme kuvvetlere dahil.')
-    parser.add_argument('--alt-gaz-modeli',choices=['veri','sifir-noktasi'],default='veri',
-                        help='Varsayilan veri: tablo disina cikmaz. sifir-noktasi: acik 0N/0W tahmini.')
+    parser.add_argument('--alt-gaz-modeli', choices=['veri', 'sifir-noktasi'],
+                        default=defaults.alt_gaz_modeli,
+                        help='sifir-noktasi: 0 N / 0 W kabulune dayali tahmin (varsayilan). veri: tablo disina cikmaz.')
     parser.add_argument('--llt-re-kontrol',action='store_true')
     parser.add_argument('--tablo-degeri',choices=['auto','guc_w','akim_a'],default='auto')
     args = parser.parse_args(argv)
