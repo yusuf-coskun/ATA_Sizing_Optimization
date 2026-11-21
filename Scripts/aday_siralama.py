@@ -345,10 +345,17 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
         )
 
         # 3. Süre, Enerji (Wh) ve Batarya (mAh) Bütçesi Birleştirmesi
-        kalkis_sure_s = sayi_al(kalkis, "sure_kriter_s", "sure_ort_ivme_s", varsayilan=sayi_al(seyir, "kalkis_sure_M2_sn", varsayilan=0.0))
-        kalkis_mah = sayi_al(kalkis, "tuketim_kriter_mAh", "tuketim_ort_ivme_mAh", varsayilan=sayi_al(seyir, "kalkis_tuketim_M2_mah", varsayilan=0.0))
-        kalkis_wh = sayi_al(kalkis, "enerji_kriter_Wh", "enerji_ort_ivme_Wh", varsayilan=sayi_al(seyir, "kalkis_enerji_M2_Wh", varsayilan=0.0))
-        kalkis_mesafe_m = sayi_al(kalkis, "S_G_kriter_m", "S_G_ort_ivme_m", varsayilan=sayi_al(seyir, "kalkis_mesafe_M2_m"))
+        kalkis_sure_s = sayi_al(kalkis, "sure_M2_kriter_s")
+        kalkis_mah = sayi_al(kalkis, "tuketim_M2_kriter_mAh")
+        kalkis_wh = sayi_al(kalkis, "enerji_M2_kriter_Wh")
+        kalkis_mesafe_m = sayi_al(kalkis, "S_G_M2_kriter_m")
+        kalkis_olcumleri = {
+            "sure_M2_kriter_s": kalkis_sure_s,
+            "tuketim_M2_kriter_mAh": kalkis_mah,
+            "enerji_M2_kriter_Wh": kalkis_wh,
+            "S_G_M2_kriter_m": kalkis_mesafe_m,
+        }
+        eksik_kalkis_alanlari = [ad for ad, deger in kalkis_olcumleri.items() if deger is None]
 
         tirmanis_sure_s = sayi_al(tirmanis, "sure_s", varsayilan=sayi_al(seyir, "tirmanis_sure_sn", varsayilan=0.0))
         tirmanis_mah = sayi_al(tirmanis, "tuketim_mAh", varsayilan=sayi_al(seyir, "tirmanis_tuketim_mah", varsayilan=0.0))
@@ -372,45 +379,43 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
         inis_sure_s = sayi_al(inis, "sure_inis_kriter_s", "sure_inis_ort_ivme_s", varsayilan=0.0)
         inis_mesafe_m = sayi_al(inis, "S_G_inis_kriter_m", "S_G_inis_ort_ivme_m")
 
-        gercek_toplam_sure_sn = round(
-            (kalkis_sure_s or 0.0)
-            + (tirmanis_sure_s or 0.0)
-            + (seyir_nav_sure_s or 0.0)
-            + (yuk_toplam_sure_s or 0.0)
-            + (inis_sure_s or 0.0),
-            3,
-        )
+        gercek_toplam_sure_sn = None
+        if kalkis_sure_s is not None:
+            gercek_toplam_sure_sn = round(
+                kalkis_sure_s + tirmanis_sure_s + seyir_nav_sure_s + yuk_toplam_sure_s + inis_sure_s,
+                3,
+            )
 
-        gercek_toplam_tuketim_mah = round(
-            (kalkis_mah or 0.0)
-            + (tirmanis_mah or 0.0)
-            + (seyir_mah or 0.0)
-            + (yuk_mah or 0.0)
-            + args.inis_ek_butce_mah,
-            3,
-        )
+        gercek_toplam_tuketim_mah = None
+        kalan_batarya_yuzde = None
+        if kalkis_mah is not None:
+            gercek_toplam_tuketim_mah = round(
+                kalkis_mah + tirmanis_mah + seyir_mah + yuk_mah + args.inis_ek_butce_mah,
+                3,
+            )
+            kalan_batarya_yuzde = round(
+                100.0 * (BATARYA_KAPASITE_MAH - gercek_toplam_tuketim_mah) / BATARYA_KAPASITE_MAH,
+                2,
+            )
 
-        gercek_toplam_enerji_wh = round(
-            (kalkis_wh or 0.0)
-            + (tirmanis_wh or 0.0)
-            + (seyir_wh or 0.0)
-            + (yuk_wh or 0.0)
-            + (args.inis_ek_butce_mah * GERILIM_V / 1000.0),
-            4,
-        )
-
-        kalan_batarya_yuzde = round(
-            100.0 * (BATARYA_KAPASITE_MAH - gercek_toplam_tuketim_mah) / BATARYA_KAPASITE_MAH,
-            2,
-        )
+        gercek_toplam_enerji_wh = None
+        if kalkis_wh is not None:
+            gercek_toplam_enerji_wh = round(
+                kalkis_wh + tirmanis_wh + seyir_wh + yuk_wh
+                + args.inis_ek_butce_mah * GERILIM_V / 1000.0,
+                4,
+            )
 
         # 4. Faz Bazlı Fizibilite (Uygunluk) Kontrolleri
         uygunsuzluklar: List[str] = []
 
         kalkis_durum = metin_al(kalkis, "durum", varsayilan="uygun" if puan_kalkis_60 and puan_kalkis_60 > 0 else "eksik")
-        kalkis_20m = bool_al(kalkis, "kutu_20m_icinde", varsayilan=bool_al(seyir, "kalkis_20m_basarili", varsayilan=False))
+        kalkis_20m = bool_al(kalkis, "kalkis_20m_basarili", "kutu_20m_icinde")
         kalkis_uygun = (kalkis is not None) and (kalkis_durum.lower() in ("uygun", "ok", "basarili") or (puan_kalkis_60 or 0.0) > 0.0)
-        if not kalkis_uygun:
+        if eksik_kalkis_alanlari:
+            kalkis_uygun = False
+            uygunsuzluklar.append("kalkis_M2_verisi_eksik:" + ",".join(eksik_kalkis_alanlari))
+        elif not kalkis_uygun:
             uygunsuzluklar.append(f"kalkis:{kalkis_durum}")
         elif args.kalkis_20m_zorunlu and not kalkis_20m:
             kalkis_uygun = False
@@ -446,12 +451,14 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
         if not inis_uygun:
             uygunsuzluklar.append(f"inis:{inis_durum}")
 
-        batarya_uygun = gercek_toplam_tuketim_mah <= KULLANILABILIR_MAH
-        if not batarya_uygun:
+        batarya_uygun = (
+            gercek_toplam_tuketim_mah is not None and gercek_toplam_tuketim_mah <= KULLANILABILIR_MAH
+        )
+        if gercek_toplam_tuketim_mah is not None and not batarya_uygun:
             uygunsuzluklar.append("batarya_9600mAh_asimi")
 
-        sure_uygun = gercek_toplam_sure_sn <= MAX_GOREV_SURESI_SN
-        if not sure_uygun:
+        sure_uygun = gercek_toplam_sure_sn is not None and gercek_toplam_sure_sn <= MAX_GOREV_SURESI_SN
+        if gercek_toplam_sure_sn is not None and not sure_uygun:
             uygunsuzluklar.append("gorev_suresi_600s_asimi")
 
         tum_fazlar_uygun = (
