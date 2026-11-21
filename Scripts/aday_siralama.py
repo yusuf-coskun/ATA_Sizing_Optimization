@@ -373,8 +373,22 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
             "sure_s",
             varsayilan=(dalis_sure_s or 0.0) + (birakma_sure_s or 0.0) + (yuk_tirmanis_sure_s or 0.0),
         )
-        yuk_mah = sayi_al(yuk, "tuketim_mAh", varsayilan=0.0)
-        yuk_wh = sayi_al(yuk, "enerji_Wh", varsayilan=0.0)
+        yuk_durum = metin_al(yuk, "durum", varsayilan="eksik")
+        yuk_durum_duz = yuk_durum.lower()
+        yuk_durum_kabul = yuk_durum_duz in ("uygun", "model_kapsaminda_hesaplandi", "kosullu_tahmin")
+        yuk_kosullu = yuk_durum_duz == "kosullu_tahmin"
+        yuk_mah = sayi_al(yuk, "tuketim_mAh")
+        yuk_wh = sayi_al(yuk, "enerji_Wh")
+        # Eski "uygun" kayıtlarında tamlık bayrağı yoksa iki toplamın varlığına bakılır.
+        eski_tamlik = yuk_durum_duz == "uygun" and yuk is not None and "tuketim_tam" not in yuk
+        yuk_enerji_tam = (
+            yuk_durum_kabul
+            and bool_al(yuk, "tuketim_tam", varsayilan=eski_tamlik)
+            and yuk_mah is not None and yuk_mah >= 0.0
+            and yuk_wh is not None and yuk_wh >= 0.0
+        )
+        if not yuk_enerji_tam:
+            yuk_mah = yuk_wh = None
 
         inis_sure_s = sayi_al(inis, "sure_inis_kriter_s", "sure_inis_ort_ivme_s", varsayilan=0.0)
         inis_mesafe_m = sayi_al(inis, "S_G_inis_kriter_m", "S_G_inis_ort_ivme_m")
@@ -388,7 +402,7 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
 
         gercek_toplam_tuketim_mah = None
         kalan_batarya_yuzde = None
-        if kalkis_mah is not None:
+        if kalkis_mah is not None and yuk_mah is not None:
             gercek_toplam_tuketim_mah = round(
                 kalkis_mah + tirmanis_mah + seyir_mah + yuk_mah + args.inis_ek_butce_mah,
                 3,
@@ -399,7 +413,7 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
             )
 
         gercek_toplam_enerji_wh = None
-        if kalkis_wh is not None:
+        if kalkis_wh is not None and yuk_wh is not None:
             gercek_toplam_enerji_wh = round(
                 kalkis_wh + tirmanis_wh + seyir_wh + yuk_wh
                 + args.inis_ek_butce_mah * GERILIM_V / 1000.0,
@@ -431,15 +445,11 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
         if not seyir_feasible:
             uygunsuzluklar.append(f"seyir:{seyir_neden or 'uygunsuz'}")
 
-        yuk_durum = metin_al(yuk, "durum", varsayilan="eksik")
-        # Koşullu hesaplar sıralamada kabul edilir. Kaynak durum tanı için korunur.
-        yuk_uygun = yuk is not None and yuk_durum.lower() in (
-            "uygun",
-            "model_kapsaminda_hesaplandi",
-            "kosullu_tahmin",
-        )
-        if not yuk_uygun:
+        yuk_uygun = yuk_durum_kabul and yuk_enerji_tam
+        if not yuk_durum_kabul:
             uygunsuzluklar.append(f"yuk_birakma:{yuk_durum}")
+        elif not yuk_enerji_tam:
+            uygunsuzluklar.append("yuk_birakma:enerji_verisi_eksik")
 
         inis_durum = metin_al(inis, "durum", varsayilan="eksik")
         inis_20m = bool_al(inis, "inis_20m_basarili", varsayilan=False)
@@ -451,11 +461,19 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
         if not inis_uygun:
             uygunsuzluklar.append(f"inis:{inis_durum}")
 
-        batarya_uygun = (
-            gercek_toplam_tuketim_mah is not None and gercek_toplam_tuketim_mah <= KULLANILABILIR_MAH
-        )
-        if gercek_toplam_tuketim_mah is not None and not batarya_uygun:
+        enerji_butcesi_durum = "eksik"
+        if gercek_toplam_tuketim_mah is not None and gercek_toplam_enerji_wh is not None:
+            enerji_butcesi_durum = "kosullu_tahmin" if yuk_kosullu else "hesaplandi"
+
+        batarya_uygun = False
+        if gercek_toplam_tuketim_mah is None:
+            batarya_durum = "belirsiz"
+        elif gercek_toplam_tuketim_mah > KULLANILABILIR_MAH:
+            batarya_durum = "uygun_degil"
             uygunsuzluklar.append("batarya_9600mAh_asimi")
+        else:
+            batarya_durum = "kosullu_uygun" if yuk_kosullu else "uygun"
+            batarya_uygun = True
 
         sure_uygun = gercek_toplam_sure_sn is not None and gercek_toplam_sure_sn <= MAX_GOREV_SURESI_SN
         if gercek_toplam_sure_sn is not None and not sure_uygun:
@@ -499,6 +517,8 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
             "yuk_birakma_durum": yuk_durum,
             "inis_uygun": inis_uygun,
             "batarya_uygun": batarya_uygun,
+            "batarya_durum": batarya_durum,
+            "enerji_butcesi_durum": enerji_butcesi_durum,
             "sure_uygun": sure_uygun,
             "uygunsuzluk_ozeti": "; ".join(uygunsuzluklar),
             # Puan Sütunları (Modüllerden Çıkan Toplam Puanlar)
@@ -718,7 +738,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"İniş: {en_iyi['resmi_inis_puani_140']})\n"
             f"  mission2_400_puani      : {en_iyi['mission2_400_puani']}\n"
             f"  toplam_tuketim / süre   : {en_iyi['gercek_toplam_tuketim_mAh']} mAh "
-            f"(Kalan: %{en_iyi['kalan_batarya_yuzde']}) / {en_iyi['gercek_toplam_sure_sn']} s"
+            f"(Kalan: %{en_iyi['kalan_batarya_yuzde']}) / {en_iyi['gercek_toplam_sure_sn']} s" +
+            f"\n  batarya_durum / enerji  : {en_iyi['batarya_durum']} / {en_iyi['enerji_butcesi_durum']}"
         )
 
     return 0
