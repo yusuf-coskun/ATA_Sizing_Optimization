@@ -47,6 +47,8 @@ BATARYA_KAPASITE_MAH = 12000.0
 INIS_REZERV_ORANI = 0.20
 KULLANILABILIR_MAH = BATARYA_KAPASITE_MAH * (1.0 - INIS_REZERV_ORANI)  # 9600.0 mAh
 MAX_GOREV_SURESI_SN = 600.0  # 10 dakika
+# kalkis_hesabi.py ile aynı sınır. Hız sütunu metre/saniye cinsindedir.
+MAX_AIRSPEED_40KTS_MS = 40.0 * 0.514444
 
 
 def dosya_yolu_coz(dosya_adi: str, ek_dizinler: Optional[Iterable[Path]] = None) -> Path:
@@ -349,11 +351,13 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
         kalkis_mah = sayi_al(kalkis, "tuketim_M2_kriter_mAh")
         kalkis_wh = sayi_al(kalkis, "enerji_M2_kriter_Wh")
         kalkis_mesafe_m = sayi_al(kalkis, "S_G_M2_kriter_m")
+        kalkis_v_lof_m_s = sayi_al(kalkis, "V_LOF_M2_m_s")
         kalkis_olcumleri = {
             "sure_M2_kriter_s": kalkis_sure_s,
             "tuketim_M2_kriter_mAh": kalkis_mah,
             "enerji_M2_kriter_Wh": kalkis_wh,
             "S_G_M2_kriter_m": kalkis_mesafe_m,
+            "V_LOF_M2_m_s": kalkis_v_lof_m_s,
         }
         eksik_kalkis_alanlari = [ad for ad, deger in kalkis_olcumleri.items() if deger is None]
 
@@ -423,20 +427,39 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
         # 4. Faz Bazlı Fizibilite (Uygunluk) Kontrolleri
         uygunsuzluklar: List[str] = []
 
-        kalkis_durum = metin_al(kalkis, "durum", varsayilan="uygun" if puan_kalkis_60 and puan_kalkis_60 > 0 else "eksik")
-        kalkis_20m = bool_al(kalkis, "kalkis_20m_basarili", "kutu_20m_icinde")
-        kalkis_uygun = (kalkis is not None) and (kalkis_durum.lower() in ("uygun", "ok", "basarili") or (puan_kalkis_60 or 0.0) > 0.0)
-        if eksik_kalkis_alanlari:
-            kalkis_uygun = False
-            uygunsuzluklar.append("kalkis_M2_verisi_eksik:" + ",".join(eksik_kalkis_alanlari))
-        elif not kalkis_uygun:
-            uygunsuzluklar.append(f"kalkis:{kalkis_durum}")
-        elif args.kalkis_20m_zorunlu and not kalkis_20m:
-            kalkis_uygun = False
-            uygunsuzluklar.append("kalkis_20m_asimi")
+        kalkis_durum = metin_al(kalkis, "durum", varsayilan="eksik")
+        kalkis_m1_durum = metin_al(kalkis, "M1_durum", varsayilan="eksik")
+        kalkis_m2_durum = metin_al(kalkis, "M2_durum", varsayilan="eksik")
+        kalkis_durum_kodu = kalkis_durum.lower()
+        kalkis_m2_durum_kodu = kalkis_m2_durum.lower()
+        kalkis_20m = (
+            kalkis_m2_durum_kodu == "uygun"
+            and kalkis_durum_kodu != "mesafe_asimi_20m"
+            and bool_al(kalkis, "kalkis_20m_basarili", "kutu_20m_icinde")
+        )
 
-        tirmanis_durum = metin_al(tirmanis, "durum", varsayilan="uygun" if bool_al(seyir, "tirmanis_uygun") else "eksik")
-        tirmanis_uygun = (tirmanis is not None and tirmanis_durum.lower() == "uygun") or bool_al(seyir, "tirmanis_uygun", varsayilan=False)
+        kalkis_sorunu = None
+        if kalkis_durum_kodu not in (
+            "uygun", "ok", "basarili", "mesafe_asimi_20m", "kismi_sonuc_m1_hesaplanamadi",
+        ):
+            kalkis_sorunu = f"kalkis:{kalkis_durum}"
+        elif kalkis_m2_durum_kodu not in ("uygun", "mesafe_asimi_20m"):
+            kalkis_sorunu = f"kalkis_M2:{kalkis_m2_durum}"
+        elif eksik_kalkis_alanlari:
+            kalkis_sorunu = "kalkis_M2_verisi_eksik:" + ",".join(eksik_kalkis_alanlari)
+        elif kalkis_v_lof_m_s <= 0.0:
+            kalkis_sorunu = "kalkis:V_LOF_M2_gecersiz"
+        elif kalkis_v_lof_m_s > MAX_AIRSPEED_40KTS_MS:
+            kalkis_sorunu = "kalkis:hiz_40kts_asimi"
+        elif args.kalkis_20m_zorunlu and not kalkis_20m:
+            kalkis_sorunu = "kalkis_20m_asimi"
+
+        kalkis_uygun = kalkis_sorunu is None
+        if kalkis_sorunu is not None:
+            uygunsuzluklar.append(kalkis_sorunu)
+
+        tirmanis_durum = metin_al(tirmanis, "durum", varsayilan="eksik")
+        tirmanis_uygun = tirmanis_durum.lower() == "uygun"
         if not tirmanis_uygun:
             uygunsuzluklar.append(f"tirmanis:{tirmanis_durum}")
 
@@ -511,7 +534,11 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
             # Fizibilite Özeti
             "tum_fazlar_uygun": tum_fazlar_uygun,
             "kalkis_uygun": kalkis_uygun,
+            "kalkis_durum": kalkis_durum,
+            "kalkis_M1_durum": kalkis_m1_durum,
+            "kalkis_M2_durum": kalkis_m2_durum,
             "tirmanis_uygun": tirmanis_uygun,
+            "tirmanis_durum": tirmanis_durum,
             "seyir_uygun": seyir_feasible,
             "yuk_birakma_uygun": yuk_uygun,
             "yuk_birakma_durum": yuk_durum,
@@ -538,6 +565,7 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
             "tasarim_kalkis_puani_100": tasarim_kalkis_100,
             # Performans, Süre ve Enerji Metrikleri
             "kalkis_mesafe_m": kalkis_mesafe_m,
+            "V_LOF_M2_m_s": kalkis_v_lof_m_s,
             "kalkis_20m_icinde": kalkis_20m,
             "inis_mesafe_m": inis_mesafe_m,
             "inis_20m_icinde": inis_20m,
