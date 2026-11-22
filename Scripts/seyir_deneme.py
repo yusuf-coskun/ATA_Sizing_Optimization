@@ -50,7 +50,7 @@ import pandas as pd
 from aday_pervane import (GERILIM_V, faz_anahtari, faz_sonuclarini_dogrula,
                          kimlik_alanlari, performans_adaylarini_hazirla)
 from tirmanis_hesabi import prop_at_speed
-from llt_csv_okuyucu import LLTTable
+from llt_csv_okuyucu import LLTTable, cl_at_alpha
 
 # ==============================================================================
 # 1. SABITLER, BATARYA KISITLARI VE GOREV PARAMETRELERI
@@ -706,7 +706,7 @@ def validate_wing_reference(row, reference):
 
 
 def evaluate_cruise_phase(mass_kg, S_w, AR_w, CD_0, e_oswald, CL_alpha_deg, alpha_L0_deg, CL_max_3d, route_info, thrust_info,
-                          alpha_min_deg=-4.0, alpha_max_deg=6.0, tail_data=None):
+                          alpha_min_deg=-4.0, alpha_max_deg=6.0, tail_data=None, wing_curve=None):
     """
     Sabit 20 m/s seyir hizinda (V_SEYIR) kanat + kuyruk dusey kuvvet dengesini (L = n * W) cozer:
     - Her ucak kendi agirligini ve kanat alanini dengeleyecek kendine ozgu bir AoA (alpha) ile ucar.
@@ -718,6 +718,8 @@ def evaluate_cruise_phase(mass_kg, S_w, AR_w, CD_0, e_oswald, CL_alpha_deg, alph
         raise ValueError("Kutle/alan/aerodinamik girdiler gecersiz.")
     if tail_data is None:
         raise ValueError("Yatay kuyruk aerodinamik verisi gerekli.")
+    if not wing_curve:
+        raise ValueError("Seyir için LLT kanat CL eğrisi gerekli.")
     q = 0.5 * RHO_HAVA * V_SEYIR ** 2
     weight = mass_kg * G_YERCEKIMI
     ratio = tail_data["S"] / S_w
@@ -725,9 +727,23 @@ def evaluate_cruise_phase(mass_kg, S_w, AR_w, CD_0, e_oswald, CL_alpha_deg, alph
 
     def state(load):
         required = load * weight / (q * S_w)
-        # CL_w = a_w * (alpha - alpha_L0); CL_HT = a_HT * (alpha + i_HT), NACA0010 alpha_L0 = 0
-        alpha = (required + CL_alpha_deg * alpha_L0_deg - ratio * slope_tail * KUYRUK_OTURMA_DEG) / (CL_alpha_deg + ratio * slope_tail)
-        clw = CL_alpha_deg * (alpha - alpha_L0_deg)
+        # Kanat CL'sini kalkış/tırmanış/inişle aynı kayıtlı eğriden oku.
+        def lift_at(alpha):
+            return cl_at_alpha(wing_curve, alpha) + ratio * slope_tail * (alpha + KUYRUK_OTURMA_DEG)
+        lo, hi = alpha_min_deg, alpha_max_deg
+        if required <= lift_at(lo):
+            alpha = lo
+        elif required >= lift_at(hi):
+            alpha = hi
+        else:
+            for _ in range(60):
+                mid = (lo + hi) / 2.0
+                if lift_at(mid) < required:
+                    lo = mid
+                else:
+                    hi = mid
+            alpha = (lo + hi) / 2.0
+        clw = cl_at_alpha(wing_curve, alpha)
         alpha_tail = alpha + KUYRUK_OTURMA_DEG
         clh = slope_tail * alpha_tail
         cdiw = clw ** 2 / (np.pi * AR_w * e_oswald)
@@ -738,6 +754,7 @@ def evaluate_cruise_phase(mass_kg, S_w, AR_w, CD_0, e_oswald, CL_alpha_deg, alph
         stall = (0 <= clw <= STALL_EMNIYET_ORANI * CL_max_3d
                  and abs(clh) <= tail_data["cl_max"])
         polar = (alpha_min_deg <= alpha <= alpha_max_deg
+                 and abs(lift_at(alpha) - required) <= 1e-6
                  and tail_data["alpha_min"] <= alpha_tail <= tail_data["alpha_max"])
         return dict(CL=required, CL_w=clw, CL_HT=clh, CD=cd, CDi_w=cdiw, CDi_HT=cdih,
                     LD=required / cd, alpha=alpha, alpha_HT=alpha_tail, thrust=thrust,
@@ -849,7 +866,8 @@ def run_full_cruise_mission_optimization(tail_csv_path=None, llt_csv_path=None, 
                 e_oswald=llt_data["e_oswald"], CL_alpha_deg=llt_data["CL_alpha_3d_per_deg"],
                 alpha_L0_deg=llt_data["alpha_L0_deg"], CL_max_3d=llt_data["CL_max_3d"],
                 route_info=route_info, thrust_info=thrust_info,
-                alpha_min_deg=llt_data["alpha_min_deg"], alpha_max_deg=llt_data["alpha_max_deg"], tail_data=tail_data
+                alpha_min_deg=llt_data["alpha_min_deg"], alpha_max_deg=llt_data["alpha_max_deg"],
+                tail_data=tail_data, wing_curve=wing["curve"]
             )
 
             # 2. BOS SEYIR ANALIZI (1 Tur)
@@ -858,7 +876,8 @@ def run_full_cruise_mission_optimization(tail_csv_path=None, llt_csv_path=None, 
                 e_oswald=llt_data["e_oswald"], CL_alpha_deg=llt_data["CL_alpha_3d_per_deg"],
                 alpha_L0_deg=llt_data["alpha_L0_deg"], CL_max_3d=llt_data["CL_max_3d"],
                 route_info=route_info, thrust_info=thrust_info,
-                alpha_min_deg=llt_data["alpha_min_deg"], alpha_max_deg=llt_data["alpha_max_deg"], tail_data=tail_data
+                alpha_min_deg=llt_data["alpha_min_deg"], alpha_max_deg=llt_data["alpha_max_deg"],
+                tail_data=tail_data, wing_curve=wing["curve"]
             )
 
             # 3. KALKIS VE TIRMANIS GERCEK VERILERININ ENTEGRASYONU

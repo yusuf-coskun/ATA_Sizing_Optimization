@@ -82,8 +82,8 @@ VSPAERO_VETER_TESS: Optional[int] = None
 #   FLAP_VERIMI: VSPAERO (sürtünmesiz) 30° flabın α0 kaymasını abartıyor; XFOIL/ince profil karşılaştırması
 #                (flap_alpha0_kontrol.py, 29 profil) ortanca eta: Re=200k 0.530, Re=250k (kalkış, v11) 0.531 -> 0.53.
 #                α0_flapli = α0_flapsiz + eta·(α0_flapli_VSPAERO − α0_flapsiz). 1.0 = düzeltme yok (ham VSPAERO).
-#   EGRI_YONTEMI: "otomatik" (VSPAERO: flapsız "kaydir", flaplı "dogrusal"; diğer çözücüler eski "olcekle"),
-#                 "kaydir", "dogrusal", "olcekle".
+#   EGRI_YONTEMI: "otomatik" (VSPAERO: flapsız "kaydir", flaplı "dogrusal";
+#                 diğer çözücüler "dogrusal"), "kaydir", "dogrusal".
 FLAP_VERIMI: float = 0.53
 EGRI_YONTEMI: str = "otomatik"
 VSPAERO_GOVDE: Optional[Dict[str, Any]] = None  # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde] None = sadece kanat; dolu = her adaya gövde (tam akış)
@@ -1056,13 +1056,9 @@ def _tek_mod_tablolari_guncelle(
     alpha_l0_key = "alpha_L0_flapli_deg" if flapli_mi else "alpha_L0_deg"
     e_key = "e_oswald_flapli" if flapli_mi else "e_oswald"
     cl_max_key = "CL_max_3d_flapli_tahmini" if flapli_mi else "CL_max_3d_tahmini"
-    cl_orani_key = "cl_alpha_flapli_orani" if flapli_mi else "cl_alpha_orani"
 
-    # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] "kaydir" yönteminde her LLT eğrisi (aday + hız + Re) ayrı ele alınır:
-    # eğrinin kendi doğrusal bölgesinden eğim ve α0 bulunur, sonra eğri VLM α0'ına KAYDIRILIR ve VLM eğimine
-    # ÖLÇEKLENİR. Böylece kalkış/iniş/tırmanışın kullandığı CL eğrisi ile seyirin kullandığı CLα/α0 sütunları
-    # aynı sayıyı verir; stall bölgesinin şekli LLT'den korunur. Eski yöntem ("olcekle") yalnız eğimi
-    # düzeltiyor, LLT α0'ını eğride bırakıyordu (flaplıda CL ≈ %45 eksik çıkabiliyordu).
+    # VLM doğrusu -2..+2 derecede tam kullanılır; LLT eğriliği bu bölgenin
+    # üstünde stall sınırına sönümlenerek eklenir. CLmax/stall aynı modeldendir.
     cozucu_alan = "cozucu_flapli" if flapli_mi else "cozucu"
     egri_gruplari: Dict[Tuple[Any, ...], List[Tuple[float, float]]] = {}
     egri_parametreleri: Dict[Tuple[Any, ...], Optional[Tuple[float, float, float, float]]] = {}
@@ -1072,12 +1068,14 @@ def _tek_mod_tablolari_guncelle(
                 metin_al(row, "hiz_ms", varsayilan=""), metin_al(row, "Re_aday", varsayilan=""))
 
     def _yontem(vlm: Dict[str, Any]) -> str:
-        if EGRI_YONTEMI in ("kaydir", "olcekle", "dogrusal"):
+        if EGRI_YONTEMI == "olcekle":
+            raise ValueError("Yalnız oranla CL ölçekleme tutarsızdır; kaydir veya dogrusal kullanın.")
+        if EGRI_YONTEMI in ("kaydir", "dogrusal"):
             return EGRI_YONTEMI
         if not str(vlm.get(cozucu_alan, vlm.get("cozucu", ""))).startswith("vspaero"):
-            return "olcekle"
-        # Flaplı LLT eğrileri güvenilir değil: düşük açılarda düz taban (60/1044 eğri) ve eğimi sütundan farklı
-        # kıvrımlı bölgeler var -> flaplıda doğru + CL_max sınırı; flapsızda LLT stall şekli korunur.
+            return "dogrusal"
+        # Flaplı LLT eğrilerinde düşük açıda düz tabanlar var; flapsızda LLT
+        # kıvrımı sınırlar içinde korunur, flaplıda VLM doğrusu kullanılır.
         return "dogrusal" if flapli_mi else "kaydir"
 
     for row in llt_satirlar:
@@ -1115,6 +1113,37 @@ def _tek_mod_tablolari_guncelle(
             return nk[-1][1]
         return float(np.interp(a, [p for p, _ in nk], [c for _, c in nk]))
 
+    def _yeni_cl(alpha: float, vlm: Dict[str, Any], ek: Tuple[Any, ...]) -> float:
+        """VLM doğrusu ve sınırıyla, mümkünse LLT eğriliğini koruyan tek CL modeli."""
+        cla = float(vlm[cl_alpha_key])
+        a0 = float(vlm[alpha_l0_key])
+        clmax = float(vlm[cl_max_key])
+        if not all(math.isfinite(x) for x in (alpha, cla, a0, clmax)) or cla <= 0 or clmax <= 0:
+            raise ValueError("VLM CL modeli için sonlu, pozitif eğim ve CLmax gerekli.")
+        stall = a0 + clmax / cla
+        linear = cla * (alpha - a0)
+        if alpha >= stall:
+            return clmax
+        if _yontem(vlm) != "kaydir" or alpha <= 2.0 or stall <= 2.0:
+            return linear
+        if ek not in egri_parametreleri:
+            egri_parametreleri[ek] = _egri_dogrusu(egri_gruplari.get(ek, []))
+        prm = egri_parametreleri[ek]
+        if prm is None:
+            raise ValueError(f"LLT eğrisinin doğrusal bölgesi çözülemedi: {ek}")
+        old_slope, old_a0, _, _ = prm
+        points = egri_gruplari[ek]
+        def residual(a: float) -> float:
+            old_a = old_a0 + a - a0
+            old_cl = _egri_deger(points, prm, old_a)
+            return (cla / old_slope) * (old_cl - old_slope * (old_a - old_a0))
+        # Düz bölgede tam VLM doğrusu; stall'da tam CLmax. Arada LLT kıvrımı.
+        taper = (stall - alpha) / (stall - 2.0)
+        correction = (residual(alpha) - residual(2.0)) * taper
+        correction = max(-0.5 * max(linear - cla * (2.0 - a0), 0.0),
+                         min(correction, 0.5 * max(clmax - linear, 0.0)))
+        return linear + correction
+
     yeni_llt: List[Dict[str, Any]] = []
     for row in llt_satirlar:
         g_key = _geometri_anahtari(row)
@@ -1125,48 +1154,58 @@ def _tek_mod_tablolari_guncelle(
             continue
 
         r_copy = dict(row)
-        # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] kaydır + ölçekle (flapsız) / doğru + CL_max sınırı (flaplı)
-        _ym = _yontem(vlm)
-        if _ym in ("kaydir", "dogrusal") and str(r_copy.get("CL", "")).strip() != "":
-            ek = _egri_anahtari(row, g_key)
-            if _ym == "kaydir" and ek not in egri_parametreleri:
-                egri_parametreleri[ek] = _egri_dogrusu(egri_gruplari.get(ek, []))
-            prm = egri_parametreleri.get(ek) if _ym == "kaydir" else None
-            if _ym == "dogrusal" or prm is not None:
-                cla_v, a0_v = float(vlm[cl_alpha_key]), float(vlm[alpha_l0_key])
-                alfa = sayi_al(r_copy, "alpha_deg", varsayilan=0.0)
-                if _ym == "kaydir":
-                    kayma = a0_v - prm[1]
-                    cl_yeni = (cla_v / prm[0]) * _egri_deger(egri_gruplari[ek], prm, alfa - kayma)
-                else:
-                    cl_yeni = min(cla_v * (alfa - a0_v), float(vlm[cl_max_key]))
-                r_copy["e_oswald"] = f"{float(vlm[e_key]):.6f}"
-                r_copy["CL_alpha_3d_per_deg"] = f"{cla_v:.6f}"
-                r_copy["alpha_L0_deg"] = f"{a0_v:.4f}"
-                r_copy["CL_max_3d_tahmini"] = f"{float(vlm[cl_max_key]):.6f}"
-                if flapli_mi:
-                    if "flap_airfoil" not in r_copy or not str(r_copy.get("flap_airfoil", "")).strip():
-                        r_copy["flap_airfoil"] = f"{g_key[0]}_flap"
-                    if "b_flap_m" not in r_copy or not str(r_copy.get("b_flap_m", "")).strip():
-                        r_copy["b_flap_m"] = f"{float(vlm['b_flap_m']):.4f}"
-                r_copy["CL"] = f"{cl_yeni:.6f}"
-                if "CL_kanat" in r_copy:
-                    r_copy["CL_kanat"] = r_copy["CL"]
-                yeni_llt.append(r_copy)
-                continue
         r_copy["e_oswald"] = f"{float(vlm[e_key]):.6f}"
         r_copy["CL_alpha_3d_per_deg"] = f"{float(vlm[cl_alpha_key]):.6f}"
+        if "CL_alpha_3d_kanat_per_deg" in r_copy:
+            r_copy["CL_alpha_3d_kanat_per_deg"] = r_copy["CL_alpha_3d_per_deg"]
         r_copy["alpha_L0_deg"] = f"{float(vlm[alpha_l0_key]):.4f}"
+        if "e_oswald_kanat" in r_copy:
+            r_copy["e_oswald_kanat"] = r_copy["e_oswald"]
         r_copy["CL_max_3d_tahmini"] = f"{float(vlm[cl_max_key]):.6f}"
+        r_copy["alpha_stall_2d_deg"] = f"{float(vlm[alpha_l0_key]) + float(vlm[cl_max_key]) / float(vlm[cl_alpha_key]):.6f}"
+        r_copy["aero_modeli"] = "vlm_tek_egri_v1"
         if flapli_mi:
             if "flap_airfoil" not in r_copy or not str(r_copy.get("flap_airfoil", "")).strip():
                 r_copy["flap_airfoil"] = f"{g_key[0]}_flap"
             if "b_flap_m" not in r_copy or not str(r_copy.get("b_flap_m", "")).strip():
                 r_copy["b_flap_m"] = f"{float(vlm['b_flap_m']):.4f}"
         if "CL" in r_copy and str(r_copy["CL"]).strip() != "":
-            cl_eski = sayi_al(r_copy, "CL", varsayilan=0.0)
-            r_copy["CL"] = f"{cl_eski * float(vlm[cl_orani_key]):.6f}"
+            r_copy["CL"] = f"{_yeni_cl(sayi_al(r_copy, 'alpha_deg'), vlm, _egri_anahtari(row, g_key)):.6f}"
+        for alan in ("CL_flapsiz_kisim", "CL_flapli_kisim", "CL_kanat"):
+            r_copy.pop(alan, None)
         yeni_llt.append(r_copy)
+
+    # Drag polarları aynı LLT eğrisinden, ilgili Reynolds düğümleri arasında hesaplanır.
+    egri_indeksi: Dict[Tuple[str, float, float, float], Dict[float, Dict[float, float]]] = {}
+    for row in yeni_llt:
+        if str(row.get("CL", "")).strip():
+            curve = egri_indeksi.setdefault(_geometri_anahtari(row), {}).setdefault(float(row["Re_aday"]), {})
+            alpha = float(row["alpha_deg"])
+            cl = float(row["CL"])
+            if alpha in curve and not math.isclose(curve[alpha], cl, abs_tol=2e-6):
+                raise ValueError("Aynı geometri/Re/alpha için çelişen VLM CL eğrileri.")
+            curve[alpha] = cl
+
+    def _polar_cl(row: Dict[str, Any], g_key: Tuple[str, float, float, float]) -> float:
+        nodes = egri_indeksi.get(g_key)
+        if not nodes:
+            raise ValueError(f"Drag polar için VLM LLT eğrisi yok: {g_key}")
+        re = sayi_al(row, "Re_aday")
+        alpha = sayi_al(row, "alpha_deg")
+        def at(re_node: float) -> float:
+            curve = nodes[re_node]
+            angles = sorted(curve)
+            if not angles[0] <= alpha <= angles[-1]:
+                raise ValueError(f"Drag polar alpha aralık dışında: {alpha}")
+            return float(np.interp(alpha, angles, [curve[a] for a in angles]))
+        reynolds = sorted(nodes)
+        if not reynolds[0] <= re <= reynolds[-1]:
+            raise ValueError(f"Drag polar Re, LLT eğri aralığı dışında: {re}")
+        if re == reynolds[0] or re == reynolds[-1]:
+            return at(re)
+        upper = next(i for i, value in enumerate(reynolds) if value >= re)
+        lo, hi = reynolds[upper - 1], reynolds[upper]
+        return at(lo) + (at(hi) - at(lo)) * (re - lo) / (hi - lo)
 
     yeni_drag_polar: List[Dict[str, Any]] = []
     for row in drag_polar_satirlar:
@@ -1182,15 +1221,16 @@ def _tek_mod_tablolari_guncelle(
         if ar_w <= 0.0:
             ar_w = 6.0
         cd0 = sayi_al(r_copy, "CD_0", "CD0_toplam", varsayilan=0.025)
-        cl_eski = sayi_al(r_copy, "CL", varsayilan=0.0)
-        cl_yeni = cl_eski * float(vlm[cl_orani_key])
+        cl_yeni = _polar_cl(r_copy, g_key)
         cdi_yeni = (cl_yeni ** 2) / max(math.pi * ar_w * float(vlm[e_key]), 1e-6)
         cd_yeni = cd0 + cdi_yeni
         ld_yeni = cl_yeni / max(cd_yeni, 1e-6)
 
         r_copy["e_oswald"] = f"{float(vlm[e_key]):.6f}"
         r_copy["CL_alpha_3d_per_deg"] = f"{float(vlm[cl_alpha_key]):.6f}"
+        r_copy["alpha_L0_deg"] = f"{float(vlm[alpha_l0_key]):.4f}"
         r_copy["CL_max_3d_tahmini"] = f"{float(vlm[cl_max_key]):.6f}"
+        r_copy["aero_modeli"] = "vlm_tek_egri_v1"
         if "CL" in r_copy:
             r_copy["CL"] = f"{cl_yeni:.6f}"
         if "CD_i" in r_copy:
@@ -1215,14 +1255,19 @@ def _tek_mod_tablolari_guncelle(
         if ar_w <= 0.0:
             ar_w = 6.0
         cd0 = sayi_al(r_copy, "CD_0_seyir", "CD0_toplam", "CD_0", varsayilan=0.025)
-        cl_seyir = sayi_al(r_copy, "CL_seyir", varsayilan=0.55) * float(vlm[cl_orani_key])
+        # CL_seyir görev yükünden gelen hedef taşıma katsayısıdır; eğim oranıyla değişmez.
+        cl_seyir = sayi_al(r_copy, "CL_seyir", varsayilan=0.55)
+        if cl_seyir > float(vlm[cl_max_key]) + 1e-6:
+            raise ValueError(f"Seyir hedef CL, VLM CLmax sınırını aşıyor: {g_key}")
         cdi_seyir = (cl_seyir ** 2) / max(math.pi * ar_w * float(vlm[e_key]), 1e-6)
         cd_seyir = cd0 + cdi_seyir
         ld_seyir = cl_seyir / max(cd_seyir, 1e-6)
 
         r_copy["e_oswald"] = f"{float(vlm[e_key]):.6f}"
         r_copy["CL_alpha_3d_per_deg"] = f"{float(vlm[cl_alpha_key]):.6f}"
+        r_copy["alpha_L0_deg"] = f"{float(vlm[alpha_l0_key]):.4f}"
         r_copy["CL_max_3d_tahmini"] = f"{float(vlm[cl_max_key]):.6f}"
+        r_copy["aero_modeli"] = "vlm_tek_egri_v1"
         if "CL_seyir" in r_copy:
             r_copy["CL_seyir"] = f"{cl_seyir:.6f}"
         if "CD_i_seyir" in r_copy:
@@ -1259,14 +1304,22 @@ def _flapsizdan_flapli_llt_olustur(
         r_copy["flap_aciklik_orani"] = f"{float(vlm['flap_aciklik_orani']):.4f}"
         r_copy["e_oswald"] = f"{float(vlm['e_oswald_flapli']):.6f}"
         r_copy["CL_alpha_3d_per_deg"] = f"{float(vlm['CL_alpha_3d_flapli_per_deg']):.6f}"
+        if "CL_alpha_3d_kanat_per_deg" in r_copy:
+            r_copy["CL_alpha_3d_kanat_per_deg"] = r_copy["CL_alpha_3d_per_deg"]
         r_copy["alpha_L0_deg"] = f"{float(vlm['alpha_L0_flapli_deg']):.4f}"
+        if "e_oswald_kanat" in r_copy:
+            r_copy["e_oswald_kanat"] = r_copy["e_oswald"]
         r_copy["CL_max_3d_tahmini"] = f"{float(vlm['CL_max_3d_flapli_tahmini']):.6f}"
+        r_copy["alpha_stall_2d_deg"] = f"{float(vlm['alpha_L0_flapli_deg']) + float(vlm['CL_max_3d_flapli_tahmini']) / float(vlm['CL_alpha_3d_flapli_per_deg']):.6f}"
+        r_copy["aero_modeli"] = "vlm_tek_egri_v1"
         if "CL" in r_copy and str(r_copy["CL"]).strip() != "":
             alpha_deg = sayi_al(r_copy, "alpha_deg", varsayilan=0.0)
-            cl_yeni = float(vlm["CL_alpha_3d_flapli_per_deg"]) * (
+            cl_yeni = min(float(vlm["CL_max_3d_flapli_tahmini"]), float(vlm["CL_alpha_3d_flapli_per_deg"]) * (
                 alpha_deg - float(vlm["alpha_L0_flapli_deg"])
-            )
+            ))
             r_copy["CL"] = f"{cl_yeni:.6f}"
+        for alan in ("CL_flapsiz_kisim", "CL_flapli_kisim", "CL_kanat"):
+            r_copy.pop(alan, None)
         uretilen.append(r_copy)
     return uretilen
 
@@ -1326,7 +1379,7 @@ def llt_ve_drag_tablolarini_vlm_ile_guncelle(
     kaynak_ozet_flapli = drag_ozet_flapli_satirlar if drag_ozet_flapli_satirlar else drag_ozet_satirlar
 
     _, yeni_polar_flapli, yeni_ozet_flapli = _tek_mod_tablolari_guncelle(
-        llt_satirlar=[],
+        llt_satirlar=llt_flapli_satirlar or yeni_llt_flapli,
         drag_polar_satirlar=kaynak_polar_flapli,
         drag_ozet_satirlar=kaynak_ozet_flapli,
         vlm_haritasi=vlm_haritasi,
@@ -2153,11 +2206,11 @@ def argumanlari_coz(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(  # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı]
         "--egri-yontemi",
         dest="egri_yontemi",
-        choices=("otomatik", "kaydir", "dogrusal", "olcekle"),
+        choices=("otomatik", "kaydir", "dogrusal"),
         default="otomatik",
         help="[DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] LLT CL eğrisinin VLM ile güncellenmesi: kaydir = VLM α0'ına kaydır + "
-             "VLM eğimine ölçekle (LLT stall şekli korunur); dogrusal = CLα·(α−α0), CL_max'ta sınırlı; olcekle = eski yöntem (yalnız eğim, "
-             "LLT α0'ı eğride kalır); otomatik = VSPAERO'da flapsız kaydir + flaplı dogrusal, diğer çözücülerde olcekle.",
+             "VLM eğimine uyan LLT kıvrımı; dogrusal = CLα·(α−α0), CL_max'ta sınırlı; "
+             "otomatik = VSPAERO'da flapsız kaydir + flaplı dogrusal, diğer çözücülerde dogrusal.",
     )
     parser.add_argument(
         "--analitik-olcekleme",

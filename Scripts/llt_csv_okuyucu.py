@@ -68,6 +68,8 @@ class LLTTable:
         self.source, self.flapped, self.errors = str(source), flapped, []
         groups = {}
         for row in rows:
+            if Path(self.source).name.startswith('vlm_') and row.get('aero_modeli') != 'vlm_tek_egri_v1':
+                raise LLTError('Eski VLM LLT tablosu: tek egri modeliyle yeniden uretin.')
             key = (profile(row),) + tuple(round(num(row,k),9) for k in GEOMETRY)
             if not key[0]: raise LLTError('LLT CSV: profil adi eksik.')
             if flapped:
@@ -95,6 +97,25 @@ class LLTTable:
                 if not same_value(value,node['values'][k]):
                     raise LLTError(f'Ayni geometri/Re icin celisen {k}')
             angle,cl=num(row,'alpha_deg'),num(row,'CL')
+            if cl > v['CL_max_3d_tahmini'] + 2e-5:
+                raise LLTError('LLT CSV: CL, ayni satirin CLmax degerini asiyor.')
+            if row.get('aero_modeli') == 'vlm_tek_egri_v1':
+                if any(row.get(k) not in (None, '') for k in ('CL_flapsiz_kisim','CL_flapli_kisim','CL_kanat')):
+                    raise LLTError('LLT CSV: VLM modelinde eski flap bileseni CL alanlari bulunamaz.')
+                for k, ana in (('CL_alpha_3d_kanat_per_deg','CL_alpha_3d_per_deg'),
+                               ('e_oswald_kanat','e_oswald')):
+                    if row.get(k) not in (None, '') and not math.isclose(num(row,k),v[ana],abs_tol=2e-6):
+                        raise LLTError(f'LLT CSV: {k} ana kanat modeliyle uyusmuyor.')
+                expected_stall = v['alpha_L0_deg'] + v['CL_max_3d_tahmini'] / v['CL_alpha_3d_per_deg']
+                if not math.isclose(v['alpha_stall_2d_deg'], expected_stall, abs_tol=2e-3):
+                    raise LLTError('LLT CSV: stall acisi, egim/alpha_L0/CLmax ile uyusmuyor.')
+                if angle <= min(2.0, expected_stall) and angle >= -2.0:
+                    expected_cl = min(v['CL_alpha_3d_per_deg'] * (angle - v['alpha_L0_deg']),
+                                      v['CL_max_3d_tahmini'])
+                    if not math.isclose(cl, expected_cl, abs_tol=2e-4):
+                        raise LLTError('LLT CSV: CL egrisi dogrusal bolgede egim/alpha_L0 ile uyusmuyor.')
+                if angle >= expected_stall and not math.isclose(cl, v['CL_max_3d_tahmini'], abs_tol=2e-4):
+                    raise LLTError('LLT CSV: stall sonrasi CL, CLmax ile uyusmuyor.')
             if angle in node['curve'] and not math.isclose(cl,node['curve'][angle],rel_tol=1e-9,abs_tol=1e-10):
                 raise LLTError('Ayni geometri/Re/alpha icin celisen CL.')
             node['curve'][angle]=cl
@@ -105,6 +126,11 @@ class LLTTable:
             group['ht_nodes']={}
             for node in group['nodes'].values():
                 if len(node['curve'])<2: raise LLTError('En az iki alpha noktasi gerekli.')
+                if node['row'].get('aero_modeli') == 'vlm_tek_egri_v1':
+                    stall = node['values']['alpha_stall_2d_deg']
+                    points = sorted((a, c) for a, c in node['curve'].items() if a <= stall)
+                    if any(c2 < c1 - 2e-5 for (_, c1), (_, c2) in zip(points, points[1:])):
+                        raise LLTError('LLT CSV: VLM CL egrisi stall oncesi azaliyor.')
                 if node['unavailable']:
                     self.errors.append({
                         'profil':profile(node['row']),
@@ -233,3 +259,8 @@ def _bounds(values, target, allow_lower=False):
 def _at(curve, alpha):
     lo,hi,f,_=_bounds(curve,alpha)
     return curve[lo]+f*(curve[hi]-curve[lo])
+
+
+def cl_at_alpha(curve, alpha):
+    """Tüm fazlar için aynı LLT CL eğrisinde doğrusal ara değerleme."""
+    return _at(curve, alpha)
