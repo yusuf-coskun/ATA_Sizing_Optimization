@@ -29,6 +29,7 @@ try:
         GERILIM_V,
         csv_oku as _ap_csv_oku,
         csv_yaz as _ap_csv_yaz,
+        faz_sonuclarini_dogrula,
         kimlik_alanlari,
         performans_adaylarini_hazirla,
         temel_kimlik,
@@ -37,6 +38,7 @@ except ImportError:
     GERILIM_V = 22.5
     _ap_csv_oku = None
     _ap_csv_yaz = None
+    faz_sonuclarini_dogrula = None
     kimlik_alanlari = None
     performans_adaylarini_hazirla = None
     temel_kimlik = None
@@ -266,18 +268,30 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
             "Aşağıdaki performans çıktı dosyaları bulunamadı:\n  - " + "\n  - ".join(eksik_dosyalar)
         )
 
-    seyir_satirlari = kimlikleri_hazirla(csv_oku(seyir_yolu))
-    indeks_olustur(seyir_satirlari, kaynak=seyir_yolu)
-    kalkis_indeks = indeks_olustur(csv_oku(kalkis_yolu), kaynak=kalkis_yolu)
-    tirmanis_indeks = indeks_olustur(csv_oku(tirmanis_yolu), kaynak=tirmanis_yolu)
-    yuk_indeks = indeks_olustur(csv_oku(yuk_birakma_yolu), kaynak=yuk_birakma_yolu)
-    inis_indeks = indeks_olustur(csv_oku(inis_yolu), kaynak=inis_yolu)
-
-    # İsteğe bağlı temel kütle tablosu (ek geometri sütunları için)
-    kutle_indeks = None
     kutle_yolu = dosya_yolu_coz(args.kutle)
-    if kutle_yolu.is_file():
-        kutle_indeks = indeks_olustur(csv_oku(kutle_yolu), kaynak=kutle_yolu)
+    if not kutle_yolu.is_file():
+        raise FileNotFoundError(f"Güncel kütle tablosu bulunamadı: {kutle_yolu}")
+    if performans_adaylarini_hazirla is None or faz_sonuclarini_dogrula is None:
+        raise RuntimeError("Aday kimliği doğrulama modülü yüklenemedi.")
+    kutle_satirlari = performans_adaylarini_hazirla(csv_oku(kutle_yolu))
+    kutle_indeks = indeks_olustur(kutle_satirlari, kaynak=kutle_yolu)
+
+    faz_girdileri = {
+        "seyir": (seyir_yolu, csv_oku(seyir_yolu)),
+        "kalkis": (kalkis_yolu, csv_oku(kalkis_yolu)),
+        "tirmanis": (tirmanis_yolu, csv_oku(tirmanis_yolu)),
+        "yuk": (yuk_birakma_yolu, csv_oku(yuk_birakma_yolu)),
+        "inis": (inis_yolu, csv_oku(inis_yolu)),
+    }
+    for yol, satirlar in faz_girdileri.values():
+        faz_sonuclarini_dogrula(kutle_satirlari, satirlar, yol)
+
+    seyir_satirlari = kimlikleri_hazirla(faz_girdileri["seyir"][1])
+    indeks_olustur(seyir_satirlari, kaynak=seyir_yolu)
+    kalkis_indeks = indeks_olustur(faz_girdileri["kalkis"][1], kaynak=kalkis_yolu)
+    tirmanis_indeks = indeks_olustur(faz_girdileri["tirmanis"][1], kaynak=tirmanis_yolu)
+    yuk_indeks = indeks_olustur(faz_girdileri["yuk"][1], kaynak=yuk_birakma_yolu)
+    inis_indeks = indeks_olustur(faz_girdileri["inis"][1], kaynak=inis_yolu)
 
     birlestirilmis: List[Dict[str, Any]] = []
 

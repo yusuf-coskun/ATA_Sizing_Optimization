@@ -139,6 +139,25 @@ def faz_anahtari(row):
     return config
 
 
+def faz_sonuclarini_dogrula(kutle_satirlari, faz_satirlari, kaynak):
+    """Faz sonuçlarının güncel kütle tablosundaki konfigürasyonlara ait olduğunu doğrula.
+
+    Bir faz yalnızca adayların bir bölümünü içerebilir. Ancak mevcut olmayan
+    kimlikler eski kütle/model sonuçlarını gösterir ve kullanılamaz.
+    """
+    guncel = {faz_anahtari(row) for row in kutle_satirlari}
+    for no, row in enumerate(faz_satirlari, start=2):
+        try:
+            kimlik = faz_anahtari(row)
+        except ValueError as hata:
+            raise ValueError(f"{kaynak}, satır {no}: {hata}") from hata
+        if kimlik not in guncel:
+            raise ValueError(
+                f"{kaynak}, satır {no}: {kimlik} güncel kütle tablosunda yok. "
+                "Kütle değişmiş olabilir; bu fazın sonuçlarını yeniden üretin."
+            )
+
+
 def elektrik_gucu(row, voltage, mode="auto"):
     """guc_w/power_w watt; akim_a amper. Watt degeri gerilimle carpilmaz."""
     if not math.isfinite(voltage) or voltage <= 0:

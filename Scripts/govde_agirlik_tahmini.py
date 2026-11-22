@@ -21,6 +21,8 @@ from math import floor, isfinite, pi
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+from aday_pervane import kimlik_ekle, temel_kimlik
+
 DIS_KABUK_GSM = 395.9  # Kürlenmiş karbon/cam/karbon: 176.7 + 42.5 + 176.7.
 ISKELET_GSM = 802.8
 ISKELET_ARALIGI_M = 0.15
@@ -189,7 +191,15 @@ def kutle_csv_guncelle(kaynak, hedef=None):
         eksik = gerekli - set(alanlar)
         if eksik:
             raise ValueError("CSV sütunları eksik: " + ", ".join(sorted(eksik)))
+        kimlik_sutunları = {"temel_aday_id","konfigurasyon_id"}
+        bulunan_kimlikler = kimlik_sutunları & set(alanlar)
+        if bulunan_kimlikler and bulunan_kimlikler != kimlik_sutunları:
+            raise ValueError("CSV kimlikleri sütunları eksik ikisi birlikte bulunmalı")
+        kimlikli = bool(bulunan_kimlikler)
+        if kimlikli and "pervane" not in alanlar:
+            raise ValueError("kimlikli csv'de pervane sütunu gerekli")
         satirlar = list(okuyucu)
+
     if not satirlar:
         raise ValueError("CSV içinde güncellenecek aday yok.")
 
@@ -198,6 +208,13 @@ def kutle_csv_guncelle(kaynak, hedef=None):
     for no, satir in enumerate(satirlar, start=2):
         if None in satir or any(v is None for v in satir.values()):
             raise ValueError(f"CSV satır {no}: sütun sayısı başlıkla uyuşmuyor.")
+        if kimlikli:
+            if not all(satir[ad].strip() for ad in (*kimlik_sutunları,"pervane")):
+                raise ValueError(f"CSV satir {no} : kimlik veya pervane boş")
+            try:
+                kimlik_ekle(satir,satir["pervane"])
+            except ValueError as hata:
+                raise ValueError(f"CSV satır {no} : {hata}") from hata
 
         def sayi(ad):
             return _sayi(satir[ad], f"CSV satır {no}, {ad}", sifir_olabilir=True)
@@ -220,6 +237,11 @@ def kutle_csv_guncelle(kaynak, hedef=None):
         })
         for ad in toplam_alanlar:
             _sayi(satir[ad], f"CSV satır {no}, {ad}", sifir_olabilir=True)
+        if kimlikli:
+            yeni_id = temel_kimlik(satir)
+            satir["temel_aday_id"] = yeni_id
+            satir["konfigurasyon_id"] = f"{yeni_id}__{satir['pervane'].strip()}"
+
 
     # Hata halinde mevcut dosyanın kısmen yazılmış durumda kalmasını önler.
     gecici = None
@@ -253,6 +275,8 @@ def main():
             parser.error(str(hata))
         print(f"{adet} satır güncellendi: {hedef.resolve()}")
         print(f"Pervane: {PERVANE_G:g} g | Motor: {MOTOR_G:g} g")
+        print("Kütle değiştiyse eski performans CSV'lerini yeniden üretin; "
+              "seyir ve sıralama eski kimlikli sonuçları reddeder.")
         return
     if not args.geometri.is_file():
         parser.error(f"Geometri dosyası bulunamadı: {args.geometri}. İki dosyayı aynı klasöre koyun.")

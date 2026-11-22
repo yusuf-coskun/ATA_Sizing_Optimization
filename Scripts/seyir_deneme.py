@@ -47,7 +47,8 @@ from pathlib import Path
 import re
 import numpy as np
 import pandas as pd
-from aday_pervane import GERILIM_V, faz_anahtari, kimlik_alanlari, performans_adaylarini_hazirla
+from aday_pervane import (GERILIM_V, faz_anahtari, faz_sonuclarini_dogrula,
+                         kimlik_alanlari, performans_adaylarini_hazirla)
 from tirmanis_hesabi import prop_at_speed
 from llt_csv_okuyucu import LLTTable
 
@@ -136,7 +137,7 @@ def load_all_databases(llt_csv_path=None):
     return itki_df, vsp_df, llt_df, kutle_df
 
 
-def load_takeoff_and_climb_tables():
+def load_takeoff_and_climb_tables(kutle_satirlari):
     """Sonuclari satir sirasina degil, aday + pervane kimligine gore eslestir."""
     maps = []
     for filename in ("kalkis_sonuclari.csv", "tirmanis_sonuclari.csv"):
@@ -146,6 +147,7 @@ def load_takeoff_and_climb_tables():
             maps.append(table)
             continue
         rows = pd.read_csv(path, comment="#", encoding="utf-8-sig")
+        faz_sonuclarini_dogrula(kutle_satirlari, rows.to_dict("records"), path)
         for _, row in rows.iterrows():
             key = faz_anahtari(row)
             if key in table:
@@ -798,7 +800,7 @@ def run_full_cruise_mission_optimization(tail_csv_path=None, llt_csv_path=None, 
     kutle_df = pd.DataFrame(performans_adaylarini_hazirla(kutle_df.to_dict("records")))
     llt_lookup.source = str(Path(llt_csv_path or find_csv_file("llt_flapsiz_coklu_re.csv")).resolve())
     tail_lookup = load_tail_lookup(tail_csv_path) if tail_csv_path else llt_lookup
-    kalkis_map, tirmanis_map = load_takeoff_and_climb_tables()
+    kalkis_map, tirmanis_map = load_takeoff_and_climb_tables(kutle_df.to_dict("records"))
 
     for label, table in (("LLT", llt_lookup), ("OpenVSP", vsp_lookup)):
         for error in table.errors:
