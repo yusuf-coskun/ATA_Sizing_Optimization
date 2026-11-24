@@ -65,6 +65,10 @@ from aday_siralama import (
 # Eski elle yazılan .vspaero akışının yerine geçti; ayrıntılar vspaero_cozucu.py başında.
 from vspaero_cozucu import vspaero_api_coz, vspaero_hazir_mi
 from vspaero_cozucu import vspaero_api_coz_richardson  # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
+from lifting_line_cozucu import (
+    POLAR_KLASORU, FLAP_POLAR_KLASORU, polar_klasorunu_indeksle,
+    profil_re_haritasi_al,
+)
 
 # [DEĞİŞİKLİK 2026-11-18 | Görev A] VSPAERO davranış ayarları (main() içinde komut satırından doldurulur).
 # VSPAERO_ZORUNLU=True -> VSPAERO hata verirse program DURUR (NumPy'a geçmez).
@@ -777,6 +781,84 @@ def _geometri_anahtari(row: Dict[str, Any]) -> Tuple[str, float, float, float]:
     return (profil, b_w, s_w, c_w)
 
 
+def _tasarim_geometrisini_dogrula(
+    adaylar: List[Dict[str, Any]],
+    kutleler: List[Dict[str, Any]],
+    llt_flapsiz: List[Dict[str, Any]],
+    llt_flapli: List[Dict[str, Any]],
+) -> None:
+    """Aynı kanat anahtarının farklı kuyruk/gövde tasarımlarını gizlemesini önle."""
+    sayisal_alanlar = {
+        "govde_D_m": ("govde_D_m",),
+        "govde_L_m": ("govde_L_toplam_m", "govde_L_m", "govde_uzunlugu_m", "L_govde_m"),
+        "govde_S_toplam_m2": ("govde_S_toplam_m2",),
+        "govde_V_su_m3": ("govde_V_su_m3",),
+        "tail_arm_m": ("tail_arm_m",),
+        "S_HT_m2": ("S_HT_m2",),
+        "b_HT_m": ("b_HT_m",),
+        "c_HT_m": ("c_root_HT_m", "c_HT_m"),
+        "S_VT_m2": ("S_VT_m2",),
+        "h_VT_m": ("h_VT_m",),
+        "c_VT_m": ("c_root_VT_m", "c_VT_m"),
+        "b_flap_m": ("b_flap_m",),
+    }
+    metin_alanlar = ("kuyruk_airfoil", "flap_airfoil")
+
+    def imza(row: Dict[str, Any]) -> Dict[str, Any]:
+        sonuc: Dict[str, Any] = {}
+        for ad, takma_adlar in sayisal_alanlar.items():
+            deger = next((row[k] for k in takma_adlar
+                          if k in row and row[k] is not None and str(row[k]).strip()), None)
+            if deger is not None:
+                sayi = float(deger)
+                if not math.isfinite(sayi):
+                    raise ValueError(f"Geometri alanı sonlu değil: {ad}")
+                sonuc[ad] = sayi
+        for ad in metin_alanlar:
+            if row.get(ad) is not None and str(row[ad]).strip():
+                sonuc[ad] = Path(str(row[ad])).stem.strip().lower()
+        return sonuc
+
+    indeksler: Dict[str, Dict[Tuple[str, float, float, float], Tuple[int, Dict[str, Any]]]] = {}
+    for kaynak, satirlar in (("VLM adayları", adaylar), ("kütle tablosu", kutleler),
+                             ("flapsız LLT", llt_flapsiz), ("flaplı LLT", llt_flapli)):
+        indeks: Dict[Tuple[str, float, float, float], Tuple[int, Dict[str, Any]]] = {}
+        for no, row in enumerate(satirlar, start=2):
+            key = _geometri_anahtari(row)
+            if not key[0] or key[1] <= 0:
+                continue
+            degerler = imza(row)
+            if key in indeks:
+                ilk_no, ilk = indeks[key]
+                for ad in ilk.keys() | degerler.keys():
+                    a, b = ilk.get(ad), degerler.get(ad)
+                    es = (math.isclose(a, b, rel_tol=1e-7, abs_tol=1e-8)
+                          if isinstance(a, float) and isinstance(b, float) else a == b)
+                    if not es:
+                        raise ValueError(
+                            f"{kaynak}: aynı kanat geometrisinde farklı {ad} "
+                            f"(satır {ilk_no}: {a!r}, satır {no}: {b!r}); "
+                            "adayları ayrı geometri olarak tanımlayın."
+                        )
+            else:
+                indeks[key] = no, degerler
+        indeksler[kaynak] = indeks
+
+    # Kaynaklar farklı sütun kümeleri taşıyabilir; ortak fiziksel ölçüler eşleşmeli.
+    for sol, sag in (("VLM adayları", "kütle tablosu"),
+                     ("kütle tablosu", "flapsız LLT"),
+                     ("kütle tablosu", "flaplı LLT")):
+        for key in indeksler[sol].keys() & indeksler[sag].keys():
+            a = indeksler[sol][key][1]
+            b = indeksler[sag][key][1]
+            for ad in a.keys() & b.keys():
+                x, y = a[ad], b[ad]
+                es = (math.isclose(x, y, rel_tol=1e-7, abs_tol=1e-8)
+                      if isinstance(x, float) and isinstance(y, float) else x == y)
+                if not es:
+                    raise ValueError(f"{sol} ve {sag}: {key} için {ad} çelişiyor ({x!r}, {y!r}).")
+
+
 def _vlm_eslesmesi_bul(
     vlm_haritasi: Dict[Tuple[str, float, float, float], Dict[str, Any]],
     g_key: Tuple[str, float, float, float],
@@ -792,6 +874,35 @@ def _vlm_eslesmesi_bul(
     return None
 
 
+def _re_dugumu(row: Dict[str, Any]) -> int:
+    re = sayi_al(row, "Re_aday", varsayilan=0.0)
+    if not math.isfinite(re) or re <= 0 or abs(re - round(re)) > 1e-3:
+        raise ValueError(f"Geçersiz LLT Reynolds düğümü: {re}")
+    return round(re)
+
+
+def _re_vlm_sonucu(vlm: Dict[str, Any], re: float, flapli_mi: bool) -> Dict[str, Any]:
+    """LLT düğümünde tam eşleşme, drag tablosunda doğrusal Re ara değeri."""
+    alan = "re_flapli" if flapli_mi else "re_flapsiz"
+    dugumler = vlm.get(alan)
+    if not dugumler:
+        return vlm  # Eski harita biçimiyle geriye dönük uyumluluk.
+    re = float(re)
+    if re in dugumler:
+        return dugumler[re]
+    sayilar = sorted(dugumler)
+    if not sayilar[0] <= re <= sayilar[-1]:
+        raise ValueError(f"VLM {alan} Reynolds aralığı dışında: {re}")
+    ust = next(r for r in sayilar if r >= re)
+    alt = sayilar[sayilar.index(ust) - 1]
+    oran = (re - alt) / (ust - alt)
+    sonuc = dict(dugumler[alt])
+    for k, v in dugumler[ust].items():
+        if k in sonuc and isinstance(v, (float, int)) and not isinstance(v, bool) and isinstance(sonuc[k], (float, int)):
+            sonuc[k] = float(sonuc[k]) + oran * (float(v) - float(sonuc[k]))
+    return sonuc
+
+
 def ilk_500_aday_vlm_analizi(
     vlm_aday_satirlari: List[Dict[str, Any]],
     llt_flapsiz_satirlar: List[Dict[str, Any]],
@@ -799,244 +910,151 @@ def ilk_500_aday_vlm_analizi(
     cozucu_tercihi: str = "auto",
     n_span: int = 24,
     n_chord: int = 4,
-    kutle_satirlari: Optional[List[Dict[str, Any]]] = None,  # [DEĞİŞİKLİK 2026-11-18 | Görev A] VSPAERO kuyruk/profil bilgisi için
-    geometri_limiti: int = 0,  # [DEĞİŞİKLİK 2026-11-18 | Görev A] >0 ise sadece ilk N geometri çözülür (hızlı test)
+    kutle_satirlari: Optional[List[Dict[str, Any]]] = None,
+    geometri_limiti: int = 0,
 ) -> Dict[Tuple[str, float, float, float], Dict[str, Any]]:
-    """
-    İlk 500 adaydaki benzersiz kanat-kuyruk geometrileri için hem flapsız 3B VLM
-    hem de kalkış/iniş fazlarında kullanılan flaplı 3B VLM analizini çalıştırır.
-    """
+    """Her geometri ve LLT Reynolds düğümü için ilgili 2B polarıyla VLM çöz."""
+    _tasarim_geometrisini_dogrula(
+        vlm_aday_satirlari, kutle_satirlari or [],
+        llt_flapsiz_satirlar, llt_flapli_satirlar or [],
+    )
     motor = kullanilabilir_vlm_motoru_sec(cozucu_tercihi)
     print(f"[VLM] Seçilen 3B VLM çözücü motoru: {motor}")
-
-    llt_flapsiz_indeks: Dict[Tuple[str, float, float, float], Dict[str, Any]] = {}
-    for r in llt_flapsiz_satirlar:
-        k = _geometri_anahtari(r)
-        if k[0] and k not in llt_flapsiz_indeks:
-            llt_flapsiz_indeks[k] = r
-
-    llt_flapli_indeks: Dict[Tuple[str, float, float, float], Dict[str, Any]] = {}
-    for r in (llt_flapli_satirlar or []):
-        k = _geometri_anahtari(r)
-        if k[0] and k not in llt_flapli_indeks:
-            llt_flapli_indeks[k] = r
-
-    vlm_sonuc_haritasi: Dict[Tuple[str, float, float, float], Dict[str, Any]] = {}
-
-    # [DEĞİŞİKLİK 2026-11-18 | Görev A] Kütle tablosundan (kanat_kuyruk_govde_kutleli.csv) gerçek kuyruk kolu,
-    # kuyruk profili ve yatay kuyruk ölçüleri alınır. Sadece VSPAERO kullanır;
-    # NumPy/AeroSandbox çözücülerinin girdileri DEĞİŞMEDİ (test tabanı bozulmasın diye).
-    kutle_geo_indeks: Dict[Tuple[str, float, float, float], Dict[str, Any]] = {}
-    for kr in (kutle_satirlari or []):
-        kk = _geometri_anahtari(kr)
-        if kk[0] and kk not in kutle_geo_indeks:
-            kutle_geo_indeks[kk] = kr
-
+    temiz_polarlar = polar_klasorunu_indeksle(POLAR_KLASORU)
+    flap_polarlar = polar_klasorunu_indeksle(FLAP_POLAR_KLASORU)
+    temiz_llt: Dict[Tuple[str, float, float, float], Dict[int, Dict[str, Any]]] = {}
+    flap_llt: Dict[Tuple[str, float, float, float], Dict[int, Dict[str, Any]]] = {}
+    for satirlar, indeks in ((llt_flapsiz_satirlar, temiz_llt), (llt_flapli_satirlar or [], flap_llt)):
+        for row in satirlar:
+            key = _geometri_anahtari(row)
+            if key[0] and key[1] > 0:
+                indeks.setdefault(key, {}).setdefault(_re_dugumu(row), row)
+    kutle_indeks = {}
+    for row in kutle_satirlari or []:
+        kutle_indeks.setdefault(_geometri_anahtari(row), row)
+    sonuc = {}
     for row in vlm_aday_satirlari:
-        g_key = _geometri_anahtari(row)
-        if not g_key[0] or g_key[1] <= 0.0 or g_key in vlm_sonuc_haritasi:
+        key = _geometri_anahtari(row)
+        if not key[0] or key[1] <= 0 or key in sonuc:
             continue
-        if geometri_limiti > 0 and len(vlm_sonuc_haritasi) >= geometri_limiti:  # [DEĞİŞİKLİK 2026-11-18 | Görev A]
+        if geometri_limiti > 0 and len(sonuc) >= geometri_limiti:
             break
-
-        profil, b_w, s_w, c_w = g_key
-        if c_w <= 0.0:
-            c_w = round(s_w / max(b_w, 1e-6), 4)
-
-        llt_ref = llt_flapsiz_indeks.get(g_key, row)
-        llt_flap_ref = llt_flapli_indeks.get(g_key, {})
-
-        s_ht = sayi_al(
-            row,
-            "S_HT_m2",
-            varsayilan=sayi_al(llt_ref, "S_HT_m2", varsayilan=0.0),
-        )
-        c_ht = sayi_al(
-            row,
-            "c_HT_m",
-            "c_root_HT_m",
-            varsayilan=sayi_al(llt_ref, "c_HT_m", "c_root_HT_m", varsayilan=0.0),
-        )
-        b_ht = (s_ht / c_ht) if (s_ht > 0.0 and c_ht > 0.0) else sayi_al(row, "b_HT_m", varsayilan=0.0)
+        profil, b_w, s_w, c_w = key
+        temiz_dugum = temiz_llt.get(key, {})
+        flap_dugum = flap_llt.get(key) or temiz_dugum
+        if not temiz_dugum:
+            raise ValueError(f"VLM için temiz LLT Reynolds düğümleri eksik: {key}")
+        temiz_polar = profil_re_haritasi_al(temiz_polarlar, profil)
+        flap_profil = metin_al(next(iter(flap_dugum.values())), "flap_airfoil", varsayilan=f"{profil}_flap")
+        flap_polar = profil_re_haritasi_al(flap_polarlar, flap_profil)
+        ilk_llt = temiz_dugum[min(temiz_dugum)]
+        s_ht = sayi_al(row, "S_HT_m2", varsayilan=sayi_al(ilk_llt, "S_HT_m2", varsayilan=0.0))
+        c_ht = sayi_al(row, "c_HT_m", "c_root_HT_m", varsayilan=sayi_al(ilk_llt, "c_HT_m", "c_root_HT_m", varsayilan=0.0))
+        b_ht = s_ht / c_ht if s_ht > 0 and c_ht > 0 else sayi_al(row, "b_HT_m", varsayilan=0.0)
         govde_l = sayi_al(row, "govde_L_m", "govde_uzunlugu_m", "L_govde_m", varsayilan=1.5)
-        if govde_l <= 0.0:
-            govde_l = 1.5
-        tail_arm = 0.55 * govde_l
-
-        # Flapsız LLT referans parametreleri
-        alpha_l0_deg = sayi_al(llt_ref, "alpha_L0_deg", varsayilan=-2.5)
-        cl_alpha_llt = sayi_al(llt_ref, "CL_alpha_3d_per_deg", varsayilan=0.078)
-        if cl_alpha_llt <= 0.0:
-            cl_alpha_llt = 0.078
-        e_llt = sayi_al(
-            llt_ref,
-            "e_oswald",
-            "e_w",
-            varsayilan=sayi_al(row, "e_oswald", varsayilan=0.84),
-        )
-        if e_llt <= 0.0:
-            e_llt = 0.84
-        cl_max_3d_llt = sayi_al(llt_ref, "CL_max_3d_tahmini", varsayilan=1.35)
-        if cl_max_3d_llt <= 0.0:
-            cl_max_3d_llt = 1.35
-        cl_max_2d_tahmin = max(cl_max_3d_llt / 0.92, 0.90)
-
-        # [DEĞİŞİKLİK 2026-11-18 | Görev A] VSPAERO'ya giden ek geometri bilgisi
-        kutle_ref = kutle_geo_indeks.get(g_key, {})
+        tail_arm = 0.55 * (govde_l if govde_l > 0 else 1.5)
+        kutle = kutle_indeks.get(key, {})
         ek_geometri = {
             "profil": profil,
-            "tail_arm": sayi_al(kutle_ref, "tail_arm_m", varsayilan=tail_arm),
-            "b_ht": sayi_al(kutle_ref, "b_HT_m", varsayilan=b_ht),
-            "c_ht": sayi_al(kutle_ref, "c_root_HT_m", "c_HT_m", varsayilan=c_ht),
-            "kuyruk_profil": Path(metin_al(kutle_ref, "kuyruk_airfoil", varsayilan="naca0010")).stem,
-            "govde_D": sayi_al(kutle_ref, "govde_D_m", varsayilan=0.0),           # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
-            "govde_L": sayi_al(kutle_ref, "govde_L_toplam_m", "govde_L_m", varsayilan=0.0),    # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde]
+            "tail_arm": sayi_al(kutle, "tail_arm_m", varsayilan=tail_arm),
+            "b_ht": sayi_al(kutle, "b_HT_m", varsayilan=b_ht),
+            "c_ht": sayi_al(kutle, "c_root_HT_m", "c_HT_m", varsayilan=c_ht),
+            "kuyruk_profil": Path(metin_al(kutle, "kuyruk_airfoil", varsayilan="naca0010")).stem,
+            "govde_D": sayi_al(kutle, "govde_D_m", varsayilan=0.0),
+            "govde_L": sayi_al(kutle, "govde_L_toplam_m", "govde_L_m", varsayilan=0.0),
         }
-
-        # 1) Flapsız 3B VLM Çözümü
-        vlm_flapsiz = _secilen_vlm_cozucu_cagir(
-            motor=motor,
-            b_w=b_w,
-            c_w=c_w,
-            s_w=s_w,
-            b_ht=b_ht,
-            c_ht=c_ht,
-            tail_arm=tail_arm,
-            alpha_l0_2d_deg=alpha_l0_deg,
-            cl_max_2d=cl_max_2d_tahmin,
-            n_span=n_span,
-            n_chord=n_chord,
-            flap_aciklik_orani=0.0,
-            ek_geometri=ek_geometri,  # [DEĞİŞİKLİK 2026-11-18 | Görev A]
-        )
-
-        cl_alpha_vlm = float(vlm_flapsiz["CL_alpha_3d_per_deg"])
-        e_vlm = float(vlm_flapsiz["e_oswald"])
-        cl_max_vlm = float(vlm_flapsiz["CL_max_3d_tahmini"])
-
-        cl_alpha_orani = cl_alpha_vlm / max(cl_alpha_llt, 1e-5)
-        e_orani = e_vlm / max(e_llt, 1e-5)
-        cl_max_orani = cl_max_vlm / max(cl_max_3d_llt, 1e-5)
-
-        # 2) Flaplı 3B VLM Çözümü (Kalkış ve İniş İçin)
-        b_flap = sayi_al(
-            row,
-            "b_flap_m",
-            varsayilan=sayi_al(llt_flap_ref, "b_flap_m", varsayilan=min(1.0, b_w)),
-        )
-        if b_flap <= 0.0:
+        b_flap = sayi_al(row, "b_flap_m", varsayilan=sayi_al(next(iter(flap_dugum.values())), "b_flap_m", varsayilan=min(1.0, b_w)))
+        if b_flap <= 0:
             b_flap = min(1.0, b_w)
-        oran_flap = float(np.clip(b_flap / max(b_w, 1e-6), 0.0, 1.0))
-
-        alpha_l0_flap_llt = sayi_al(
-            llt_flap_ref,
-            "alpha_L0_deg",
-            varsayilan=alpha_l0_deg - 4.5 * oran_flap,
-        )
-        cl_alpha_flap_llt = sayi_al(
-            llt_flap_ref,
-            "CL_alpha_3d_per_deg",
-            varsayilan=cl_alpha_llt,
-        )
-        if cl_alpha_flap_llt <= 0.0:
-            cl_alpha_flap_llt = cl_alpha_llt
-        e_flap_llt = sayi_al(
-            llt_flap_ref,
-            "e_oswald",
-            "e_w",
-            varsayilan=max(e_llt * 0.94, 0.55),
-        )
-        if e_flap_llt <= 0.0:
-            e_flap_llt = max(e_llt * 0.94, 0.55)
-        cl_max_3d_flap_llt = sayi_al(
-            llt_flap_ref,
-            "CL_max_3d_tahmini",
-            varsayilan=cl_max_3d_llt * (1.0 + 0.30 * oran_flap),
-        )
-        if cl_max_3d_flap_llt <= 0.0:
-            cl_max_3d_flap_llt = cl_max_3d_llt * (1.0 + 0.30 * oran_flap)
-
-        if oran_flap > 1e-4:
-            alpha_l0_flap_kesit_2d = (
-                alpha_l0_flap_llt - (1.0 - oran_flap) * alpha_l0_deg
-            ) / oran_flap
-            cl_max_flap_3d_kesit = (
-                cl_max_3d_flap_llt - (1.0 - oran_flap) * cl_max_3d_llt
-            ) / oran_flap
-            cl_max_flap_kesit_2d = max(cl_max_flap_3d_kesit / 0.92, cl_max_2d_tahmin * 1.15)
-        else:
-            alpha_l0_flap_kesit_2d = alpha_l0_deg
-            cl_max_flap_kesit_2d = cl_max_2d_tahmin
-
-        vlm_flapli = _secilen_vlm_cozucu_cagir(
-            motor=motor,
-            b_w=b_w,
-            c_w=c_w,
-            s_w=s_w,
-            b_ht=b_ht,
-            c_ht=c_ht,
-            tail_arm=tail_arm,
-            alpha_l0_2d_deg=alpha_l0_deg,
-            cl_max_2d=cl_max_2d_tahmin,
-            n_span=n_span,
-            n_chord=n_chord,
-            flap_aciklik_orani=oran_flap,
-            alpha_l0_flap_2d_deg=alpha_l0_flap_kesit_2d,
-            cl_max_flap_2d=cl_max_flap_kesit_2d,
-            ek_geometri=ek_geometri,  # [DEĞİŞİKLİK 2026-11-18 | Görev A]
-        )
-
-        cl_alpha_flap_vlm = float(vlm_flapli["CL_alpha_3d_per_deg"])
-        e_flap_vlm = float(vlm_flapli["e_oswald"])
-        cl_max_flap_vlm = float(vlm_flapli["CL_max_3d_tahmini"])
-        alpha_l0_flap_vlm = float(vlm_flapli["alpha_L0_deg"])
-        # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] Flap verimi düzeltmesi (yalnız VSPAERO sonucuna):
-        # sürtünmesiz çözücü 30° flabın α0 kaymasını abartır (≈ −11.6° yerine XFOIL'e göre ≈ −6°).
-        alpha_l0_flap_ham = alpha_l0_flap_vlm
-        flap_verimi_uygulanan = 1.0
-        if str(vlm_flapli.get("cozucu", "")).startswith("vspaero") and oran_flap > 1e-4:
-            _a0_temiz = float(vlm_flapsiz["alpha_L0_deg"])
-            flap_verimi_uygulanan = float(FLAP_VERIMI)
-            alpha_l0_flap_vlm = _a0_temiz + flap_verimi_uygulanan * (alpha_l0_flap_ham - _a0_temiz)
-
-        cl_alpha_flap_orani = cl_alpha_flap_vlm / max(cl_alpha_flap_llt, 1e-5)
-        e_flap_orani = e_flap_vlm / max(e_flap_llt, 1e-5)
-        cl_max_flap_orani = cl_max_flap_vlm / max(cl_max_3d_flap_llt, 1e-5)
-
-        vlm_sonuc_haritasi[g_key] = {
-            **vlm_flapsiz,
-            "CL_alpha_llt": round(cl_alpha_llt, 6),
-            "e_oswald_llt": round(e_llt, 5),
-            "CL_max_3d_llt": round(cl_max_3d_llt, 5),
-            "cl_alpha_orani": round(cl_alpha_orani, 5),
-            "e_oswald_orani": round(e_orani, 5),
-            "cl_max_orani": round(cl_max_orani, 5),
-            # Flaplı VLM sonuçları
-            "b_flap_m": round(b_flap, 4),
-            "flap_aciklik_orani": round(oran_flap, 4),
-            "CL_alpha_3d_flapli_per_deg": round(cl_alpha_flap_vlm, 6),
-            "alpha_L0_flapli_deg": round(alpha_l0_flap_vlm, 4),
-            "alpha_L0_flapli_ham_deg": round(alpha_l0_flap_ham, 4),        # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] düzeltme öncesi
-            "flap_verimi": round(flap_verimi_uygulanan, 4),                # [DEĞİŞİKLİK 2026-11-19 v10 | eğri tutarlılığı] 1.0 = düzeltme yok
-            "e_oswald_flapli": round(e_flap_vlm, 5),
-            "CL_max_3d_flapli_tahmini": round(cl_max_flap_vlm, 5),
-            "CL_alpha_flapli_llt": round(cl_alpha_flap_llt, 6),
-            "e_oswald_flapli_llt": round(e_flap_llt, 5),
-            "CL_max_3d_flapli_llt": round(cl_max_3d_flap_llt, 5),
-            "cl_alpha_flapli_orani": round(cl_alpha_flap_orani, 5),
-            "e_oswald_flapli_orani": round(e_flap_orani, 5),
-            "cl_max_flapli_orani": round(cl_max_flap_orani, 5),
-            # [DEĞİŞİKLİK 2026-11-18 | Görev A] Hangi çözücünün kullanıldığı + VSPAERO model dosyaları (Görev B karşılaştırması için)
-            "cozucu_flapli": vlm_flapli.get("cozucu", ""),
-            "vsp3_flapsiz": vlm_flapsiz.get("vsp3_dosyasi", ""),
-            "vsp3_flapli": vlm_flapli.get("vsp3_dosyasi", ""),
+        oran_flap = float(np.clip(b_flap / b_w, 0.0, 1.0))
+        temiz_polar_ref = min(temiz_dugum, key=lambda r: (abs(r - 250000), r))
+        flap_polar_ref = min(flap_dugum, key=lambda r: (abs(r - 250000), r))
+        re_temiz = {}
+        for re in sorted(temiz_dugum):
+            if re not in temiz_polar:
+                raise ValueError(f"Temiz 2B polar eksik: {profil}, Re={re}")
+            pol = temiz_polar[re]
+            hesap = _secilen_vlm_cozucu_cagir(
+                motor=motor, b_w=b_w, c_w=c_w, s_w=s_w, b_ht=b_ht, c_ht=c_ht,
+                tail_arm=tail_arm, alpha_l0_2d_deg=float(pol["alpha_L0_deg"]),
+                cl_max_2d=float(pol["cl_max_2d"]), n_span=n_span, n_chord=n_chord,
+                flap_aciklik_orani=0.0, ek_geometri=ek_geometri,
+            )
+            if str(hesap.get("cozucu", "")).startswith("vspaero"):
+                # VSPAERO sürtünmesizdir; polar kaynaklı α0 farkını aynı sabit
+                # referans Re'deki geometrik çözüme ekle.
+                hesap["alpha_L0_deg"] = float(hesap["alpha_L0_deg"]) + (
+                    float(pol["alpha_L0_deg"]) - float(temiz_polar[temiz_polar_ref]["alpha_L0_deg"])
+                )
+            re_temiz[re] = {**hesap, "Re_aday": re, "polar_dosyasi": str(pol["dosya_yolu"])}
+        re_flap = {}
+        for re in sorted(flap_dugum):
+            if re not in temiz_polar or re not in flap_polar:
+                raise ValueError(f"Flaplı/temiz 2B polar eksik: {profil}, {flap_profil}, Re={re}")
+            pol, fpol = temiz_polar[re], flap_polar[re]
+            hesap = _secilen_vlm_cozucu_cagir(
+                motor=motor, b_w=b_w, c_w=c_w, s_w=s_w, b_ht=b_ht, c_ht=c_ht,
+                tail_arm=tail_arm, alpha_l0_2d_deg=float(pol["alpha_L0_deg"]),
+                cl_max_2d=float(pol["cl_max_2d"]), n_span=n_span, n_chord=n_chord,
+                flap_aciklik_orani=oran_flap,
+                alpha_l0_flap_2d_deg=float(fpol["alpha_L0_deg"]),
+                cl_max_flap_2d=float(fpol["cl_max_2d"]), ek_geometri=ek_geometri,
+            )
+            if str(hesap.get("cozucu", "")).startswith("vspaero"):
+                temiz_kayma = float(pol["alpha_L0_deg"]) - float(temiz_polar[flap_polar_ref]["alpha_L0_deg"])
+                flap_kayma = float(fpol["alpha_L0_deg"]) - float(flap_polar[flap_polar_ref]["alpha_L0_deg"])
+                hesap["alpha_L0_deg"] = float(hesap["alpha_L0_deg"]) + (
+                    (1.0 - oran_flap) * temiz_kayma + oran_flap * flap_kayma
+                )
+            ham_a0 = float(hesap["alpha_L0_deg"])
+            eta = 1.0
+            if str(hesap.get("cozucu", "")).startswith("vspaero") and oran_flap > 1e-4:
+                temiz_a0 = float(_re_vlm_sonucu({"re_flapsiz": re_temiz}, re, False)["alpha_L0_deg"])
+                eta = FLAP_VERIMI
+                hesap["alpha_L0_deg"] = temiz_a0 + eta * (ham_a0 - temiz_a0)
+            re_flap[re] = {
+                **hesap, "Re_aday": re, "polar_dosyasi": str(fpol["dosya_yolu"]),
+                "b_flap_m": b_flap, "flap_aciklik_orani": oran_flap,
+                "CL_alpha_3d_flapli_per_deg": float(hesap["CL_alpha_3d_per_deg"]),
+                "alpha_L0_flapli_deg": float(hesap["alpha_L0_deg"]),
+                "alpha_L0_flapli_ham_deg": ham_a0,
+                "flap_verimi": eta,
+                "e_oswald_flapli": float(hesap["e_oswald"]),
+                "CL_max_3d_flapli_tahmini": float(hesap["CL_max_3d_tahmini"]),
+                "cozucu_flapli": hesap.get("cozucu", ""),
+            }
+        # Özet/puanlama alanları için açık ve sabit referans: Re=250 000 (yoksa en yakın düğüm).
+        temiz_ref_re = min(re_temiz, key=lambda r: (abs(r - 250000), r))
+        flap_ref_re = min(re_flap, key=lambda r: (abs(r - 250000), r))
+        temiz_ref, flap_ref = re_temiz[temiz_ref_re], re_flap[flap_ref_re]
+        llt_ref, llt_flap_ref = temiz_dugum[temiz_ref_re], flap_dugum[flap_ref_re]
+        def oran(yeni, eski):
+            return float(yeni) / max(float(eski), 1e-5)
+        sonuc[key] = {
+            **temiz_ref,
+            **{k: flap_ref[k] for k in ("CL_alpha_3d_flapli_per_deg", "alpha_L0_flapli_deg",
+                "alpha_L0_flapli_ham_deg", "flap_verimi", "e_oswald_flapli",
+                "CL_max_3d_flapli_tahmini", "cozucu_flapli")},
+            "re_flapsiz": re_temiz, "re_flapli": re_flap,
+            "referans_re_flapsiz": temiz_ref_re, "referans_re_flapli": flap_ref_re,
+            "b_flap_m": b_flap, "flap_aciklik_orani": oran_flap,
+            "CL_alpha_llt": sayi_al(llt_ref, "CL_alpha_3d_per_deg"),
+            "e_oswald_llt": sayi_al(llt_ref, "e_oswald", "e_w"),
+            "CL_max_3d_llt": sayi_al(llt_ref, "CL_max_3d_tahmini"),
+            "cl_alpha_orani": oran(temiz_ref["CL_alpha_3d_per_deg"], sayi_al(llt_ref, "CL_alpha_3d_per_deg")),
+            "e_oswald_orani": oran(temiz_ref["e_oswald"], sayi_al(llt_ref, "e_oswald", "e_w")),
+            "cl_max_orani": oran(temiz_ref["CL_max_3d_tahmini"], sayi_al(llt_ref, "CL_max_3d_tahmini")),
+            "CL_alpha_flapli_llt": sayi_al(llt_flap_ref, "CL_alpha_3d_per_deg"),
+            "e_oswald_flapli_llt": sayi_al(llt_flap_ref, "e_oswald", "e_w"),
+            "CL_max_3d_flapli_llt": sayi_al(llt_flap_ref, "CL_max_3d_tahmini"),
+            "cl_alpha_flapli_orani": oran(flap_ref["CL_alpha_3d_per_deg"], sayi_al(llt_flap_ref, "CL_alpha_3d_per_deg")),
+            "e_oswald_flapli_orani": oran(flap_ref["e_oswald"], sayi_al(llt_flap_ref, "e_oswald", "e_w")),
+            "cl_max_flapli_orani": oran(flap_ref["CL_max_3d_tahmini"], sayi_al(llt_flap_ref, "CL_max_3d_tahmini")),
+            "vsp3_flapsiz": temiz_ref.get("vsp3_dosyasi", ""),
+            "vsp3_flapli": flap_ref.get("vsp3_dosyasi", ""),
         }
-
-    print(
-        f"[VLM] Toplam {len(vlm_sonuc_haritasi)} benzersiz kanat-kuyruk geometrisi "
-        f"(flapsız + flaplı) 3B VLM ile çözüldü."
-    )
-    return vlm_sonuc_haritasi
+    print(f"[VLM] {len(sonuc)} geometri; {sum(len(v['re_flapsiz']) + len(v['re_flapli']) for v in sonuc.values())} geometri/Re/mod çözümü.")
+    return sonuc
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1171,7 @@ def _tek_mod_tablolari_guncelle(
                 yeni_llt.append(dict(row))
             continue
 
+        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
         r_copy = dict(row)
         r_copy["e_oswald"] = f"{float(vlm[e_key]):.6f}"
         r_copy["CL_alpha_3d_per_deg"] = f"{float(vlm[cl_alpha_key]):.6f}"
@@ -1216,6 +1235,7 @@ def _tek_mod_tablolari_guncelle(
                 yeni_drag_polar.append(dict(row))
             continue
 
+        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
         r_copy = dict(row)
         ar_w = sayi_al(r_copy, "AR_w", varsayilan=(g_key[1] ** 2) / max(g_key[2], 1e-6))
         if ar_w <= 0.0:
@@ -1250,6 +1270,7 @@ def _tek_mod_tablolari_guncelle(
                 yeni_drag_ozet.append(dict(row))
             continue
 
+        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
         r_copy = dict(row)
         ar_w = sayi_al(r_copy, "AR_w", varsayilan=(g_key[1] ** 2) / max(g_key[2], 1e-6))
         if ar_w <= 0.0:
@@ -1297,6 +1318,7 @@ def _flapsizdan_flapli_llt_olustur(
         vlm = _vlm_eslesmesi_bul(vlm_haritasi, g_key)
         if vlm is None:
             continue
+        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), True)
         r_copy = dict(row)
         profil_temel = g_key[0]
         r_copy["flap_airfoil"] = f"{profil_temel}_flap"
