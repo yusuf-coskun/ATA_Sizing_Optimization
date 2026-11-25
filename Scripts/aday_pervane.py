@@ -46,7 +46,8 @@ def temel_kimlik(aday):
     """
     canonical = {}
     for key, value in aday.items():
-        if key in KIMLIK_ALANLARI or key.endswith(("_no", "_dat")):
+        # VLM çözümüne bağlanan geometri etiketi aday girdisinin parçası değildir.
+        if key in KIMLIK_ALANLARI or key == "vlm_geometri_id" or key.endswith(("_no", "_dat")):
             continue
         text = metin(value)
         if not text:

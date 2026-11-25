@@ -640,6 +640,104 @@ def polar_dosyasi_oku(polar_yolu: Path) -> Dict[str, np.ndarray]:
     return sonuc
 
 
+def _firar_kenari_noktalari(vsp: Any, gid: str) -> np.ndarray:
+    """Kurulan simetrik kanadın sağ yarısındaki fiziksel firar kenarını örnekle."""
+    u = np.linspace(0.0, 1.0, 257).tolist()
+    noktalar = vsp.CompVecPnt01(gid, 0, u, [0.0] * len(u))
+    xyz = np.array([(p.x(), p.y(), p.z()) for p in noktalar], dtype=float)
+    if xyz.shape != (len(u), 3) or not np.isfinite(xyz).all():
+        raise ValueError(f"VSPAERO firar kenarı geometrisi okunamadı: {gid}.")
+    xyz[:, 1] = abs(xyz[:, 1])
+    aciklik, indisler = np.unique(xyz[:, 1], return_index=True)
+    if len(aciklik) < 2:
+        raise ValueError(f"VSPAERO firar kenarının açıklığı sıfır: {gid}.")
+    return xyz[indisler]
+
+
+def _kanat_yuk_polarini_oku(
+    lod_yolu: Path, toplam: Dict[str, np.ndarray], kenarlar: Dict[str, np.ndarray],
+    s_ref: float, govde_dahil: bool,
+) -> Dict[str, np.ndarray]:
+    """Kanat şeritlerinin Cl ve Cdi kuvvetlerini .lod dosyasından Sref'e göre topla."""
+    alanlar = ("VortexSheet", "Xavg", "Yavg", "Zavg", "dSpan", "Chord", "Cl", "Cdi")
+    durumlar: Dict[float, List[Tuple[float, ...]]] = {}
+    alfa: Optional[float] = None
+    sutunlar: Dict[str, int] = {}
+    for satir in lod_yolu.read_text(encoding="utf-8", errors="ignore").splitlines():
+        parcalar = satir.split()
+        if parcalar[:1] == ["AoA_"]:
+            alfa = float(parcalar[1])
+            if alfa in durumlar:
+                raise ValueError(f".lod dosyasında yinelenen hücum açısı: {alfa:g}°.")
+            durumlar[alfa] = []
+            sutunlar = {}
+        elif all(ad in parcalar for ad in alanlar):
+            sutunlar = {ad: i for i, ad in enumerate(parcalar)}
+        elif alfa is not None and sutunlar and len(parcalar) == len(sutunlar):
+            try:
+                veriler = tuple(float(parcalar[sutunlar[ad]]) for ad in alanlar)
+            except ValueError:
+                continue
+            if not all(math.isfinite(v) for v in veriler):
+                raise ValueError(f".lod şerit verisi sonlu değil: alfa={alfa:g}°.")
+            durumlar[alfa].append(veriler)
+
+    beklenen_acilar = np.asarray(toplam["alfa"], dtype=float)
+    if len(durumlar) != len(beklenen_acilar) or not np.allclose(
+        sorted(durumlar), sorted(beklenen_acilar), rtol=0.0, atol=1e-5,
+    ):
+        raise ValueError(".lod ve .polar hücum açıları uyuşmuyor.")
+
+    kanat_cl: List[float] = []
+    kanat_cdi: List[float] = []
+    for i, beklenen_alfa in enumerate(beklenen_acilar):
+        alfa = min(durumlar, key=lambda a: abs(a - beklenen_alfa))
+        yukler = np.asarray(durumlar[alfa], dtype=float)
+        if not yukler.size:
+            raise ValueError(f".lod dosyasında şerit yükü yok: alfa={alfa:g}°.")
+        bilesenler: Dict[str, List[np.ndarray]] = {ad: [] for ad in kenarlar}
+        for iz in np.unique(yukler[:, 0]):
+            seritler = yukler[yukler[:, 0] == iz]
+            x, y, z = seritler[:, 1], abs(seritler[:, 2]), seritler[:, 3]
+            eslesenler = []
+            for ad, kenar in kenarlar.items():
+                # .lod konumları beş ondalıkla yazılır. Firar kenarı referansı doğrudan
+                # OpenVSP geometrisinden alınır, iz numarasının sırasına güvenilmez.
+                tolerans = 5e-4
+                if (
+                    np.all(y >= kenar[0, 1] - tolerans)
+                    and np.all(y <= kenar[-1, 1] + tolerans)
+                    and np.allclose(x, np.interp(y, kenar[:, 1], kenar[:, 0]), rtol=0.0, atol=tolerans)
+                    and np.allclose(z, np.interp(y, kenar[:, 1], kenar[:, 2]), rtol=0.0, atol=tolerans)
+                ):
+                    eslesenler.append(ad)
+            if len(eslesenler) == 1:
+                bilesenler[eslesenler[0]].append(seritler)
+            elif len(eslesenler) > 1 or not govde_dahil:
+                raise ValueError(f"VSPAERO iz {iz:g}, alfa={alfa:g}° için bileşen eşleşmesi belirsiz.")
+
+        if any(not seritler for seritler in bilesenler.values()):
+            raise ValueError(f"VSPAERO kanat veya kuyruk yükü bulunamadı: alfa={alfa:g}°.")
+
+        def kuvvet_katsayilari(yuzey: List[np.ndarray]) -> np.ndarray:
+            seritler = np.concatenate(yuzey)
+            agirlik = seritler[:, 4] * seritler[:, 5] / s_ref
+            return agirlik @ seritler[:, 6:8]
+
+        cl_w, cdi_w = kuvvet_katsayilari(bilesenler["kanat"])
+        if not govde_dahil:
+            cl_ht, cdi_ht = kuvvet_katsayilari(bilesenler["kuyruk"])
+            if not np.allclose(
+                (cl_w + cl_ht, cdi_w + cdi_ht),
+                (toplam["CL"][i], toplam["CDi"][i]),
+                atol=1e-3, rtol=2e-3,
+            ):
+                raise ValueError(f".lod kanat ve kuyruk kuvvetleri .polar toplamıyla uyuşmuyor: alfa={alfa:g}°.")
+        kanat_cl.append(float(cl_w))
+        kanat_cdi.append(float(cdi_w))
+    return {"alfa": beklenen_acilar, "CL": np.asarray(kanat_cl), "CDi": np.asarray(kanat_cdi)}
+
+
 def _polar_dosyasini_bul(vsp3_yolu: Path, baslangic_zamani: Optional[float] = None) -> Optional[Path]:
     """
     [DEĞİŞİKLİK 2026-11-18 v5 | inceleme düzeltmeleri] Bağımsız inceleme (kritik 1): eskiden '{ad}*.polar' deseniyle en yeni
@@ -760,6 +858,8 @@ def vspaero_api_coz(
     e_kaynagi: str = "iz",               # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson] "iz" (önerilen) veya "yuzey" (eski)
     viskoz_e_carpani: float = 0.995,     # [DEĞİŞİKLİK 2026-11-19 v9 | tam akışta gövde] 1/e = 1/(k·e_span) + 0.007·π·AR formülündeki k (gövde modellenince 1.0 düşünülebilir)
     veter_tess: Optional[int] = None,    # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson] veter yönü panel (Tess_W)
+    flap_profil: Optional[str] = None,
+    geometri_etiketi: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Tek bir geometriyi VSPAERO ile çözer. Hata olursa İSTİSNA FIRLATIR (sessiz yedek yok).
@@ -805,9 +905,14 @@ def vspaero_api_coz(
     flap_orani = float(np.clip(flap_aciklik_orani, 0.0, 1.0))
     flapli_dosya: Optional[Path] = None
     if flap_orani > 1e-4:
-        flapli_dosya = profil_dosyasi_bul(profil, flapli=True)
+        flap_adi = Path(flap_profil).stem if flap_profil else f"{profil}_flap"
+        flapli_dosya = next(
+            (yol for klasor in (REPO_ROOT, SCRIPT_DIR)
+             if (yol := klasor / "airfoils_flap" / f"{flap_adi}.dat").is_file()),
+            None,
+        )
         if flapli_dosya is None:
-            raise FileNotFoundError(f"Flaplı profil dosyası yok: airfoils_flap/{profil}_flap.dat")
+            raise FileNotFoundError(f"Flaplı profil dosyası yok: airfoils_flap/{flap_adi}.dat")
 
     # Gövde ve kanat konumu (profil dosyası ASCII klasöre kopyalanmadan önce okunur)
     x_kanat_hk, z_kanat, xcg = 0.0, 0.0, 0.25 * c_w
@@ -887,6 +992,8 @@ def vspaero_api_coz(
             ad += f"_tw{int(veter_tess)}"
         if abs(zcg_deger) > 1e-9:
             ad += f"_zcg{zcg_deger:+.3f}"
+    if geometri_etiketi:
+        ad += f"_{geometri_etiketi}"
 
     # [v3] VSPAERO ve profil dosyaları ASCII (Türkçe karaktersiz) bir klasörde kullanılır.
     env_calisma = os.environ.get("VSPAERO_CALISMA_KLASORU", "").strip()
@@ -903,7 +1010,7 @@ def vspaero_api_coz(
 
     vsp.ClearVSPModel()
     vsp.Update()
-    _kanat_kur(
+    kanat_gid = _kanat_kur(
         vsp, "Kanat", 0.5 * b_w, c_w, temiz,
         flap_ic=flap_ic, flap_dis=flap_dis, flapli_profil=flapli_dosya,
         x_konum=x_kanat_hk, z_konum=z_kanat,
@@ -913,16 +1020,26 @@ def vspaero_api_coz(
     if govde:
         _govde_kur(vsp, float(g["D"]), float(g["L_toplam"]), float(g["L_aviyonik"]),
                    float(g["L_kuyruk"]), float(g["D_min"]))
-    if kuyruk_dahil and b_ht > 0.05 and c_ht > 0.02 and tail_arm > 0.05:
-        kuyruk_dosya = profil_dosyasi_bul(kuyruk_profil, flapli=False) or temiz
+    firar_kenarlari: Dict[str, np.ndarray] = {}
+    if kuyruk_dahil:
+        if not (b_ht > 0.05 and c_ht > 0.02 and tail_arm > 0.05):
+            raise ValueError("Kuyruklu VSPAERO için geçerli yatay kuyruk açıklığı, veteri ve kuyruk kolu gerekli.")
+        kuyruk_dosya = profil_dosyasi_bul(kuyruk_profil, flapli=False)
+        if kuyruk_dosya is None:
+            raise FileNotFoundError(f"Yatay kuyruk profil dosyası yok: airfoils/{kuyruk_profil}.dat")
         if ayri_klasor and kuyruk_dosya != temiz:
             kuyruk_dosya = Path(shutil.copy2(kuyruk_dosya, calisma / "profiller" / kuyruk_dosya.name))
         x_kuyruk_hk = x_kanat_hk + 0.25 * c_w + tail_arm - 0.25 * c_ht
         if govde:
             print("[VSPAERO] UYARI: kuyruk + gövde birlikte: kuyruk z=0'da, VLM'de gövde plakasıyla çakışabilir.")
-        _kanat_kur(vsp, "YatayKuyruk", 0.5 * b_ht, c_ht, kuyruk_dosya, x_konum=x_kuyruk_hk,
-                   span_panel=_SPAN_PANEL)
+        kuyruk_gid = _kanat_kur(vsp, "YatayKuyruk", 0.5 * b_ht, c_ht, kuyruk_dosya, x_konum=x_kuyruk_hk,
+                                span_panel=_SPAN_PANEL)
     vsp.Update()
+    if kuyruk_dahil:
+        firar_kenarlari = {
+            "kanat": _firar_kenari_noktalari(vsp, kanat_gid),
+            "kuyruk": _firar_kenari_noktalari(vsp, kuyruk_gid),
+        }
 
     # [v5] Önceki çalıştırmadan kalan aynı adlı dosyaları sil (eski .polar okunmasın)
     import time as _time
@@ -996,8 +1113,15 @@ def vspaero_api_coz(
     polar_yolu = _polar_dosyasini_bul(vsp3_yolu, baslangic)
     if polar_yolu is None:
         raise RuntimeError(f"VSPAERO sonuç vermedi (.polar dosyası yok): {vsp3_yolu.with_suffix('.polar')}")
-    polar = polar_dosyasi_oku(polar_yolu)
+    toplam_polar = polar_dosyasi_oku(polar_yolu)
+    polar = toplam_polar
     kaynak = f"polar_dosyasi:{polar_yolu.name}"
+    if kuyruk_dahil:
+        lod_yolu = polar_yolu.with_suffix(".lod")
+        if not lod_yolu.is_file() or lod_yolu.stat().st_mtime < baslangic - 2.0:
+            raise RuntimeError(f"Bu VSPAERO çözümünün kanat ve kuyruk yükleri bulunamadı: {lod_yolu}")
+        polar = _kanat_yuk_polarini_oku(lod_yolu, toplam_polar, firar_kenarlari, s_w, bool(govde))
+        kaynak = f"kanat_serit_yuku:{lod_yolu.name}"
 
     if ayri_klasor:  # [v3] model/sonuç dosyalarını asıl klasöre kopyala
         for f in glob.glob(str(calisma / f"{ad}.*")):
@@ -1010,6 +1134,8 @@ def vspaero_api_coz(
     ar_w = (b_w ** 2) / max(s_w, 1e-9)
     kats = polar_katsayilarini_cikar(polar, ar_w)
     bayraklar = kalite_bayraklari(polar, kats)
+    # Mevcut moment tanı alanları çözülen geometrinin tamamını raporlar.
+    moment = polar_katsayilarini_cikar(toplam_polar, ar_w) if kuyruk_dahil else kats
     # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson] e kaynağı seçimi
     e_yuzey = kats["e_oswald_ham"]
     cl_max_flap_kesit_ = cl_max_flap_2d if (cl_max_flap_2d and cl_max_flap_2d > 0.1) else cl_max_2d
@@ -1017,7 +1143,12 @@ def vspaero_api_coz(
     cl_ref = 0.83 * cl_max_3d_ if flap_orani > 1e-4 else float("nan")
     e_iz_yerel = yerel_e_iz(polar, (b_w ** 2) / max(s_w, 1e-9), cl_ref) if flap_orani > 1e-4 else float("nan")
     ek_kaynak = (e_kaynagi or "iz").strip().lower()
-    if ek_kaynak == "iz":
+    if kuyruk_dahil and ek_kaynak in ("iz", "yuzey"):
+        e_ham = e_yuzey
+        e_kaynak_etiketi = "kanat_yuzeyi_lod"
+        if ek_kaynak == "iz":
+            bayraklar.append("kanat_bileseni_iz_verisi_yok")
+    elif ek_kaynak == "iz":
         e_ham = e_iz_yerel if flap_orani > 1e-4 else kats.get("e_iz", float("nan"))
         e_kaynak_etiketi = "iz_yerel_CLref" if flap_orani > 1e-4 else "iz_egrilik"
         if not math.isfinite(e_ham):  # iz verisi yoksa yüzeye düş ama işaretle
@@ -1061,6 +1192,7 @@ def vspaero_api_coz(
 
     return {
         "cozucu": "vspaero_api",
+        "kuvvet_kapsami": "kanat" if kuyruk_dahil or not govde else "kanat_govde",
         "CL_alpha_3d_per_deg": _y(kats["CL_alpha_3d_per_deg"]),
         "alpha_L0_deg": _y(kats["alpha_L0_deg"], 4),
         "e_oswald": _y(e_oswald_duzeltilmis, 5),
@@ -1089,14 +1221,16 @@ def vspaero_api_coz(
         "polar_alfa": ";".join(f"{x:.2f}" for x in polar["alfa"]),
         "polar_CL": ";".join(f"{x:.5f}" for x in polar["CL"]),
         "polar_CDi": ";".join(f"{x:.6f}" for x in polar["CDi"]),
+        "polar_CL_toplam": ";".join(f"{x:.5f}" for x in toplam_polar["CL"]),
+        "polar_CDi_toplam": ";".join(f"{x:.6f}" for x in toplam_polar["CDi"]),
         "yontem": yontem,
         "span_panel": _SPAN_PANEL or "varsayilan",
         "uc_sik": uc_sik if uc_sik else "varsayilan",
         "zcg_m": round(zcg_deger, 4),
         "CL_alfa4": _y(kats["CL_alfa4"]),
         "CDi_alfa4": _y(kats["CDi_alfa4"]),
-        "Cm_alpha_per_deg": _y(kats.get("Cm_alpha_per_deg", float("nan"))),
-        "CMy_alfa4": _y(kats.get("CMy_alfa4", float("nan"))),
+        "Cm_alpha_per_deg": _y(moment.get("Cm_alpha_per_deg", float("nan"))),
+        "CMy_alfa4": _y(moment.get("CMy_alfa4", float("nan"))),
         "govde_dahil": bool(govde),
         **govde_bilgi,
     }
@@ -1122,7 +1256,8 @@ def vspaero_api_coz_richardson(n_kaba: int = 24, n_ince: int = 48, **kw: Any) ->
     sonuc = dict(r_ince)
     e1, e2 = float(r_kaba["e_span_vspaero_ham"]), float(r_ince["e_span_vspaero_ham"])
     oran = float(n_ince) / float(n_kaba)
-    if math.isfinite(e1) and math.isfinite(e2):
+    kanat_yuzeyi = r_ince["e_kaynagi"] == "kanat_yuzeyi_lod"
+    if not kanat_yuzeyi and math.isfinite(e1) and math.isfinite(e2):
         e_inf = e2 + (e2 - e1) / (oran - 1.0)
         e_span = float(np.clip(e_inf, 0.30, 1.00))
         b_w, s_w = float(kw["b_w"]), float(kw["s_w"])
@@ -1138,7 +1273,7 @@ def vspaero_api_coz_richardson(n_kaba: int = 24, n_ince: int = 48, **kw: Any) ->
         if sonuc["e_kirpildi"]:
             kalite.append("e_kirpildi")
         sonuc["kalite"] = ";".join(kalite) if kalite else "ok"
-    sonuc["richardson"] = f"{n_kaba}/{n_ince}"
+    sonuc["richardson"] = f"{n_kaba}/{n_ince} (e: ince ağ)" if kanat_yuzeyi else f"{n_kaba}/{n_ince}"
     sonuc["e_span_kaba"] = round(e1, 5)
     sonuc["e_span_ince"] = round(e2, 5)
     sonuc["CL_alpha_kaba_per_deg"] = r_kaba["CL_alpha_3d_per_deg"]

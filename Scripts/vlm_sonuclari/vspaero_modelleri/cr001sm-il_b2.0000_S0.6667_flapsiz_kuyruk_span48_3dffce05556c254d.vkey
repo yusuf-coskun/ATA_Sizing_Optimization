@@ -1,0 +1,17 @@
+# VSPGEOM v3 Tag Key File
+C:\Users\yusuf\OneDrive\Desktop\ATA_Sizing_Optimization\Scripts\vlm_sonuclari\vspaero_modelleri\cr001sm-il_b2.0000_S0.6667_flapsiz_kuyruk_span48_3dffce05556c254d.vspgeom
+4
+
+# part#,geom#,surf#,gname,gid,thick,plate,copy#,geomcopy#
+1,1,0,Kanat_C,FYSYRYVGIA,0,3,1,2
+2,1,1,Kanat_C,FYSYRYVGIA,0,3,2,2
+3,0,0,YatayKuyruk_C,ZSEAPQWPMD,0,3,1,1
+4,0,1,YatayKuyruk_C,ZSEAPQWPMD,0,3,2,1
+
+4
+
+# tag#,part#,ssname1,ssname2,...,ssid1,ssid2,...
+1,1
+2,2
+3,3
+4,4

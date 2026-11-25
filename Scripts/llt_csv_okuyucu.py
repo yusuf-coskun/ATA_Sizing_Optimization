@@ -63,6 +63,11 @@ def same_value(left, right):
     return math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-10)
 
 
+def text_field(row, key):
+    value = row.get(key)
+    return value.strip().lower() if isinstance(value, str) else ''
+
+
 class LLTTable:
     def __init__(self, rows, source='LLT CSV', flapped=False):
         self.source, self.flapped, self.errors = str(source), flapped, []
@@ -89,7 +94,14 @@ class LLTTable:
             for part in ('HT','VT'):
                 if not math.isclose(v['Re_'+part]/v['Re_aday'],num(row,'c_'+part+'_m')/num(row,'c_w_m'),rel_tol=1e-5):
                     raise LLTError('Kanat/kuyruk Reynolds ve kord oranlari uyusmuyor.')
-            group=groups.setdefault(key,{'row':dict(row),'nodes':{}})
+            geometry_id = text_field(row, 'vlm_geometri_id')
+            if geometry_id:
+                key += (geometry_id,)
+            group=groups.setdefault(key,{'row':dict(row),'nodes':{},
+                                         'geometry_id':geometry_id,'configuration_ids':set()})
+            configuration_id = text_field(row, 'konfigurasyon_id')
+            if configuration_id:
+                group['configuration_ids'].add(configuration_id)
             node=group['nodes'].setdefault(v['Re_aday'],{'row':dict(row),'values':v,'curve':{},'unavailable':unavailable})
             if node['unavailable'] != unavailable:
                 raise LLTError('Ayni geometri/Re icin celisen kuyruk kapsam durumu.')
@@ -162,8 +174,15 @@ class LLTTable:
 
     def match(self, candidate):
         matches=[]
+        geometry_id = text_field(candidate, 'vlm_geometri_id')
+        configuration_id = text_field(candidate, 'konfigurasyon_id')
         for group in self.by_profile.get(profile(candidate),[]):
             row=group['row']
+            if geometry_id and group['geometry_id'] and group['geometry_id'] != geometry_id:
+                continue
+            if group['geometry_id'] and row.get('tail_arm_m') not in ('', None) and candidate.get('tail_arm_m') not in ('', None):
+                if not math.isclose(num(row, 'tail_arm_m'), num(candidate, 'tail_arm_m'), rel_tol=1e-7, abs_tol=6e-6):
+                    continue
             if not all(math.isclose(num(row,a),num(candidate,b),rel_tol=1e-5,abs_tol=6e-6) for a,b in GEOMETRY.items()):
                 continue
             if self.flapped:
@@ -174,6 +193,9 @@ class LLTTable:
                 if str(row['flap_airfoil']).strip().lower()!=expected:
                     continue
             matches.append(group)
+        if configuration_id:
+            matches = [group for group in matches
+                       if group['geometry_id'] and configuration_id in group['configuration_ids']] or matches
         if len(matches)!=1:
             raise LLTError(f'{self.source}: {profile(candidate)} icin ayni kanat/kuyruk/flap geometrisinde tek kayit bekleniyor; bulunan={len(matches)}')
         group=matches[0]

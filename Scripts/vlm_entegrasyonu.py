@@ -11,8 +11,9 @@ Akış:
    - Flapsız 3B VLM analizi (tırmanış, seyir ve yük bırakma için)
    - Flaplı 3B VLM analizi (`b_flap_m = min(1.0, b_w_m)` iç açıklıkta `<airfoil>_flap`
      kambur/sıfır-taşıma açısı ve kesit CL_max sınırlarıyla; kalkış ve iniş için)
-   çalıştırılır.
-3. Flapsız ve flaplı LLT + OpenVSP polar/özet tabloları VLM sonuçlarıyla güncellenerek
+   çalıştırılır. Her geometri/Re düğümü aynı Reynolds'taki kesit polarıyla çözülür.
+3. Flapsız ve flaplı LLT + OpenVSP polar/özet tabloları kullanılan polar dosyaları
+   ve Reynolds düğümleriyle birlikte VLM sonuçlarıyla güncellenerek
    `vlm_sonuclari/` dizinine kaydedilir:
    - `vlm_flapsiz_coklu_re.csv`, `vlm_flapsiz_polar_detay.csv`, `vlm_flapsiz_aday_ozet.csv`
    - `vlm_flapli_coklu_re.csv`, `vlm_flapli_polar_detay.csv`, `vlm_flapli_aday_ozet.csv`
@@ -25,6 +26,8 @@ Akış:
    - `inis_hesabi_deneme.py` -> Flaplı ve flapsız VLM tablolarıyla (`vlm_inis_sonuclari.csv`)
 5. Üretilen gerçek VLM performans tabloları `aday_siralama.adaylari_degerlendir_ve_sirala`
    ile birleştirilip puanlanır ve `vlm_nihai_ucak_siralamasi.csv` dosyasına kaydedilir.
+   Bir performans fazı başarısız olursa sıralama yerine hata durumu kaydedilir.
+   Analitik tahminler `--analitik-olcekleme` ile ayrı bir CSV'ye yazılır.
 """
 
 from __future__ import annotations
@@ -32,11 +35,16 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import hashlib
+import importlib
+import io
+import json
 import math
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -72,9 +80,9 @@ from lifting_line_cozucu import (
 
 # [DEĞİŞİKLİK 2026-11-18 | Görev A] VSPAERO davranış ayarları (main() içinde komut satırından doldurulur).
 # VSPAERO_ZORUNLU=True -> VSPAERO hata verirse program DURUR (NumPy'a geçmez).
-# VSPAERO_KUYRUK_DAHIL=True -> modele yatay kuyruk da eklenir (varsayılan: sadece kanat).
+# VSPAERO varsayılan olarak kanadı ve yatay kuyruğu birlikte çözer.
 VSPAERO_ZORUNLU = False
-VSPAERO_KUYRUK_DAHIL = False
+VSPAERO_KUYRUK_DAHIL = True
 VSPAERO_MODEL_KLASORU: Optional[Path] = None
 VSPAERO_HATALARI: List[str] = []  # hangi geometride neden NumPy'a düşüldü
 VSPAERO_SPAN_PANEL: Optional[int] = None
@@ -213,9 +221,9 @@ def kullanilabilir_vlm_motoru_sec(tercih: str = "auto") -> str:
         try:
             import aerosandbox  # type: ignore # noqa: F401
             return "aerosandbox"
-        except ImportError:
+        except ImportError as exc:
             if tercih_norm == "aerosandbox":
-                print("[UYARI] AeroSandbox bulunamadı; dahili NumPy 3B VLM motoruna geçiliyor.")
+                raise RuntimeError(f"--cozucu aerosandbox seçildi ama AeroSandbox yüklenemedi: {exc}") from exc
 
     return "numpy_vlm"
 
@@ -350,7 +358,8 @@ def numpy_3d_vlm_coz(
     if b_ht > 0.05 and c_ht > 0.02 and tail_arm > 0.1:
         n_ht_span = max(6, (n_span_even // 3) + ((n_span_even // 3) % 2))
         y_ht_edges = np.linspace(-0.5 * b_ht, 0.5 * b_ht, n_ht_span + 1)
-        x_ht_edges = np.linspace(tail_arm, tail_arm + c_ht, 3)
+        x_ht = 0.25 * c_w + tail_arm - 0.25 * c_ht
+        x_ht_edges = np.linspace(x_ht, x_ht + c_ht, 3)
         n_ht = np.array([0.0, 0.0, 1.0], dtype=float)
         for i in range(n_ht_span):
             y1, y2 = float(y_ht_edges[i]), float(y_ht_edges[i + 1])
@@ -389,7 +398,7 @@ def numpy_3d_vlm_coz(
 
     alphas_deg: List[float] = []
     cls_wing: List[float] = []
-    e_values: List[float] = []
+    e_noktalari: List[Tuple[float, float]] = []
     peak_ratios: List[float] = []
     strip_limit_ratios: List[float] = []
 
@@ -428,7 +437,7 @@ def numpy_3d_vlm_coz(
                 e_vlm = float(np.clip(1.0 / max(e_inv, 1e-6), 0.45, 0.99))
             else:
                 e_vlm = 0.80
-            e_values.append(e_vlm)
+            e_noktalari.append((float(alpha_deg), e_vlm))
 
             cl_local = (2.0 * gamma_strip) / c_w
             mean_cl = max(abs(cl_wing), 1e-6)
@@ -447,12 +456,10 @@ def numpy_3d_vlm_coz(
     slope_per_deg = float(max(slope_per_deg, 1e-4))
     alpha_l0_vlm = float(-intercept / slope_per_deg)
 
-    e_mid = [
-        e_values[idx]
-        for idx, a in enumerate(alphas_deg[: len(e_values)])
-        if 1.5 <= a <= 6.5
-    ]
-    e_oswald_vlm = float(np.mean(e_mid)) if e_mid else (float(np.mean(e_values)) if e_values else 0.82)
+    e_secimi = [e for alfa, e in e_noktalari if 1.5 <= alfa <= 6.5]
+    if not e_secimi:
+        e_secimi = [e for _, e in e_noktalari]
+    e_oswald_vlm = float(np.mean(e_secimi)) if e_secimi else 0.82
     peak_cl_ratio = float(np.mean(peak_ratios)) if peak_ratios else 1.07
 
     if flap_orani > 1e-4 and strip_limit_ratios:
@@ -463,6 +470,7 @@ def numpy_3d_vlm_coz(
 
     return {
         "cozucu": "numpy_3d_vlm",
+        "kuvvet_kapsami": "kanat",
         "CL_alpha_3d_per_deg": round(slope_per_deg, 6),
         "alpha_L0_deg": round(alpha_l0_vlm, 4),
         "e_oswald": round(e_oswald_vlm, 5),
@@ -484,113 +492,112 @@ def aerosandbox_vlm_coz(
     flap_aciklik_orani: float = 0.0,
     alpha_l0_flap_2d_deg: Optional[float] = None,
     cl_max_flap_2d: Optional[float] = None,
+    ek_geometri: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """AeroSandbox VortexLatticeMethod çözücüsü (flapsız ve flaplı kesit destekli)."""
-    try:
-        import aerosandbox as asb  # type: ignore
-    except ImportError:
-        return numpy_3d_vlm_coz(
-            b_w=b_w,
-            c_w=c_w,
-            s_w=s_w,
-            b_ht=b_ht,
-            c_ht=c_ht,
-            tail_arm=tail_arm,
-            alpha_l0_2d_deg=alpha_l0_2d_deg,
-            cl_max_2d=cl_max_2d,
-            flap_aciklik_orani=flap_aciklik_orani,
-            alpha_l0_flap_2d_deg=alpha_l0_flap_2d_deg,
-            cl_max_flap_2d=cl_max_flap_2d,
+    """AeroSandbox VLM ağını adayın gerçek temiz, flaplı ve kuyruk profilleriyle kur."""
+    import aerosandbox as asb
+
+    geometri = ek_geometri or {}
+    profil = str(geometri.get("profil", "")).strip()
+    if not profil:
+        raise ValueError("AeroSandbox kanat profilini almak için ek_geometri['profil'] gerekli.")
+
+    def profil_oku(ad: str, flapli: bool = False):
+        ad = Path(ad).stem
+        klasor = "airfoils_flap" if flapli else "airfoils"
+        polar_klasoru = Path(FLAP_POLAR_KLASORU if flapli else POLAR_KLASORU)
+        yollar = (polar_klasoru.parent / klasor / f"{ad}.dat", SCRIPT_DIR / klasor / f"{ad}.dat")
+        yol = next((aday for aday in yollar if aday.is_file()), None)
+        if yol is None:
+            raise FileNotFoundError(f"AeroSandbox profil dosyası bulunamadı: {yollar[0]}")
+        airfoil = asb.Airfoil(name=ad, coordinates=yol)
+        if airfoil.coordinates is None or len(airfoil.coordinates) < 3:
+            raise ValueError(f"AeroSandbox profil koordinatları eksik: {yol}")
+        return airfoil
+
+    def yuzey(ad, x, y_baslangic, y_bitis, veter, airfoil):
+        return asb.Wing(
+            name=ad, symmetric=True,
+            xsecs=[
+                asb.WingXSec(xyz_le=[x, y_baslangic, 0.0], chord=veter, airfoil=airfoil),
+                asb.WingXSec(xyz_le=[x, y_bitis, 0.0], chord=veter, airfoil=airfoil),
+            ],
         )
 
     flap_orani = float(np.clip(flap_aciklik_orani, 0.0, 1.0))
-    alpha_l0_flap_deg = (
-        float(alpha_l0_flap_2d_deg)
-        if alpha_l0_flap_2d_deg is not None
-        else float(alpha_l0_2d_deg)
-    )
-    cl_max_flap_kesit = (
-        float(cl_max_flap_2d)
-        if (cl_max_flap_2d is not None and cl_max_flap_2d > 0.1)
-        else float(cl_max_2d)
-    )
+    flapli_mi = flap_orani > 1e-4
+    yari_aciklik = 0.5 * b_w
+    wings = []
+    if flapli_mi:
+        flap_profil = str(geometri.get("flap_profil") or f"{profil}_flap")
+        flap_son = yari_aciklik * flap_orani
+        wings.append(yuzey("FlappedWing", 0.0, 0.0, flap_son, c_w, profil_oku(flap_profil, flapli=True)))
+        if flap_son < yari_aciklik:
+            wings.append(yuzey("CleanOuterWing", 0.0, flap_son, yari_aciklik, c_w, profil_oku(profil)))
+    else:
+        wings.append(yuzey("MainWing", 0.0, 0.0, yari_aciklik, c_w, profil_oku(profil)))
 
-    try:
-        delta_flap_twist = float(alpha_l0_2d_deg - alpha_l0_flap_deg) if flap_orani > 1e-4 else 0.0
-        if 0.05 < flap_orani < 0.98:
-            y_flap = 0.5 * b_w * flap_orani
-            xsecs = [
-                asb.WingXSec(xyz_le=[0.0, 0.0, 0.0], chord=c_w, twist=delta_flap_twist),
-                asb.WingXSec(xyz_le=[0.0, y_flap, 0.0], chord=c_w, twist=delta_flap_twist),
-                asb.WingXSec(xyz_le=[0.0, 0.5 * b_w, 0.0], chord=c_w, twist=0.0),
-            ]
-        else:
-            xsecs = [
-                asb.WingXSec(xyz_le=[0.0, 0.0, 0.0], chord=c_w, twist=delta_flap_twist),
-                asb.WingXSec(xyz_le=[0.0, 0.5 * b_w, 0.0], chord=c_w, twist=delta_flap_twist),
-            ]
+    kanat_yuzey_sayisi = len(wings)
+    if b_ht > 0.05 and c_ht > 0.02 and tail_arm > 0.1:
+        x_ht = 0.25 * c_w + tail_arm - 0.25 * c_ht
+        kuyruk_profil = str(geometri.get("kuyruk_profil") or "naca0010")
+        wings.append(yuzey("HTail", x_ht, 0.0, 0.5 * b_ht, c_ht, profil_oku(kuyruk_profil)))
 
-        wings = [asb.Wing(name="MainWing", symmetric=True, xsecs=xsecs)]
-        if b_ht > 0.05 and c_ht > 0.02 and tail_arm > 0.1:
-            wings.append(
-                asb.Wing(
-                    name="HTail",
-                    symmetric=True,
-                    xsecs=[
-                        asb.WingXSec(xyz_le=[tail_arm, 0.0, 0.0], chord=c_ht, twist=0.0),
-                        asb.WingXSec(xyz_le=[tail_arm, 0.5 * b_ht, 0.0], chord=c_ht, twist=0.0),
-                    ],
-                )
-            )
-        airplane = asb.Airplane(name="CandidateAircraft", wings=wings)
-        alphas = (0.0, 4.0)
-        cls: List[float] = []
-        cdi_list: List[float] = []
-        for a_deg in alphas:
-            vlm = asb.VortexLatticeMethod(
-                airplane=airplane,
-                op_point=asb.OperatingPoint(velocity=20.0, alpha=float(a_deg - alpha_l0_2d_deg)),
-                spanwise_resolution=12,
-                chordwise_resolution=4,
-            )
-            res = vlm.run()
-            cls.append(float(res["CL"]))
-            cdi_list.append(float(res["CDi"]))
-
-        cl_alpha_per_deg = max((cls[1] - cls[0]) / (alphas[1] - alphas[0]), 1e-4)
-        alpha_l0_eff = float(alpha_l0_2d_deg - flap_orani * delta_flap_twist)
-        ar_w = (b_w ** 2) / max(s_w, 1e-6)
-        if abs(cls[1]) > 0.05 and cdi_list[1] > 1e-6:
-            e_oswald = float(np.clip((cls[1] ** 2) / (math.pi * ar_w * cdi_list[1]), 0.50, 0.98))
-        else:
-            e_oswald = 0.82
-
-        cl_max_eff_2d = flap_orani * cl_max_flap_kesit + (1.0 - flap_orani) * float(cl_max_2d)
-        cl_max_3d_tahmini = cl_max_eff_2d * (0.90 if flap_orani > 1e-4 else 0.92)
-
-        return {
-            "cozucu": "aerosandbox_vlm",
-            "CL_alpha_3d_per_deg": round(cl_alpha_per_deg, 6),
-            "alpha_L0_deg": round(alpha_l0_eff, 4),
-            "e_oswald": round(e_oswald, 5),
-            "CL_max_3d_tahmini": round(cl_max_3d_tahmini, 5),
-            "peak_cl_ratio": 1.087,
-            "flap_aciklik_orani": round(flap_orani, 4),
-        }
-    except Exception:
-        return numpy_3d_vlm_coz(
-            b_w=b_w,
-            c_w=c_w,
-            s_w=s_w,
-            b_ht=b_ht,
-            c_ht=c_ht,
-            tail_arm=tail_arm,
-            alpha_l0_2d_deg=alpha_l0_2d_deg,
-            cl_max_2d=cl_max_2d,
-            flap_aciklik_orani=flap_aciklik_orani,
-            alpha_l0_flap_2d_deg=alpha_l0_flap_2d_deg,
-            cl_max_flap_2d=cl_max_flap_2d,
+    airplane = asb.Airplane(name="CandidateAircraft", wings=wings, s_ref=s_w, b_ref=b_w, c_ref=c_w)
+    alphas = (0.0, 4.0)
+    n_span, n_chord = 12, 4
+    # AeroSandbox kuvvet panellerini uçak nesnesindeki yüzey sırasıyla birleştirir.
+    panel_sayilari = [
+        (len(wing.xsecs) - 1) * n_span * n_chord * (2 if wing.symmetric else 1)
+        for wing in wings
+    ]
+    kanat_panel_sayisi = sum(panel_sayilari[:kanat_yuzey_sayisi])
+    cls: List[float] = []
+    cds: List[float] = []
+    for alfa in alphas:
+        # VLM ağı kamburluğu zaten içerir. Polar kaynaklı alfa_L0 yalnızca çıkan eğrinin kesişiminde kullanılır.
+        vlm = asb.VortexLatticeMethod(
+            airplane=airplane,
+            op_point=asb.OperatingPoint(velocity=20.0, alpha=alfa),
+            spanwise_resolution=n_span,
+            chordwise_resolution=n_chord,
         )
+        vlm.run()
+        kuvvetler = np.asarray(vlm.forces_geometry, dtype=float)
+        if kuvvetler.shape != (sum(panel_sayilari), 3):
+            raise ValueError(f"AeroSandbox panel kuvvetleri geometriyle uyuşmuyor: {profil}.")
+        kanat_kuvveti = kuvvetler[:kanat_panel_sayisi].sum(axis=0)
+        ruzgar_ekseninde = vlm.op_point.convert_axes(*kanat_kuvveti, from_axes="geometry", to_axes="wind")
+        referans = float(vlm.op_point.dynamic_pressure()) * s_w
+        cls.append(-float(ruzgar_ekseninde[2]) / referans)
+        cds.append(-float(ruzgar_ekseninde[0]) / referans)
+
+    cl_alpha_per_deg = (cls[1] - cls[0]) / (alphas[1] - alphas[0])
+    if not all(math.isfinite(deger) for deger in (*cls, *cds)) or cl_alpha_per_deg <= 0:
+        raise ValueError(f"AeroSandbox geçerli bir CL/CD eğrisi üretemedi: {profil}.")
+
+    alpha_l0_flap = alpha_l0_2d_deg if alpha_l0_flap_2d_deg is None else alpha_l0_flap_2d_deg
+    alpha_l0_eff = (1.0 - flap_orani) * alpha_l0_2d_deg + flap_orani * alpha_l0_flap
+    ar_w = b_w ** 2 / max(s_w, 1e-6)
+    if abs(cls[1]) > 0.05 and cds[1] > 1e-6:
+        e_oswald = float(np.clip(cls[1] ** 2 / (math.pi * ar_w * cds[1]), 0.50, 0.98))
+    else:
+        e_oswald = 0.82
+
+    cl_max_flap = cl_max_flap_2d if cl_max_flap_2d is not None and cl_max_flap_2d > 0.1 else cl_max_2d
+    cl_max_eff_2d = (1.0 - flap_orani) * cl_max_2d + flap_orani * cl_max_flap
+    cl_max_3d_tahmini = cl_max_eff_2d * (0.90 if flapli_mi else 0.92)
+
+    return {
+        "cozucu": "aerosandbox_vlm",
+        "kuvvet_kapsami": "kanat",
+        "CL_alpha_3d_per_deg": round(cl_alpha_per_deg, 6),
+        "alpha_L0_deg": round(alpha_l0_eff, 4),
+        "e_oswald": round(e_oswald, 5),
+        "CL_max_3d_tahmini": round(cl_max_3d_tahmini, 5),
+        "peak_cl_ratio": 1.087,
+        "flap_aciklik_orani": round(flap_orani, 4),
+    }
 
 
 def vspaero_cli_coz(
@@ -643,6 +650,12 @@ def vspaero_cli_coz(
         if VSPAERO_RICHARDSON:
             _coz = vspaero_api_coz_richardson
             _ek = {"n_kaba": VSPAERO_RICHARDSON[0], "n_ince": VSPAERO_RICHARDSON[1]}
+        model_anahtari = ek.get("model_anahtari")
+        if model_anahtari:
+            _ek["geometri_etiketi"] = model_anahtari
+        flap_profil = str(ek.get("flap_profil", f"{profil}_flap"))
+        if flap_aciklik_orani > 1e-4 and flap_profil != f"{profil}_flap":
+            _ek["flap_profil"] = flap_profil
         return _coz(
             **_ek,
             e_kaynagi=VSPAERO_E_KAYNAGI,    # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
@@ -723,6 +736,7 @@ def _secilen_vlm_cozucu_cagir(
         )
     if motor == "aerosandbox":
         return aerosandbox_vlm_coz(
+            ek_geometri=ek_geometri,
             b_w=b_w,
             c_w=c_w,
             s_w=s_w,
@@ -764,11 +778,10 @@ def _profil_normalize(profil: str) -> str:
     return p
 
 
-def _geometri_anahtari(row: Dict[str, Any]) -> Tuple[str, float, float, float]:
+def _kanat_anahtari(row: Dict[str, Any]) -> Tuple[str, float, float, float]:
     """
     Aday satırından `(temel_profil, b_w, s_w, c_w)` geometrik anahtarını üretir.
-    Bazı tablolarda `c_w_m` kolonu bulunmadığından `b_w > 0` ve `s_w > 0` olduğunda
-    `c_w = round(s_w / b_w, 4)` üzerinden tüm CSV'ler arasında %100 tutarlı anahtar üretilir.
+    CSV ön süzmesinde ve eksik geometri sütunları olan kaynakların eşleştirilmesinde kullanılır.
     """
     profil = _profil_normalize(metin_al(row, "kanat_airfoil", "profil", varsayilan=""))
     b_w = round(sayi_al(row, "b_w_m", "aciklik_m", varsayilan=0.0), 4)
@@ -781,97 +794,159 @@ def _geometri_anahtari(row: Dict[str, Any]) -> Tuple[str, float, float, float]:
     return (profil, b_w, s_w, c_w)
 
 
-def _tasarim_geometrisini_dogrula(
-    adaylar: List[Dict[str, Any]],
-    kutleler: List[Dict[str, Any]],
-    llt_flapsiz: List[Dict[str, Any]],
-    llt_flapli: List[Dict[str, Any]],
-) -> None:
-    """Aynı kanat anahtarının farklı kuyruk/gövde tasarımlarını gizlemesini önle."""
-    sayisal_alanlar = {
-        "govde_D_m": ("govde_D_m",),
-        "govde_L_m": ("govde_L_toplam_m", "govde_L_m", "govde_uzunlugu_m", "L_govde_m"),
-        "govde_S_toplam_m2": ("govde_S_toplam_m2",),
-        "govde_V_su_m3": ("govde_V_su_m3",),
-        "tail_arm_m": ("tail_arm_m",),
-        "S_HT_m2": ("S_HT_m2",),
-        "b_HT_m": ("b_HT_m",),
-        "c_HT_m": ("c_root_HT_m", "c_HT_m"),
-        "S_VT_m2": ("S_VT_m2",),
-        "h_VT_m": ("h_VT_m",),
-        "c_VT_m": ("c_root_VT_m", "c_VT_m"),
-        "b_flap_m": ("b_flap_m",),
-    }
-    metin_alanlar = ("kuyruk_airfoil", "flap_airfoil")
+# Ön süzme kanat ölçüleriyle yapılır. Çözüm anahtarı kuyruk, gövde ve flap
+# ölçülerini de taşır. Böylece aynı kanadı kullanan farklı düzenler ayrı
+# çözülür ve LLT ile drag tablolarında doğru adaya bağlanır.
+GeometriAnahtari = Tuple[str, float, float, float, Tuple[Tuple[str, Any], ...]]
+GeometriKimligi = Tuple[str, str]
+GeometriGrubu = Tuple[GeometriAnahtari, GeometriKimligi]
 
-    def imza(row: Dict[str, Any]) -> Dict[str, Any]:
-        sonuc: Dict[str, Any] = {}
-        for ad, takma_adlar in sayisal_alanlar.items():
-            deger = next((row[k] for k in takma_adlar
-                          if k in row and row[k] is not None and str(row[k]).strip()), None)
-            if deger is not None:
-                sayi = float(deger)
-                if not math.isfinite(sayi):
-                    raise ValueError(f"Geometri alanı sonlu değil: {ad}")
-                sonuc[ad] = sayi
-        for ad in metin_alanlar:
-            if row.get(ad) is not None and str(row[ad]).strip():
-                sonuc[ad] = Path(str(row[ad])).stem.strip().lower()
-        return sonuc
+_GEOMETRI_OLCULERI = {
+    "b_w_m": ("b_w_m", "aciklik_m"),
+    "S_w_m2": ("S_w_m2", "alan_m2"),
+    "c_w_m": ("c_w_m", "c_root_w_m", "veter_m"),
+    "c_tip_w_m": ("c_tip_w_m",),
+    "govde_D_m": ("govde_D_m", "D_govde_m"),
+    "govde_L_m": ("govde_L_toplam_m", "govde_L_m", "govde_uzunlugu_m", "L_govde_m"),
+    "govde_S_toplam_m2": ("govde_S_toplam_m2",),
+    "govde_V_su_m3": ("govde_V_su_m3",),
+    "tail_arm_m": ("tail_arm_m",),
+    "S_HT_m2": ("S_HT_m2",),
+    "b_HT_m": ("b_HT_m",),
+    "c_HT_m": ("c_root_HT_m", "c_HT_m"),
+    "S_VT_m2": ("S_VT_m2",),
+    "h_VT_m": ("h_VT_m",),
+    "c_VT_m": ("c_root_VT_m", "c_VT_m"),
+    "b_flap_m": ("b_flap_m",),
+    "flap_aciklik_orani": ("flap_aciklik_orani",),
+}
+_GEOMETRI_PROFILLERI = ("kuyruk_airfoil", "flap_airfoil")
 
-    indeksler: Dict[str, Dict[Tuple[str, float, float, float], Tuple[int, Dict[str, Any]]]] = {}
-    for kaynak, satirlar in (("VLM adayları", adaylar), ("kütle tablosu", kutleler),
-                             ("flapsız LLT", llt_flapsiz), ("flaplı LLT", llt_flapli)):
-        indeks: Dict[Tuple[str, float, float, float], Tuple[int, Dict[str, Any]]] = {}
-        for no, row in enumerate(satirlar, start=2):
-            key = _geometri_anahtari(row)
-            if not key[0] or key[1] <= 0:
+
+def _geometri_anahtari(row: Dict[str, Any]) -> GeometriAnahtari:
+    """Kaynakta bulunan kanat, kuyruk, gövde ve flap ölçülerini kanat anahtarına ekle."""
+    alanlar: Dict[str, Any] = {}
+    for ad, takma_adlar in _GEOMETRI_OLCULERI.items():
+        for kolon in takma_adlar:
+            ham = row.get(kolon)
+            if ham is None or str(ham).strip() == "":
                 continue
-            degerler = imza(row)
-            if key in indeks:
-                ilk_no, ilk = indeks[key]
-                for ad in ilk.keys() | degerler.keys():
-                    a, b = ilk.get(ad), degerler.get(ad)
-                    es = (math.isclose(a, b, rel_tol=1e-7, abs_tol=1e-8)
-                          if isinstance(a, float) and isinstance(b, float) else a == b)
-                    if not es:
-                        raise ValueError(
-                            f"{kaynak}: aynı kanat geometrisinde farklı {ad} "
-                            f"(satır {ilk_no}: {a!r}, satır {no}: {b!r}); "
-                            "adayları ayrı geometri olarak tanımlayın."
-                        )
-            else:
-                indeks[key] = no, degerler
-        indeksler[kaynak] = indeks
+            deger = float(ham)
+            if not math.isfinite(deger):
+                raise ValueError(f"Geometri alanı sonlu değil: {kolon}")
+            alanlar[ad] = deger
+            break
+    for ad in _GEOMETRI_PROFILLERI:
+        ham = row.get(ad)
+        if ham is not None and str(ham).strip():
+            alanlar[ad] = Path(str(ham).strip()).stem.lower()
+    return (*_kanat_anahtari(row), tuple(sorted(alanlar.items())))
 
-    # Kaynaklar farklı sütun kümeleri taşıyabilir; ortak fiziksel ölçüler eşleşmeli.
-    for sol, sag in (("VLM adayları", "kütle tablosu"),
-                     ("kütle tablosu", "flapsız LLT"),
-                     ("kütle tablosu", "flaplı LLT")):
-        for key in indeksler[sol].keys() & indeksler[sag].keys():
-            a = indeksler[sol][key][1]
-            b = indeksler[sag][key][1]
-            for ad in a.keys() & b.keys():
-                x, y = a[ad], b[ad]
-                es = (math.isclose(x, y, rel_tol=1e-7, abs_tol=1e-8)
-                      if isinstance(x, float) and isinstance(y, float) else x == y)
-                if not es:
-                    raise ValueError(f"{sol} ve {sag}: {key} için {ad} çelişiyor ({x!r}, {y!r}).")
+
+def _geometri_kimligi(row: Dict[str, Any]) -> GeometriKimligi:
+    return (metin_al(row, "konfigurasyon_id").strip().lower(),
+            metin_al(row, "temel_aday_id").strip().lower())
+
+
+def _geometri_satirlarini_grupla(
+    satirlar: Iterable[Dict[str, Any]],
+) -> Dict[GeometriGrubu, List[Dict[str, Any]]]:
+    gruplar: Dict[GeometriGrubu, List[Dict[str, Any]]] = {}
+    for row in satirlar:
+        key = _geometri_anahtari(row)
+        if key[0] and key[1] > 0:
+            gruplar.setdefault((key, _geometri_kimligi(row)), []).append(row)
+    return gruplar
+
+
+def _geometri_farklari(sol: GeometriAnahtari, sag: GeometriAnahtari) -> List[str]:
+    farklar = []
+    if sol[0] != sag[0]:
+        farklar.append("kanat_airfoil")
+    for alan, a, b in zip(("b_w_m", "S_w_m2"), sol[1:3], sag[1:3]):
+        if not math.isclose(a, b, rel_tol=0.0, abs_tol=1e-3):
+            farklar.append(alan)
+    sol_olcu, sag_olcu = dict(sol[4]), dict(sag[4])
+    for ad in sorted(sol_olcu.keys() & sag_olcu.keys()):
+        a, b = sol_olcu[ad], sag_olcu[ad]
+        uyumlu = (math.isclose(a, b, rel_tol=1e-7, abs_tol=6e-6)
+                   if isinstance(a, float) and isinstance(b, float) else a == b)
+        if not uyumlu:
+            farklar.append(ad)
+    return farklar
+
+
+def _geometri_grubu_sec(
+    key: GeometriAnahtari, kimlik: GeometriKimligi,
+    secenekler: Iterable[GeometriGrubu], kaynak: str,
+) -> List[GeometriGrubu]:
+    """Kimliği ve ortak fiziksel ölçüleri doğrula, birden fazla tasarımı reddet."""
+    gruplar = list(secenekler)
+    kimlik_eslesmesi = []
+    for i, deger in enumerate(kimlik):
+        if deger:
+            kimlik_eslesmesi = [grup for grup in gruplar if grup[1][i] == deger]
+            if kimlik_eslesmesi:
+                gruplar = kimlik_eslesmesi
+                break
+
+    if not kimlik_eslesmesi:
+        gruplar = [grup for grup in gruplar if not any(a and b for a, b in zip(kimlik, grup[1]))]
+    uygun = [grup for grup in gruplar if not _geometri_farklari(key, grup[0])]
+    if not uygun and kimlik_eslesmesi:
+        alanlar = sorted({alan for grup in gruplar for alan in _geometri_farklari(key, grup[0])})
+        raise ValueError(f"{kaynak}: {kimlik} kimliği için geometri çelişkisi: {', '.join(alanlar)}.")
+
+    tam_kanat = [grup for grup in uygun if grup[0][:4] == key[:4]]
+    eslesenler = tam_kanat or uygun
+    if len({grup[0] for grup in eslesenler}) > 1:
+        raise ValueError(
+            f"{kaynak}: {kimlik} / {key[:4]} için birden fazla geometri eşleşti. "
+            "Kesin aday kimliği veya ayırt edici geometri ölçüleri gerekli."
+        )
+    return eslesenler
+
+
+def _geometriyi_tamamla(
+    key: GeometriAnahtari, kaynaklar: Iterable[GeometriGrubu],
+) -> GeometriAnahtari:
+    alanlar = dict(key[4])
+    for kaynak_key, _ in kaynaklar:
+        for ad, deger in kaynak_key[4]:
+            alanlar.setdefault(ad, deger)
+    return (*key[:4], tuple(sorted(alanlar.items())))
+
+
+def _vlm_geometri_eslesmesi(
+    vlm_haritasi: Dict[GeometriAnahtari, Dict[str, Any]],
+    kaynak: GeometriGrubu,
+) -> Optional[Tuple[GeometriAnahtari, Dict[str, Any]]]:
+    key, kimlik = kaynak
+    secenekler = [
+        (g_key if len(g_key) == 5 else (*g_key, ()), aday_kimligi)
+        for g_key, vlm in vlm_haritasi.items()
+        for aday_kimligi in vlm.get("geometri_kimlikleri", (("", ""),))
+    ]
+    eslesen = _geometri_grubu_sec(key, kimlik, secenekler, "VLM tablosu")
+    if not eslesen:
+        return None
+    g_key = eslesen[0][0]
+    if g_key in vlm_haritasi:
+        return g_key, vlm_haritasi[g_key]
+    # Dört alanlı eski VLM haritalarının tüketicileri için.
+    return g_key, vlm_haritasi[g_key[:4]]
 
 
 def _vlm_eslesmesi_bul(
-    vlm_haritasi: Dict[Tuple[str, float, float, float], Dict[str, Any]],
-    g_key: Tuple[str, float, float, float],
+    vlm_haritasi: Dict[GeometriAnahtari, Dict[str, Any]], row: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    """Geometri anahtarını doğrudan veya `(profil, round(b_w, 3), round(s_w, 3))` toleransıyla bulur."""
-    dogrudan = vlm_haritasi.get(g_key)
-    if dogrudan is not None:
-        return dogrudan
-    p, bw, sw, _ = g_key
-    for k, v in vlm_haritasi.items():
-        if k[0] == p and abs(k[1] - bw) <= 1e-3 and abs(k[2] - sw) <= 1e-3:
-            return v
-    return None
+    if isinstance(row, tuple):
+        key = row if len(row) == 5 else (*row, ())
+        kaynak = (key, ("", ""))
+    else:
+        kaynak = (_geometri_anahtari(row), _geometri_kimligi(row))
+    eslesme = _vlm_geometri_eslesmesi(vlm_haritasi, kaynak)
+    return eslesme[1] if eslesme else None
 
 
 def _re_dugumu(row: Dict[str, Any]) -> int:
@@ -879,6 +954,85 @@ def _re_dugumu(row: Dict[str, Any]) -> int:
     if not math.isfinite(re) or re <= 0 or abs(re - round(re)) > 1e-3:
         raise ValueError(f"Geçersiz LLT Reynolds düğümü: {re}")
     return round(re)
+
+
+def _llt_re_dugumlerini_indeksle(
+    satirlar: Iterable[Dict[str, Any]], kaynak: str, key: GeometriAnahtari,
+) -> Dict[int, Dict[str, Any]]:
+    """Bir düğümün sabit katsayıları ve tekrarlanan açı noktaları tutarlı olmalı."""
+    sayisal_alanlar = {
+        "CL_alpha_3d_per_deg": ("CL_alpha_3d_per_deg",),
+        "alpha_L0_deg": ("alpha_L0_deg",),
+        "CL_max_3d_tahmini": ("CL_max_3d_tahmini",),
+        "e_oswald": ("e_oswald", "e_w"),
+        "alpha_stall_2d_deg": ("alpha_stall_2d_deg",),
+        "CL_max_2d": ("CL_max_2d",),
+        "a0_2d_per_deg": ("a0_2d_per_deg",),
+    }
+    metin_alanlar = ("Re_durumu", "polar_dosyasi")
+    indeks: Dict[int, Dict[str, Any]] = {}
+    imzalar: Dict[int, Tuple[int, Dict[str, Any]]] = {}
+    noktalar: Dict[Tuple[int, float], Tuple[int, float]] = {}
+
+    for no, row in enumerate(satirlar, start=2):
+        re = _re_dugumu(row)
+        konum = f"{kaynak}, geometri={key}, Re={re}, satır {no}"
+
+        def sonlu_sayi(ham: str, alan: str) -> float:
+            try:
+                deger = float(ham.replace(",", "."))
+            except ValueError as exc:
+                raise ValueError(f"{konum}: geçersiz {alan}={ham!r}.") from exc
+            if not math.isfinite(deger):
+                raise ValueError(f"{konum}: sonlu olmayan {alan}={ham!r}.")
+            return deger
+
+        imza: Dict[str, Any] = {}
+        for alan, takma_adlar in sayisal_alanlar.items():
+            ham = metin_al(row, *takma_adlar)
+            imza[alan] = sonlu_sayi(ham, alan) if ham else None
+        for alan in metin_alanlar:
+            imza[alan] = metin_al(row, alan)
+
+        onceki_no, onceki_imza = imzalar.setdefault(re, (no, imza))
+        for alan, deger in imza.items():
+            onceki = onceki_imza[alan]
+            if deger != onceki:
+                raise ValueError(
+                    f"{konum}: çelişen {alan} "
+                    f"(satır {onceki_no}: {onceki!r}, satır {no}: {deger!r})."
+                )
+
+        ham_cl = metin_al(row, "CL")
+        if ham_cl:
+            alpha = sonlu_sayi(metin_al(row, "alpha_deg"), "alpha_deg")
+            cl = sonlu_sayi(ham_cl, "CL")
+            onceki_no, onceki_cl = noktalar.setdefault((re, alpha), (no, cl))
+            if not math.isclose(cl, onceki_cl, rel_tol=1e-9, abs_tol=1e-10):
+                raise ValueError(
+                    f"{konum}: alpha={alpha:g} için çelişen CL "
+                    f"(satır {onceki_no}: {onceki_cl:g}, satır {no}: {cl:g})."
+                )
+
+        referans = {ad: deger for ad, deger in imza.items() if deger is not None}
+        indeks.setdefault(re, referans)
+
+    return indeks
+
+
+def _csv_polar_kaynak_bilgisi(
+    alt: Dict[str, Any], ust: Dict[str, Any], agirlik: float,
+) -> Dict[str, Any]:
+    """Tam düğümün veya ara değerlemenin iki tarafının polar kaynaklarını yaz."""
+    if "polar_kaynaklari" not in alt:
+        return {}
+    bilgi = {"vlm_Re_alt": alt["Re_aday"], "vlm_Re_ust": ust["Re_aday"], "vlm_Re_agirlik": agirlik}
+    for sinir, dugum in (("alt", alt), ("ust", ust)):
+        for mod, (dosya, stall_tepesi_gorulmedi) in dugum["polar_kaynaklari"].items():
+            kok = f"vlm_polar_{mod}_{sinir}"
+            bilgi[f"{kok}_dosyasi"] = dosya
+            bilgi[f"{kok}_stall_tepesi_gorulmedi"] = stall_tepesi_gorulmedi
+    return bilgi
 
 
 def _re_vlm_sonucu(vlm: Dict[str, Any], re: float, flapli_mi: bool) -> Dict[str, Any]:
@@ -889,7 +1043,8 @@ def _re_vlm_sonucu(vlm: Dict[str, Any], re: float, flapli_mi: bool) -> Dict[str,
         return vlm  # Eski harita biçimiyle geriye dönük uyumluluk.
     re = float(re)
     if re in dugumler:
-        return dugumler[re]
+        dugum = dugumler[re]
+        return {**dugum, "csv_polar_kaynagi": _csv_polar_kaynak_bilgisi(dugum, dugum, 0.0)}
     sayilar = sorted(dugumler)
     if not sayilar[0] <= re <= sayilar[-1]:
         raise ValueError(f"VLM {alan} Reynolds aralığı dışında: {re}")
@@ -900,6 +1055,7 @@ def _re_vlm_sonucu(vlm: Dict[str, Any], re: float, flapli_mi: bool) -> Dict[str,
     for k, v in dugumler[ust].items():
         if k in sonuc and isinstance(v, (float, int)) and not isinstance(v, bool) and isinstance(sonuc[k], (float, int)):
             sonuc[k] = float(sonuc[k]) + oran * (float(v) - float(sonuc[k]))
+    sonuc["csv_polar_kaynagi"] = _csv_polar_kaynak_bilgisi(dugumler[alt], dugumler[ust], oran)
     return sonuc
 
 
@@ -912,61 +1068,111 @@ def ilk_500_aday_vlm_analizi(
     n_chord: int = 4,
     kutle_satirlari: Optional[List[Dict[str, Any]]] = None,
     geometri_limiti: int = 0,
-) -> Dict[Tuple[str, float, float, float], Dict[str, Any]]:
+) -> Dict[GeometriAnahtari, Dict[str, Any]]:
     """Her geometri ve LLT Reynolds düğümü için ilgili 2B polarıyla VLM çöz."""
-    _tasarim_geometrisini_dogrula(
-        vlm_aday_satirlari, kutle_satirlari or [],
-        llt_flapsiz_satirlar, llt_flapli_satirlar or [],
-    )
+    temiz_gruplar = _geometri_satirlarini_grupla(llt_flapsiz_satirlar)
+    flap_gruplar = _geometri_satirlarini_grupla(llt_flapli_satirlar or [])
+    kutle_gruplari = _geometri_satirlarini_grupla(kutle_satirlari or [])
+    cozum_girdileri: Dict[GeometriAnahtari, Tuple[Set[GeometriKimligi], Set[GeometriGrubu], Set[GeometriGrubu]]] = {}
+
+    for row in vlm_aday_satirlari:
+        key = _geometri_anahtari(row)
+        if not key[0] or key[1] <= 0:
+            continue
+        kimlik = _geometri_kimligi(row)
+        kutle_eslesen = _geometri_grubu_sec(key, kimlik, kutle_gruplari, "Kütle tablosu")
+        if kutle_eslesen:
+            # Kütle tablosu kuyruk kolu ve boyutları için tam hassasiyetli kaynaktır.
+            kutle_key = (*key[:4], kutle_eslesen[0][0][4])
+            key = _geometriyi_tamamla(kutle_key, [(key, kimlik)])
+        elif kutle_gruplari:
+            raise ValueError(f"Kütle tablosunda adayın geometrisi eşleşmedi: {kimlik}, {key[:4]}.")
+
+        temiz_eslesen = _geometri_grubu_sec(key, kimlik, temiz_gruplar, "Flapsız LLT")
+        if not temiz_eslesen:
+            raise ValueError(f"VLM için temiz LLT Reynolds düğümleri eksik: {kimlik}, {key[:4]}.")
+        key = _geometriyi_tamamla(key, temiz_eslesen)
+        flap_eslesen = _geometri_grubu_sec(key, kimlik, flap_gruplar, "Flaplı LLT")
+        if not flap_eslesen and flap_gruplar:
+            raise ValueError(f"VLM için flaplı LLT Reynolds düğümleri eksik: {kimlik}, {key[:4]}.")
+        key = _geometriyi_tamamla(key, flap_eslesen)
+
+        olculer = dict(key[4])
+        profil, b_w, _, c_w = key[:4]
+        b_w = olculer.get("b_w_m", b_w)
+        govde_l = olculer.get("govde_L_m", 0.0)
+        olculer.setdefault("tail_arm_m", 0.55 * (govde_l if govde_l > 0 else 1.5))
+        olculer.setdefault("c_w_m", c_w)
+        olculer.setdefault("kuyruk_airfoil", "naca0010")
+        olculer.setdefault("flap_airfoil", f"{profil}_flap")
+        flap_orani = olculer.get("flap_aciklik_orani")
+        olculer.setdefault("b_flap_m", b_w * flap_orani if flap_orani is not None else min(1.0, b_w))
+        if flap_orani is not None and not math.isclose(olculer["b_flap_m"] / b_w, flap_orani, abs_tol=6e-6):
+            raise ValueError(f"Flap açıklığı ve açıklık oranı uyuşmuyor: {kimlik}, {key[:4]}.")
+        olculer["flap_aciklik_orani"] = olculer["b_flap_m"] / b_w
+        c_ht = olculer.get("c_HT_m", 0.0)
+        olculer.setdefault("b_HT_m", olculer.get("S_HT_m2", 0.0) / c_ht if c_ht > 0 else 0.0)
+        key = (*key[:4], tuple(sorted(olculer.items())))
+        if key not in cozum_girdileri and geometri_limiti > 0 and len(cozum_girdileri) >= geometri_limiti:
+            continue
+        kimlikler, temiz_kaynaklar, flap_kaynaklar = cozum_girdileri.setdefault(key, (set(), set(), set()))
+        kimlikler.add(kimlik)
+        temiz_kaynaklar.update(temiz_eslesen)
+        flap_kaynaklar.update(flap_eslesen)
+
+    # Bir kaynak satırı iki farklı tasarıma atanırsa sonraki çıktı da belirsiz olur.
+    for kaynak_no, etiket in ((1, "Flapsız LLT"), (2, "Flaplı LLT")):
+        atamalar: Dict[GeometriGrubu, GeometriAnahtari] = {}
+        for key, girdiler in cozum_girdileri.items():
+            for kaynak in girdiler[kaynak_no]:
+                if atamalar.setdefault(kaynak, key) != key:
+                    raise ValueError(f"{etiket}: {kaynak[1]} için aynı kaynak birden fazla tasarıma ait.")
+
     motor = kullanilabilir_vlm_motoru_sec(cozucu_tercihi)
     print(f"[VLM] Seçilen 3B VLM çözücü motoru: {motor}")
     temiz_polarlar = polar_klasorunu_indeksle(POLAR_KLASORU)
     flap_polarlar = polar_klasorunu_indeksle(FLAP_POLAR_KLASORU)
-    temiz_llt: Dict[Tuple[str, float, float, float], Dict[int, Dict[str, Any]]] = {}
-    flap_llt: Dict[Tuple[str, float, float, float], Dict[int, Dict[str, Any]]] = {}
-    for satirlar, indeks in ((llt_flapsiz_satirlar, temiz_llt), (llt_flapli_satirlar or [], flap_llt)):
-        for row in satirlar:
-            key = _geometri_anahtari(row)
-            if key[0] and key[1] > 0:
-                indeks.setdefault(key, {}).setdefault(_re_dugumu(row), row)
-    kutle_indeks = {}
-    for row in kutle_satirlari or []:
-        kutle_indeks.setdefault(_geometri_anahtari(row), row)
     sonuc = {}
-    for row in vlm_aday_satirlari:
-        key = _geometri_anahtari(row)
-        if not key[0] or key[1] <= 0 or key in sonuc:
-            continue
-        if geometri_limiti > 0 and len(sonuc) >= geometri_limiti:
-            break
-        profil, b_w, s_w, c_w = key
-        temiz_dugum = temiz_llt.get(key, {})
-        flap_dugum = flap_llt.get(key) or temiz_dugum
-        if not temiz_dugum:
-            raise ValueError(f"VLM için temiz LLT Reynolds düğümleri eksik: {key}")
+    for key, (kimlikler, temiz_kaynaklar, flap_kaynaklar) in cozum_girdileri.items():
+        profil, b_w, s_w, _ = key[:4]
+        olculer = dict(key[4])
+        b_w = olculer.get("b_w_m", b_w)
+        s_w = olculer.get("S_w_m2", s_w)
+        c_w = olculer["c_w_m"]
+        temiz_dugum = _llt_re_dugumlerini_indeksle(
+            (r for grup in temiz_gruplar if grup in temiz_kaynaklar for r in temiz_gruplar[grup]),
+            "Flapsız LLT", key,
+        )
+        flap_dugum = _llt_re_dugumlerini_indeksle(
+            (r for grup in flap_gruplar if grup in flap_kaynaklar for r in flap_gruplar[grup]),
+            "Flaplı LLT", key,
+        ) if flap_kaynaklar else temiz_dugum
+        flap_profil = olculer["flap_airfoil"]
         temiz_polar = profil_re_haritasi_al(temiz_polarlar, profil)
-        flap_profil = metin_al(next(iter(flap_dugum.values())), "flap_airfoil", varsayilan=f"{profil}_flap")
         flap_polar = profil_re_haritasi_al(flap_polarlar, flap_profil)
-        ilk_llt = temiz_dugum[min(temiz_dugum)]
-        s_ht = sayi_al(row, "S_HT_m2", varsayilan=sayi_al(ilk_llt, "S_HT_m2", varsayilan=0.0))
-        c_ht = sayi_al(row, "c_HT_m", "c_root_HT_m", varsayilan=sayi_al(ilk_llt, "c_HT_m", "c_root_HT_m", varsayilan=0.0))
-        b_ht = s_ht / c_ht if s_ht > 0 and c_ht > 0 else sayi_al(row, "b_HT_m", varsayilan=0.0)
-        govde_l = sayi_al(row, "govde_L_m", "govde_uzunlugu_m", "L_govde_m", varsayilan=1.5)
-        tail_arm = 0.55 * (govde_l if govde_l > 0 else 1.5)
-        kutle = kutle_indeks.get(key, {})
+        b_ht = olculer["b_HT_m"]
+        c_ht = olculer.get("c_HT_m", 0.0)
+        tail_arm = olculer["tail_arm_m"]
+        if all(ad in olculer for ad in ("S_HT_m2", "b_HT_m", "c_HT_m")) and not math.isclose(
+            b_ht * c_ht, olculer["S_HT_m2"], rel_tol=1e-5, abs_tol=6e-6,
+        ):
+            raise ValueError(f"Yatay kuyruk alanı açıklık ve veterle uyuşmuyor: {key}.")
+        geometri_id = hashlib.sha256(repr(key).encode("utf-8")).hexdigest()[:16]
         ek_geometri = {
             "profil": profil,
-            "tail_arm": sayi_al(kutle, "tail_arm_m", varsayilan=tail_arm),
-            "b_ht": sayi_al(kutle, "b_HT_m", varsayilan=b_ht),
-            "c_ht": sayi_al(kutle, "c_root_HT_m", "c_HT_m", varsayilan=c_ht),
-            "kuyruk_profil": Path(metin_al(kutle, "kuyruk_airfoil", varsayilan="naca0010")).stem,
-            "govde_D": sayi_al(kutle, "govde_D_m", varsayilan=0.0),
-            "govde_L": sayi_al(kutle, "govde_L_toplam_m", "govde_L_m", varsayilan=0.0),
+            "flap_profil": flap_profil,
+            "tail_arm": tail_arm,
+            "b_ht": b_ht,
+            "c_ht": c_ht,
+            "kuyruk_profil": olculer["kuyruk_airfoil"],
+            "govde_D": olculer.get("govde_D_m", 0.0),
+            "govde_L": olculer.get("govde_L_m", 0.0),
+            "model_anahtari": geometri_id,
         }
-        b_flap = sayi_al(row, "b_flap_m", varsayilan=sayi_al(next(iter(flap_dugum.values())), "b_flap_m", varsayilan=min(1.0, b_w)))
-        if b_flap <= 0:
-            b_flap = min(1.0, b_w)
-        oran_flap = float(np.clip(b_flap / b_w, 0.0, 1.0))
+        b_flap = olculer["b_flap_m"]
+        if not 0 < b_flap <= b_w:
+            raise ValueError(f"Geçersiz flap açıklığı: {key}, b_flap_m={b_flap:g}.")
+        oran_flap = b_flap / b_w
         temiz_polar_ref = min(temiz_dugum, key=lambda r: (abs(r - 250000), r))
         flap_polar_ref = min(flap_dugum, key=lambda r: (abs(r - 250000), r))
         re_temiz = {}
@@ -986,7 +1192,12 @@ def ilk_500_aday_vlm_analizi(
                 hesap["alpha_L0_deg"] = float(hesap["alpha_L0_deg"]) + (
                     float(pol["alpha_L0_deg"]) - float(temiz_polar[temiz_polar_ref]["alpha_L0_deg"])
                 )
-            re_temiz[re] = {**hesap, "Re_aday": re, "polar_dosyasi": str(pol["dosya_yolu"])}
+            re_temiz[re] = {
+                **hesap, "Re_aday": re, "polar_dosyasi": str(pol["dosya_yolu"]),
+                "polar_kaynaklari": {
+                    "flapsiz": (str(pol["dosya_yolu"]), pol.get("stall_tepesi_gorulmedi")),
+                },
+            }
         re_flap = {}
         for re in sorted(flap_dugum):
             if re not in temiz_polar or re not in flap_polar:
@@ -1014,7 +1225,11 @@ def ilk_500_aday_vlm_analizi(
                 hesap["alpha_L0_deg"] = temiz_a0 + eta * (ham_a0 - temiz_a0)
             re_flap[re] = {
                 **hesap, "Re_aday": re, "polar_dosyasi": str(fpol["dosya_yolu"]),
-                "b_flap_m": b_flap, "flap_aciklik_orani": oran_flap,
+                "polar_kaynaklari": {
+                    "flapsiz": (str(pol["dosya_yolu"]), pol.get("stall_tepesi_gorulmedi")),
+                    "flapli": (str(fpol["dosya_yolu"]), fpol.get("stall_tepesi_gorulmedi")),
+                },
+                "b_flap_m": b_flap, "flap_aciklik_orani": oran_flap, "flap_airfoil": flap_profil,
                 "CL_alpha_3d_flapli_per_deg": float(hesap["CL_alpha_3d_per_deg"]),
                 "alpha_L0_flapli_deg": float(hesap["alpha_L0_deg"]),
                 "alpha_L0_flapli_ham_deg": ham_a0,
@@ -1038,6 +1253,8 @@ def ilk_500_aday_vlm_analizi(
             "re_flapsiz": re_temiz, "re_flapli": re_flap,
             "referans_re_flapsiz": temiz_ref_re, "referans_re_flapli": flap_ref_re,
             "b_flap_m": b_flap, "flap_aciklik_orani": oran_flap,
+            "flap_airfoil": flap_profil, "geometri_kimlikleri": kimlikler,
+            "vlm_geometri_id": geometri_id, "tail_arm_m": tail_arm,
             "CL_alpha_llt": sayi_al(llt_ref, "CL_alpha_3d_per_deg"),
             "e_oswald_llt": sayi_al(llt_ref, "e_oswald", "e_w"),
             "CL_max_3d_llt": sayi_al(llt_ref, "CL_max_3d_tahmini"),
@@ -1061,11 +1278,17 @@ def ilk_500_aday_vlm_analizi(
 # 3. Flapsız ve Flaplı LLT / Drag Tablolarının VLM İle Güncellenmesi
 # ---------------------------------------------------------------------------
 
+def _vlm_geometri_alanlarini_yaz(row: Dict[str, Any], vlm: Dict[str, Any]) -> None:
+    if "vlm_geometri_id" in vlm:
+        row["vlm_geometri_id"] = vlm["vlm_geometri_id"]
+        row["tail_arm_m"] = vlm["tail_arm_m"]
+
+
 def _tek_mod_tablolari_guncelle(
     llt_satirlar: List[Dict[str, Any]],
     drag_polar_satirlar: List[Dict[str, Any]],
     drag_ozet_satirlar: List[Dict[str, Any]],
-    vlm_haritasi: Dict[Tuple[str, float, float, float], Dict[str, Any]],
+    vlm_haritasi: Dict[GeometriAnahtari, Dict[str, Any]],
     flapli_mi: bool = False,
     sadece_vlm_adaylari: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -1081,7 +1304,15 @@ def _tek_mod_tablolari_guncelle(
     egri_gruplari: Dict[Tuple[Any, ...], List[Tuple[float, float]]] = {}
     egri_parametreleri: Dict[Tuple[Any, ...], Optional[Tuple[float, float, float, float]]] = {}
 
-    def _egri_anahtari(row: Dict[str, Any], g_key: Tuple[str, float, float, float]) -> Tuple[Any, ...]:
+    eslesme_onbellegi: Dict[GeometriGrubu, Optional[Tuple[GeometriAnahtari, Dict[str, Any]]]] = {}
+
+    def eslesme_bul(row: Dict[str, Any]) -> Optional[Tuple[GeometriAnahtari, Dict[str, Any]]]:
+        kaynak = (_geometri_anahtari(row), _geometri_kimligi(row))
+        if kaynak not in eslesme_onbellegi:
+            eslesme_onbellegi[kaynak] = _vlm_geometri_eslesmesi(vlm_haritasi, kaynak)
+        return eslesme_onbellegi[kaynak]
+
+    def _egri_anahtari(row: Dict[str, Any], g_key: GeometriAnahtari) -> Tuple[Any, ...]:
         return (g_key, metin_al(row, "temel_aday_id", varsayilan=""), metin_al(row, "konfigurasyon_id", varsayilan=""),
                 metin_al(row, "hiz_ms", varsayilan=""), metin_al(row, "Re_aday", varsayilan=""))
 
@@ -1097,9 +1328,10 @@ def _tek_mod_tablolari_guncelle(
         return "dogrusal" if flapli_mi else "kaydir"
 
     for row in llt_satirlar:
-        g_key = _geometri_anahtari(row)
-        if _vlm_eslesmesi_bul(vlm_haritasi, g_key) is None or str(row.get("CL", "")).strip() == "":
+        eslesme = eslesme_bul(row)
+        if eslesme is None or str(row.get("CL", "")).strip() == "":
             continue
+        g_key, _ = eslesme
         egri_gruplari.setdefault(_egri_anahtari(row, g_key), []).append(
             (sayi_al(row, "alpha_deg", varsayilan=0.0), sayi_al(row, "CL", varsayilan=0.0)))
 
@@ -1163,16 +1395,18 @@ def _tek_mod_tablolari_guncelle(
         return linear + correction
 
     yeni_llt: List[Dict[str, Any]] = []
+    egri_indeksi: Dict[GeometriAnahtari, Dict[float, Dict[float, float]]] = {}
     for row in llt_satirlar:
-        g_key = _geometri_anahtari(row)
-        vlm = _vlm_eslesmesi_bul(vlm_haritasi, g_key)
-        if vlm is None:
+        eslesme = eslesme_bul(row)
+        if eslesme is None:
             if not sadece_vlm_adaylari:
                 yeni_llt.append(dict(row))
             continue
 
-        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
+        g_key, vlm = eslesme
         r_copy = dict(row)
+        _vlm_geometri_alanlarini_yaz(r_copy, vlm)
+        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
         r_copy["e_oswald"] = f"{float(vlm[e_key]):.6f}"
         r_copy["CL_alpha_3d_per_deg"] = f"{float(vlm[cl_alpha_key]):.6f}"
         if "CL_alpha_3d_kanat_per_deg" in r_copy:
@@ -1183,9 +1417,10 @@ def _tek_mod_tablolari_guncelle(
         r_copy["CL_max_3d_tahmini"] = f"{float(vlm[cl_max_key]):.6f}"
         r_copy["alpha_stall_2d_deg"] = f"{float(vlm[alpha_l0_key]) + float(vlm[cl_max_key]) / float(vlm[cl_alpha_key]):.6f}"
         r_copy["aero_modeli"] = "vlm_tek_egri_v1"
+        r_copy.update(vlm.get("csv_polar_kaynagi", {}))
         if flapli_mi:
             if "flap_airfoil" not in r_copy or not str(r_copy.get("flap_airfoil", "")).strip():
-                r_copy["flap_airfoil"] = f"{g_key[0]}_flap"
+                r_copy["flap_airfoil"] = vlm.get("flap_airfoil", f"{g_key[0]}_flap")
             if "b_flap_m" not in r_copy or not str(r_copy.get("b_flap_m", "")).strip():
                 r_copy["b_flap_m"] = f"{float(vlm['b_flap_m']):.4f}"
         if "CL" in r_copy and str(r_copy["CL"]).strip() != "":
@@ -1193,19 +1428,16 @@ def _tek_mod_tablolari_guncelle(
         for alan in ("CL_flapsiz_kisim", "CL_flapli_kisim", "CL_kanat"):
             r_copy.pop(alan, None)
         yeni_llt.append(r_copy)
-
-    # Drag polarları aynı LLT eğrisinden, ilgili Reynolds düğümleri arasında hesaplanır.
-    egri_indeksi: Dict[Tuple[str, float, float, float], Dict[float, Dict[float, float]]] = {}
-    for row in yeni_llt:
-        if str(row.get("CL", "")).strip():
-            curve = egri_indeksi.setdefault(_geometri_anahtari(row), {}).setdefault(float(row["Re_aday"]), {})
-            alpha = float(row["alpha_deg"])
-            cl = float(row["CL"])
+        if str(r_copy.get("CL", "")).strip():
+            curve = egri_indeksi.setdefault(g_key, {}).setdefault(float(r_copy["Re_aday"]), {})
+            alpha = float(r_copy["alpha_deg"])
+            cl = float(r_copy["CL"])
             if alpha in curve and not math.isclose(curve[alpha], cl, abs_tol=2e-6):
                 raise ValueError("Aynı geometri/Re/alpha için çelişen VLM CL eğrileri.")
             curve[alpha] = cl
 
-    def _polar_cl(row: Dict[str, Any], g_key: Tuple[str, float, float, float]) -> float:
+    # Drag polarları eşleşen geometrinin LLT eğrisinden hesaplanır.
+    def _polar_cl(row: Dict[str, Any], g_key: GeometriAnahtari) -> float:
         nodes = egri_indeksi.get(g_key)
         if not nodes:
             raise ValueError(f"Drag polar için VLM LLT eğrisi yok: {g_key}")
@@ -1228,15 +1460,16 @@ def _tek_mod_tablolari_guncelle(
 
     yeni_drag_polar: List[Dict[str, Any]] = []
     for row in drag_polar_satirlar:
-        g_key = _geometri_anahtari(row)
-        vlm = _vlm_eslesmesi_bul(vlm_haritasi, g_key)
-        if vlm is None:
+        eslesme = eslesme_bul(row)
+        if eslesme is None:
             if not sadece_vlm_adaylari:
                 yeni_drag_polar.append(dict(row))
             continue
 
-        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
+        g_key, vlm = eslesme
         r_copy = dict(row)
+        _vlm_geometri_alanlarini_yaz(r_copy, vlm)
+        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
         ar_w = sayi_al(r_copy, "AR_w", varsayilan=(g_key[1] ** 2) / max(g_key[2], 1e-6))
         if ar_w <= 0.0:
             ar_w = 6.0
@@ -1251,6 +1484,7 @@ def _tek_mod_tablolari_guncelle(
         r_copy["alpha_L0_deg"] = f"{float(vlm[alpha_l0_key]):.4f}"
         r_copy["CL_max_3d_tahmini"] = f"{float(vlm[cl_max_key]):.6f}"
         r_copy["aero_modeli"] = "vlm_tek_egri_v1"
+        r_copy.update(vlm.get("csv_polar_kaynagi", {}))
         if "CL" in r_copy:
             r_copy["CL"] = f"{cl_yeni:.6f}"
         if "CD_i" in r_copy:
@@ -1263,15 +1497,16 @@ def _tek_mod_tablolari_guncelle(
 
     yeni_drag_ozet: List[Dict[str, Any]] = []
     for row in drag_ozet_satirlar:
-        g_key = _geometri_anahtari(row)
-        vlm = _vlm_eslesmesi_bul(vlm_haritasi, g_key)
-        if vlm is None:
+        eslesme = eslesme_bul(row)
+        if eslesme is None:
             if not sadece_vlm_adaylari:
                 yeni_drag_ozet.append(dict(row))
             continue
 
-        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
+        g_key, vlm = eslesme
         r_copy = dict(row)
+        _vlm_geometri_alanlarini_yaz(r_copy, vlm)
+        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
         ar_w = sayi_al(r_copy, "AR_w", varsayilan=(g_key[1] ** 2) / max(g_key[2], 1e-6))
         if ar_w <= 0.0:
             ar_w = 6.0
@@ -1289,6 +1524,7 @@ def _tek_mod_tablolari_guncelle(
         r_copy["alpha_L0_deg"] = f"{float(vlm[alpha_l0_key]):.4f}"
         r_copy["CL_max_3d_tahmini"] = f"{float(vlm[cl_max_key]):.6f}"
         r_copy["aero_modeli"] = "vlm_tek_egri_v1"
+        r_copy.update(vlm.get("csv_polar_kaynagi", {}))
         if "CL_seyir" in r_copy:
             r_copy["CL_seyir"] = f"{cl_seyir:.6f}"
         if "CD_i_seyir" in r_copy:
@@ -1304,7 +1540,7 @@ def _tek_mod_tablolari_guncelle(
 
 def _flapsizdan_flapli_llt_olustur(
     llt_flapsiz_satirlar: List[Dict[str, Any]],
-    vlm_haritasi: Dict[Tuple[str, float, float, float], Dict[str, Any]],
+    vlm_haritasi: Dict[GeometriAnahtari, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
     Diskte `llt_flapli_coklu_re.csv` bulunmadığında veya eksik olduğunda,
@@ -1314,14 +1550,13 @@ def _flapsizdan_flapli_llt_olustur(
     """
     uretilen: List[Dict[str, Any]] = []
     for row in llt_flapsiz_satirlar:
-        g_key = _geometri_anahtari(row)
-        vlm = _vlm_eslesmesi_bul(vlm_haritasi, g_key)
+        vlm = _vlm_eslesmesi_bul(vlm_haritasi, row)
         if vlm is None:
             continue
-        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), True)
         r_copy = dict(row)
-        profil_temel = g_key[0]
-        r_copy["flap_airfoil"] = f"{profil_temel}_flap"
+        _vlm_geometri_alanlarini_yaz(r_copy, vlm)
+        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), True)
+        r_copy["flap_airfoil"] = vlm.get("flap_airfoil", f"{_kanat_anahtari(row)[0]}_flap")
         r_copy["b_flap_m"] = f"{float(vlm['b_flap_m']):.4f}"
         r_copy["flap_aciklik_orani"] = f"{float(vlm['flap_aciklik_orani']):.4f}"
         r_copy["e_oswald"] = f"{float(vlm['e_oswald_flapli']):.6f}"
@@ -1334,6 +1569,7 @@ def _flapsizdan_flapli_llt_olustur(
         r_copy["CL_max_3d_tahmini"] = f"{float(vlm['CL_max_3d_flapli_tahmini']):.6f}"
         r_copy["alpha_stall_2d_deg"] = f"{float(vlm['alpha_L0_flapli_deg']) + float(vlm['CL_max_3d_flapli_tahmini']) / float(vlm['CL_alpha_3d_flapli_per_deg']):.6f}"
         r_copy["aero_modeli"] = "vlm_tek_egri_v1"
+        r_copy.update(vlm.get("csv_polar_kaynagi", {}))
         if "CL" in r_copy and str(r_copy["CL"]).strip() != "":
             alpha_deg = sayi_al(r_copy, "alpha_deg", varsayilan=0.0)
             cl_yeni = min(float(vlm["CL_max_3d_flapli_tahmini"]), float(vlm["CL_alpha_3d_flapli_per_deg"]) * (
@@ -1347,7 +1583,7 @@ def _flapsizdan_flapli_llt_olustur(
 
 
 def llt_ve_drag_tablolari_vlm_ile_guncelle(
-    vlm_haritasi: Dict[Tuple[str, float, float, float], Dict[str, Any]],
+    vlm_haritasi: Dict[GeometriAnahtari, Dict[str, Any]],
     llt_satirlari: List[Dict[str, Any]],
     drag_polar_satirlari: List[Dict[str, Any]],
     drag_ozet_satirlari: List[Dict[str, Any]],
@@ -1367,7 +1603,7 @@ def llt_ve_drag_tablolarini_vlm_ile_guncelle(
     llt_flapsiz_satirlar: List[Dict[str, Any]],
     drag_polar_satirlar: List[Dict[str, Any]],
     drag_ozet_satirlar: List[Dict[str, Any]],
-    vlm_haritasi: Dict[Tuple[str, float, float, float], Dict[str, Any]],
+    vlm_haritasi: Dict[GeometriAnahtari, Dict[str, Any]],
     llt_flapli_satirlar: Optional[List[Dict[str, Any]]] = None,
     drag_polar_flapli_satirlar: Optional[List[Dict[str, Any]]] = None,
     drag_ozet_flapli_satirlar: Optional[List[Dict[str, Any]]] = None,
@@ -1423,45 +1659,87 @@ def llt_ve_drag_tablolarini_vlm_ile_guncelle(
 # 4. Performans Modüllerinin VLM Çıktılarıyla Gerçekten Baştan Çalıştırılması
 # ---------------------------------------------------------------------------
 
+class VLMKutleEslesmeHatasi(ValueError):
+    """Seçilen konfigürasyon için kütle verisi eksik veya belirsiz."""
+
+
 def _ilk_500_icin_kutle_tablosunu_suz(
     tum_kutle_satirlari: List[Dict[str, Any]],
     ilk_500_satirlar: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """
-    `kanat_kuyruk_govde_kutleli.csv` içinden yalnızca `vlm_ilk_500_aday.csv`
-    listesinde yer alan adayların kütle satırlarını süzer.
-    """
-    hedef_konfig_idler: Set[str] = set()
-    hedef_aday_nolar: Set[str] = set()
-    hedef_geometriler: Set[Tuple[str, float, float]] = set()
+    """Hedef sırasını koruyarak konfigürasyon başına tek kütle satırı seç."""
+    if not ilk_500_satirlar:
+        raise VLMKutleEslesmeHatasi("VLM aday listesi boş.")
 
-    for r in ilk_500_satirlar:
-        konf_id = metin_al(r, "konfigurasyon_id", varsayilan="").strip()
-        if konf_id:
-            hedef_konfig_idler.add(konf_id)
-        for id_kol in ("temel_aday_id", "aday_no", "aday_id"):
-            deger = metin_al(r, id_kol, varsayilan="").strip()
-            if deger:
-                hedef_aday_nolar.add(deger)
-        g_key = _geometri_anahtari(r)
-        if g_key[0]:
-            hedef_geometriler.add((g_key[0], round(g_key[1], 3), round(g_key[2], 3)))
+    konfigurasyonlar: Dict[str, List[int]] = {}
+    aday_pervaneleri: Dict[Tuple[str, str], List[int]] = {}
+    for i, row in enumerate(tum_kutle_satirlari):
+        konfigurasyon = metin_al(row, "konfigurasyon_id")
+        temel_aday = metin_al(row, "temel_aday_id")
+        pervane = metin_al(row, "pervane")
+        if konfigurasyon:
+            konfigurasyonlar.setdefault(konfigurasyon, []).append(i)
+        if temel_aday and pervane:
+            aday_pervaneleri.setdefault((temel_aday, pervane), []).append(i)
 
-    suzulen: List[Dict[str, Any]] = []
-    for row in tum_kutle_satirlari:
-        konf_id = metin_al(row, "konfigurasyon_id", varsayilan="").strip()
-        aday_no = metin_al(row, "temel_aday_id", "aday_no", "aday_id", varsayilan="").strip()
-        g_key = _geometri_anahtari(row)
-        g_uclu = (g_key[0], round(g_key[1], 3), round(g_key[2], 3))
+    secilen: List[Dict[str, Any]] = []
+    kullanilan_satirlar: Set[int] = set()
+    for no, aday in enumerate(ilk_500_satirlar, start=2):
+        konfigurasyon = metin_al(aday, "konfigurasyon_id")
+        temel_aday = metin_al(aday, "temel_aday_id")
+        pervane = metin_al(aday, "pervane")
+        # Konfigürasyon mevcutsa pervane varyantı bu kimlikle seçilir.
+        # Kimlik sütunu boş olan eski adaylarda temel aday ve pervane birlikte gerekir.
+        if konfigurasyon:
+            etiket = f"konfigurasyon_id={konfigurasyon!r}"
+            eslesenler = konfigurasyonlar.get(konfigurasyon, [])
+        elif temel_aday and pervane:
+            etiket = f"temel_aday_id={temel_aday!r}, pervane={pervane!r}"
+            eslesenler = aday_pervaneleri.get((temel_aday, pervane), [])
+        else:
+            raise VLMKutleEslesmeHatasi(
+                f"VLM aday listesi satır {no}: konfigurasyon_id veya temel_aday_id ve pervane gerekli."
+            )
 
-        if (
-            (konf_id and konf_id in hedef_konfig_idler)
-            or (aday_no and aday_no in hedef_aday_nolar)
-            or (g_key[0] and g_uclu in hedef_geometriler)
-        ):
-            suzulen.append(row)
+        if not eslesenler:
+            raise VLMKutleEslesmeHatasi(f"VLM aday listesi satır {no}: {etiket} için kütle kaydı bulunamadı.")
+        if len(eslesenler) != 1:
+            satirlar = ", ".join(str(i + 2) for i in eslesenler)
+            raise VLMKutleEslesmeHatasi(
+                f"VLM aday listesi satır {no}: {etiket} için birden fazla kütle kaydı var (satırlar {satirlar})."
+            )
 
-    return suzulen if suzulen else list(tum_kutle_satirlari)
+        i = eslesenler[0]
+        row = tum_kutle_satirlari[i]
+        kaynak_konfigurasyonu = metin_al(row, "konfigurasyon_id")
+        if kaynak_konfigurasyonu and len(konfigurasyonlar[kaynak_konfigurasyonu]) != 1:
+            raise VLMKutleEslesmeHatasi(
+                f"VLM aday listesi satır {no}: kütle tablosunda "
+                f"konfigurasyon_id={kaynak_konfigurasyonu!r} için birden fazla kütle kaydı var."
+            )
+        for alan, beklenen in (("temel_aday_id", temel_aday), ("pervane", pervane)):
+            bulunan = metin_al(row, alan)
+            if beklenen and bulunan and beklenen != bulunan:
+                raise VLMKutleEslesmeHatasi(
+                    f"VLM aday listesi satır {no}: {etiket} için kütle satırında "
+                    f"{alan} çelişiyor ({beklenen!r} / {bulunan!r})."
+                )
+        if i in kullanilan_satirlar:
+            raise VLMKutleEslesmeHatasi(f"VLM aday listesi satır {no}: {etiket} için yinelenen seçim.")
+        kullanilan_satirlar.add(i)
+        secilen.append(row)
+    return secilen
+
+
+def _vlm_kutle_satirlarini_oku(
+    kaynak: str, ilk_500_satirlar: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    yol = dosya_yolu_coz(kaynak)
+    try:
+        tum_kutle_satirlari = csv_oku(yol)
+    except (OSError, ValueError, csv.Error) as exc:
+        raise VLMKutleEslesmeHatasi(f"Kütle tablosu okunamadı ({yol}): {exc}") from exc
+    return _ilk_500_icin_kutle_tablosunu_suz(tum_kutle_satirlari, ilk_500_satirlar)
 
 
 @contextlib.contextmanager
@@ -1484,9 +1762,14 @@ def _seyir_dosya_yonlendirici(
 
     def _vlm_find_csv_file(filename: str, required: bool = True) -> Any:
         aranan_ad = Path(str(filename)).name.lower()
-        if aranan_ad in norm_harita and norm_harita[aranan_ad].is_file():
-            return norm_harita[aranan_ad]
-        return orijinal_find(filename, required=required)
+        yol = norm_harita.get(aranan_ad)
+        if yol is None:
+            return orijinal_find(filename, required=required)
+        if yol.is_file():
+            return yol
+        if required:
+            raise FileNotFoundError(f"Bu çalışmanın VLM girdisi bulunamadı: {yol}")
+        return None
 
     setattr(seyir_modulu, "find_csv_file", _vlm_find_csv_file)
     try:
@@ -1495,42 +1778,111 @@ def _seyir_dosya_yonlendirici(
         setattr(seyir_modulu, "find_csv_file", orijinal_find)
 
 
+class VLMPerformansHatasi(RuntimeError):
+    def __init__(self, faz: str, hata_turu: str, mesaj: str, cikis_kodu: Optional[int] = None):
+        super().__init__(f"{faz}: {mesaj}")
+        self.faz = faz
+        self.hata_turu = hata_turu
+        self.mesaj = mesaj
+        self.cikis_kodu = cikis_kodu
+
+
+def _performans_fazini_calistir(
+    modul_adi: str, cikti: Path, calistir: Callable[[Any], Any],
+) -> None:
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(stderr):
+            modul = importlib.import_module(modul_adi)
+            sonuc = calistir(modul)
+    except SystemExit as exc:
+        mesaj = stderr.getvalue().strip() or f"Modül işlemi durdurdu (kod={exc.code})."
+        kod = exc.code if isinstance(exc.code, int) else None
+        raise VLMPerformansHatasi(modul_adi, "SystemExit", mesaj, kod) from exc
+    except Exception as exc:
+        mesaj = stderr.getvalue().strip()
+        ayrinti = f"{exc}\n{mesaj}".strip()
+        raise VLMPerformansHatasi(modul_adi, type(exc).__name__, ayrinti) from exc
+
+    mesaj = stderr.getvalue().strip()
+    if isinstance(sonuc, int) and sonuc != 0:
+        raise VLMPerformansHatasi(modul_adi, "cikis_kodu", mesaj or f"Modül {sonuc} kodunu döndürdü.", sonuc)
+    if not cikti.is_file() or cikti.stat().st_size == 0:
+        ayrinti = f"Modül geçerli bir çıktı oluşturmadı: {cikti.name}."
+        if mesaj:
+            ayrinti += f"\n{mesaj}"
+        raise VLMPerformansHatasi(modul_adi, "eksik_cikti", ayrinti)
+    if mesaj:
+        print(mesaj, file=sys.stderr)
+
+
 def performans_modullerini_vlm_ile_calistir(
     vlm_klasoru: Path,
     vlm_dosya_yollari: Dict[str, Path],
     ilk_500_satirlar: List[Dict[str, Any]],
     args: argparse.Namespace,
+    vlm_haritasi: Optional[Dict[GeometriAnahtari, Dict[str, Any]]] = None,
+    secilen_kutle_satirlari: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Path]:
     """
     Kalkış, tırmanış, seyir, yük bırakma ve iniş performans modüllerini
     VLM çıktılarıyla (kalkış ve iniş için flaplı VLM; tırmanış, seyir ve
     yük bırakma için flapsız VLM) gerçekten baştan çalıştırır.
     """
-    import inis_hesabi_deneme  # type: ignore
-    import kalkis_hesabi  # type: ignore
-    import seyir_deneme  # type: ignore
-    import tirmanis_hesabi  # type: ignore
-    import yuk_birakma  # type: ignore
+    if secilen_kutle_satirlari is None:
+        vlm_kutle_satirlari = _vlm_kutle_satirlarini_oku(args.kutle, ilk_500_satirlar)
+    else:
+        vlm_kutle_satirlari = _ilk_500_icin_kutle_tablosunu_suz(secilen_kutle_satirlari, ilk_500_satirlar)
+    if vlm_haritasi is not None:
+        vlm_kutle_satirlari = [dict(row) for row in vlm_kutle_satirlari]
+        for row in vlm_kutle_satirlari:
+            kimlik = _aday_kimlik_anahtari(row)[1]
+            try:
+                vlm = _vlm_eslesmesi_bul(vlm_haritasi, row)
+            except ValueError as exc:
+                raise VLMKutleEslesmeHatasi(f"{kimlik}: kütle/VLM geometrisi eşleşmedi ({exc}).") from exc
+            if vlm is None:
+                raise VLMKutleEslesmeHatasi(f"{kimlik}: seçilen kütle kaydının VLM çözümü yok.")
+            if "vlm_geometri_id" in vlm:
+                row["vlm_geometri_id"] = vlm["vlm_geometri_id"]
 
-    kutle_kaynak_yolu = dosya_yolu_coz(args.kutle)
     itki_yolu = dosya_yolu_coz(args.itki)
+    vlm_klasoru.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="vlm_faz_", dir=vlm_klasoru) as gecici:
+        faz_klasoru = Path(gecici)
+        faz_ciktilari = _vlm_performans_fazlarini_calistir(
+            faz_klasoru, vlm_dosya_yollari, itki_yolu, vlm_kutle_satirlari,
+        )
+        # Hesap bu çalışmaya ait dosyaları kullanır. Yalnız tamamlanan faz seti yayımlanır.
+        for ad in ("vlm_yuk_birakma_sonuclari_fazlar.csv", "vlm_yuk_birakma_sonuclari_saniyelik.csv"):
+            if (vlm_klasoru / ad).is_file() and not (faz_klasoru / ad).exists():
+                (faz_klasoru / ad).write_text(
+                    "durum,aciklama\nveri_yok,Aday ozetindeki hatalara bakin.\n", encoding="utf-8-sig",
+                )
+        for yol in faz_klasoru.iterdir():
+            yol.replace(vlm_klasoru / yol.name)
+        return {ad: vlm_klasoru / yol.name for ad, yol in faz_ciktilari.items()}
 
-    tum_kutle = csv_oku(kutle_kaynak_yolu)
-    vlm_kutle_satirlari = _ilk_500_icin_kutle_tablosunu_suz(tum_kutle, ilk_500_satirlar)
+
+def _vlm_performans_fazlarini_calistir(
+    vlm_klasoru: Path,
+    vlm_dosya_yollari: Dict[str, Path],
+    itki_yolu: Path,
+    vlm_kutle_satirlari: List[Dict[str, Any]],
+) -> Dict[str, Path]:
     vlm_kutle_yolu = vlm_klasoru / "vlm_kutle_500_aday.csv"
     csv_yaz(vlm_kutle_satirlari, vlm_kutle_yolu)
     print(f"[VLM-MODÜL] Kütle tablosu {len(vlm_kutle_satirlari)} aday için süzüldü: {vlm_kutle_yolu}")
 
-    drag_flapli_yolu = (
-        vlm_dosya_yollari["drag_ozet_flapli"]
-        if vlm_dosya_yollari["drag_ozet_flapli"].is_file()
-        else vlm_dosya_yollari["drag_polar_flapli"]
-    )
-    drag_flapsiz_yolu = (
-        vlm_dosya_yollari["drag_ozet_flapsiz"]
-        if vlm_dosya_yollari["drag_ozet_flapsiz"].is_file()
-        else vlm_dosya_yollari["drag_polar_flapsiz"]
-    )
+    def drag_girdisi(mod: str) -> Path:
+        for tablo in ("ozet", "polar"):
+            yol = vlm_dosya_yollari.get(f"drag_{tablo}_{mod}")
+            if yol is not None and yol.is_file():
+                return yol
+        raise VLMPerformansHatasi("performans_hazirligi", "eksik_girdi", f"VLM drag tablosu eksik: {mod}.")
+
+    drag_flapli_yolu = drag_girdisi("flapli")
+    drag_flapsiz_yolu = drag_girdisi("flapsiz")
 
     cikti_kalkis = vlm_klasoru / "vlm_kalkis_sonuclari.csv"
     cikti_tirmanis = vlm_klasoru / "vlm_tirmanis_sonuclari.csv"
@@ -1549,9 +1901,7 @@ def performans_modullerini_vlm_ile_calistir(
         "--itki", str(itki_yolu),
         "--cikti", str(cikti_kalkis),
     ]
-    kalkis_rc = kalkis_hesabi.main(kalkis_argv)
-    if kalkis_rc not in (0, None) or not cikti_kalkis.is_file():
-        raise RuntimeError(f"kalkis_hesabi başarısız oldu (kod={kalkis_rc})")
+    _performans_fazini_calistir("kalkis_hesabi", cikti_kalkis, lambda modul: modul.main(kalkis_argv))
 
     # 2. Tırmanış Modülü (Flapsız VLM ile)
     print("[VLM-MODÜL] 2/5 Tırmanış modülü (flapsız VLM) çalıştırılıyor...")
@@ -1562,9 +1912,7 @@ def performans_modullerini_vlm_ile_calistir(
         "--itki", str(itki_yolu),
         "--cikti", str(cikti_tirmanis),
     ]
-    tirmanis_rc = tirmanis_hesabi.main(tirmanis_argv)
-    if tirmanis_rc not in (0, None) or not cikti_tirmanis.is_file():
-        raise RuntimeError(f"tirmanis_hesabi başarısız oldu (kod={tirmanis_rc})")
+    _performans_fazini_calistir("tirmanis_hesabi", cikti_tirmanis, lambda modul: modul.main(tirmanis_argv))
 
     # 3. Seyir Modülü (Flapsız VLM + VLM Kalkış ve Tırmanış sonuçlarıyla)
     print("[VLM-MODÜL] 3/5 Seyir ve görev optimizasyon modülü (flapsız VLM) çalıştırılıyor...")
@@ -1572,20 +1920,22 @@ def performans_modullerini_vlm_ile_calistir(
         "kanat_kuyruk_govde_kutleli.csv": vlm_kutle_yolu,
         "itki_tablosu.csv": itki_yolu,
         "llt_flapsiz_coklu_re.csv": vlm_dosya_yollari["llt_flapsiz"],
-        "openvsp_llt_flapsiz_polar_detay.csv": vlm_dosya_yollari["drag_polar_flapsiz"],
-        "openvsp_llt_flapsiz_aday_ozet.csv": vlm_dosya_yollari["drag_ozet_flapsiz"],
+        "openvsp_llt_flapsiz_polar_detay.csv": vlm_dosya_yollari.get("drag_polar_flapsiz", drag_flapsiz_yolu),
+        "openvsp_llt_flapsiz_aday_ozet.csv": drag_flapsiz_yolu,
         "kalkis_sonuclari.csv": cikti_kalkis,
         "tirmanis_sonuclari.csv": cikti_tirmanis,
     }
-    with _seyir_dosya_yonlendirici(seyir_deneme, seyir_yonlendirme):
-        seyir_deneme.run_full_cruise_mission_optimization(
-            tail_csv_path=str(vlm_dosya_yollari["llt_flapsiz"]),
-            llt_csv_path=str(vlm_dosya_yollari["llt_flapsiz"]),
-            strict_re=False,
-            output_path=str(cikti_seyir),
-        )
-    if not cikti_seyir.is_file():
-        raise RuntimeError("seyir_deneme çıktı dosyası oluşturulamadı")
+
+    def seyri_calistir(modul: Any) -> None:
+        with _seyir_dosya_yonlendirici(modul, seyir_yonlendirme):
+            modul.run_full_cruise_mission_optimization(
+                tail_csv_path=str(vlm_dosya_yollari["llt_flapsiz"]),
+                llt_csv_path=str(vlm_dosya_yollari["llt_flapsiz"]),
+                strict_re=False,
+                output_path=str(cikti_seyir),
+            )
+
+    _performans_fazini_calistir("seyir_deneme", cikti_seyir, seyri_calistir)
 
     # 4. Yük Bırakma Modülü (Flapsız VLM ile)
     print("[VLM-MODÜL] 4/5 Yük bırakma modülü (flapsız VLM) çalıştırılıyor...")
@@ -1598,9 +1948,7 @@ def performans_modullerini_vlm_ile_calistir(
         "--faz-cikti", str(cikti_yuk_faz),
         "--saniye-cikti", str(cikti_yuk_saniye),
     ]
-    yuk_rc = yuk_birakma.main(yuk_argv)
-    if yuk_rc not in (0, None) or not cikti_yuk_birakma.is_file():
-        raise RuntimeError(f"yuk_birakma başarısız oldu (kod={yuk_rc})")
+    _performans_fazini_calistir("yuk_birakma", cikti_yuk_birakma, lambda modul: modul.main(yuk_argv))
 
     # 5. İniş Modülü (Flaplı + Flapsız VLM ile)
     print("[VLM-MODÜL] 5/5 İniş modülü (flaplı + flapsız VLM) çalıştırılıyor...")
@@ -1612,9 +1960,7 @@ def performans_modullerini_vlm_ile_calistir(
         "--drag-flapsiz", str(drag_flapsiz_yolu),
         "--cikti", str(cikti_inis),
     ]
-    inis_rc = inis_hesabi_deneme.main(inis_argv)
-    if inis_rc not in (0, None) or not cikti_inis.is_file():
-        raise RuntimeError(f"inis_hesabi_deneme başarısız oldu (kod={inis_rc})")
+    _performans_fazini_calistir("inis_hesabi_deneme", cikti_inis, lambda modul: modul.main(inis_argv))
 
     return {
         "kutle": vlm_kutle_yolu,
@@ -1631,31 +1977,33 @@ def _aday_kimlik_anahtari(row: Dict[str, Any]) -> Tuple[str, str]:
     konf_id = metin_al(row, "konfigurasyon_id", varsayilan="").strip().lower()
     if konf_id:
         return ("konf", konf_id)
-    aday_id = metin_al(row, "temel_aday_id", "aday_no", "aday_id", varsayilan="").strip().lower()
     pervane = metin_al(row, "pervane", varsayilan="").strip().lower()
+    temel_aday = metin_al(row, "temel_aday_id").lower()
+    if temel_aday and pervane:
+        return ("konf", f"{temel_aday}__{pervane}")
+    aday_id = metin_al(row, "temel_aday_id", "aday_no", "aday_id", varsayilan="").strip().lower()
     if aday_id:
         return ("aday_perv", f"{aday_id}::{pervane}")
-    g_key = _geometri_anahtari(row)
-    return ("geom_perv", f"{g_key[0]}_{g_key[1]}_{g_key[2]}_{g_key[3]}::{pervane}")
+    return ("geom_perv", f"{_geometri_anahtari(row)!r}::{pervane}")
 
 
 def _analitik_vlm_yeniden_puanla(
     ilk_500_satirlar: List[Dict[str, Any]],
-    vlm_haritasi: Dict[Tuple[str, float, float, float], Dict[str, Any]],
+    vlm_haritasi: Dict[GeometriAnahtari, Dict[str, Any]],
     args: argparse.Namespace,
 ) -> List[Dict[str, Any]]:
     """
-    Yalnızca `--analitik-olcekleme` bayrağı verildiğinde veya performans modülleri
-    çağrılamadığında kullanılan yedek analitik yeniden puanlama fonksiyonu.
+    Açıkça seçilen `--analitik-olcekleme` modu için LLT sonuçlarından tahmin üret.
     Kalkış ve iniş için flaplı VLM katsayılarını, diğer fazlar için flapsız VLM
     katsayılarını kullanır.
     """
     yeniden_hesaplanan: List[Dict[str, Any]] = []
 
     for idx, row in enumerate(ilk_500_satirlar, start=1):
-        g_key = _geometri_anahtari(row)
-        vlm = _vlm_eslesmesi_bul(vlm_haritasi, g_key) or {}
+        vlm = _vlm_eslesmesi_bul(vlm_haritasi, row) or {}
         kopya = dict(row)
+        kopya.pop("gercek_toplam_tuketim_mAh_vlm", None)
+        kopya.pop("gercek_toplam_enerji_Wh_vlm", None)
 
         eski_sira = int(sayi_al(row, "vlm_sira", "sira", varsayilan=float(idx)))
         eski_toplam_puan = sayi_al(row, "toplam_performans_puani", varsayilan=0.0)
@@ -1740,6 +2088,7 @@ def _analitik_vlm_yeniden_puanla(
 
         kopya.update(
             {
+                "performans_hesap_yontemi": "analitik_olcekleme",
                 "vlm_cozucu": cozucu_adi,
                 "llt_onc_sira": eski_sira,
                 "llt_sira": eski_sira,
@@ -1759,9 +2108,9 @@ def _analitik_vlm_yeniden_puanla(
                 "kalkis_20m_icinde_vlm": kalkis_20m_vlm,
                 "inis_mesafe_m_vlm": inis_mesafe_vlm,
                 "inis_20m_icinde_vlm": inis_20m_vlm,
-                "gercek_toplam_tuketim_mAh_vlm": toplam_mah_vlm,
+                "tahmini_toplam_tuketim_mAh_vlm": toplam_mah_vlm,
                 "kalan_batarya_yuzde_vlm": kalan_batarya_vlm,
-                "gercek_toplam_enerji_Wh_vlm": toplam_enerji_wh_vlm,
+                "tahmini_toplam_enerji_Wh_vlm": toplam_enerji_wh_vlm,
                 "tum_fazlar_uygun_vlm": tum_fazlar_uygun_vlm,
                 "resmi_kalkis_puani_60_vlm": round(puan_kalkis_60_vlm, 4),
                 "puan_M2_yuklu_kalkis_20_vlm": round(puan_kalkis_m2_20_vlm, 4),
@@ -1824,7 +2173,7 @@ def _analitik_vlm_yeniden_puanla(
             0 if r["tum_fazlar_uygun_vlm"] else 1,
             -float(r.get(puan_anahtari, 0.0) or 0.0),
             -sayi_al(r, "tasarim_kalkis_puani_100", varsayilan=0.0),
-            float(r.get("gercek_toplam_enerji_Wh_vlm", 1e9) or 1e9),
+            float(r.get("tahmini_toplam_enerji_Wh_vlm", 1e9) or 1e9),
             sayi_al(r, "toplam_kutle_kg", varsayilan=99.0),
         )
     )
@@ -1838,10 +2187,11 @@ def _analitik_vlm_yeniden_puanla(
 
 def vlm_adaylarini_yeniden_puanla(
     ilk_500_satirlar: List[Dict[str, Any]],
-    vlm_haritasi: Dict[Tuple[str, float, float, float], Dict[str, Any]],
+    vlm_haritasi: Dict[GeometriAnahtari, Dict[str, Any]],
     args: argparse.Namespace,
     vlm_klasoru: Optional[Path] = None,
     vlm_dosya_yollari: Optional[Dict[str, Path]] = None,
+    secilen_kutle_satirlari: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Güncellenen flapsız ve flaplı VLM aerodinamik tablolarıyla tüm performans
@@ -1849,9 +2199,11 @@ def vlm_adaylarini_yeniden_puanla(
     `inis_hesabi_deneme`) gerçekten baştan çalıştırır ve `aday_siralama` üzerinden
     nihai VLM puanlamasını üretir.
     """
-    if getattr(args, "analitik_olcekleme", False) or vlm_klasoru is None or vlm_dosya_yollari is None:
-        print("[VLM] Analitik ölçekleme modu ile yeniden puanlama yapılıyor...")
+    if getattr(args, "analitik_olcekleme", False):
+        print("[VLM] Analitik ölçekleme ile tahmini yeniden puanlama yapılıyor...")
         return _analitik_vlm_yeniden_puanla(ilk_500_satirlar, vlm_haritasi, args)
+    if vlm_klasoru is None or vlm_dosya_yollari is None:
+        raise VLMPerformansHatasi("performans_hazirligi", "eksik_girdi", "VLM çıktı yolları gerekli.")
 
     try:
         modul_ciktilari = performans_modullerini_vlm_ile_calistir(
@@ -1859,13 +2211,13 @@ def vlm_adaylarini_yeniden_puanla(
             vlm_dosya_yollari=vlm_dosya_yollari,
             ilk_500_satirlar=ilk_500_satirlar,
             args=args,
+            vlm_haritasi=vlm_haritasi,
+            secilen_kutle_satirlari=secilen_kutle_satirlari,
         )
+    except (VLMKutleEslesmeHatasi, VLMPerformansHatasi):
+        raise
     except Exception as exc:
-        print(
-            f"[UYARI] Performans modülleri doğrudan çalıştırılırken hata oluştu ({exc}); "
-            "yedek analitik VLM yeniden puanlama moduna geçiliyor."
-        )
-        return _analitik_vlm_yeniden_puanla(ilk_500_satirlar, vlm_haritasi, args)
+        raise VLMPerformansHatasi("performans_hazirligi", type(exc).__name__, str(exc)) from exc
 
     llt_gecmis_haritasi: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for idx, r in enumerate(ilk_500_satirlar, start=1):
@@ -1893,13 +2245,15 @@ def vlm_adaylarini_yeniden_puanla(
     if args.inis_20m_zorunlu:
         siralama_argv.append("--inis-20m-zorunlu")
 
-    siralama_args = siralama_argumanlari_coz(siralama_argv)
-    vlm_sirali_tum, _ = adaylari_degerlendir_ve_sirala(siralama_args)
+    try:
+        siralama_args = siralama_argumanlari_coz(siralama_argv)
+        vlm_sirali_tum, _ = adaylari_degerlendir_ve_sirala(siralama_args)
+    except (Exception, SystemExit) as exc:
+        raise VLMPerformansHatasi("aday_siralama", type(exc).__name__, str(exc)) from exc
 
     nihai_liste: List[Dict[str, Any]] = []
     for yeni_sira, row in enumerate(vlm_sirali_tum, start=1):
-        g_key = _geometri_anahtari(row)
-        vlm = _vlm_eslesmesi_bul(vlm_haritasi, g_key) or {}
+        vlm = _vlm_eslesmesi_bul(vlm_haritasi, row) or {}
         kimlik = _aday_kimlik_anahtari(row)
         eski_bilgi = llt_gecmis_haritasi.get(kimlik, {})
 
@@ -1918,6 +2272,7 @@ def vlm_adaylarini_yeniden_puanla(
         r_copy = dict(row)
         r_copy.update(
             {
+                "performans_hesap_yontemi": "faz_yeniden_hesaplama",
                 "vlm_nihai_sira": yeni_sira,
                 "llt_onc_sira": eski_sira,
                 "llt_sira": eski_sira,
@@ -2031,7 +2386,7 @@ def argumanlari_coz(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--cikti",
         default="vlm_nihai_ucak_siralamasi.csv",
-        help="VLM sonrası nihai uçak sıralaması çıktı CSV dosyası",
+        help="Nihai sıralama CSV dosyası. Analitik mod ayrı bir dosya adı kullanır.",
     )
     parser.add_argument(
         "--vlm-klasoru",
@@ -2098,9 +2453,9 @@ def argumanlari_coz(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--vspaero-kuyruk",
         dest="vspaero_kuyruk",
-        action="store_true",
-        default=False,
-        help="VSPAERO modeline yatay kuyruğu da ekle (varsayılan: sadece kanat).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="VSPAERO modeline yatay kuyruğu ekle (varsayılan: açık, --no-vspaero-kuyruk ile kapat).",
     )
     parser.add_argument(
         "--vlm-test",
@@ -2239,7 +2594,7 @@ def argumanlari_coz(argv: Optional[List[str]] = None) -> argparse.Namespace:
         dest="analitik_olcekleme",
         action="store_true",
         default=False,
-        help="Performans modüllerini baştan çalıştırmak yerine hızlı analitik ölçekleme kullan",
+        help="Analitik performans tahmini üret ve ayrı bir CSV'ye yaz",
     )
     return parser.parse_args(argv)
 
@@ -2266,7 +2621,7 @@ def _hedef_geometriler_icin_csv_oku(
             ayirici = ";" if ilk_satir.count(";") > ilk_satir.count(",") else ","
             okuyucu = csv.DictReader(f, delimiter=ayirici)
             for row in okuyucu:
-                g_key = _geometri_anahtari(row)
+                g_key = _kanat_anahtari(row)
                 if g_key[0] and (g_key[0], round(g_key[1], 3), round(g_key[2], 3)) in hedef_uclu_anahtarlar:
                     suzulen.append(row)
         return suzulen
@@ -2403,17 +2758,15 @@ def _govde_test_modu(
     if args.zcg is not None:
         zcg = "kanat" if str(args.zcg).strip().lower() == "kanat" else float(args.zcg)
 
-    kutle_geo: Dict[Tuple[str, float, float, float], Dict[str, Any]] = {}
-    for kr in kutle_satirlari:
-        kk = _geometri_anahtari(kr)
-        if kk[0] and kk not in kutle_geo:
-            kutle_geo[kk] = kr
-
-    geometriler: List[Tuple[str, float, float, float]] = []
+    kutle_geo = _geometri_satirlarini_grupla(kutle_satirlari)
+    geometriler: List[GeometriAnahtari] = []
     for r in ilk_500:
         gk = _geometri_anahtari(r)
-        if gk[0] and gk[1] > 0 and gk not in geometriler:
-            geometriler.append(gk)
+        if gk[0] and gk[1] > 0:
+            eslesen = _geometri_grubu_sec(gk, _geometri_kimligi(r), kutle_geo, "Gövde testi kütle tablosu")
+            gk = _geometriyi_tamamla(gk, eslesen)
+            if gk not in geometriler:
+                geometriler.append(gk)
         if len(geometriler) >= int(args.vlm_test):
             break
 
@@ -2425,12 +2778,13 @@ def _govde_test_modu(
 
     satirlar: List[Dict[str, Any]] = []
     for gk in geometriler:
-        profil, b_w, s_w, c_w = gk
-        kr = kutle_geo.get(gk, {})
-        D = sayi_al(kr, "govde_D_m", varsayilan=0.14)
-        L = sayi_al(kr, "govde_L_toplam_m", "govde_L_m", varsayilan=1.56)
+        profil, b_w, s_w, c_w = gk[:4]
+        olculer = dict(gk[4])
+        c_w = olculer.get("c_w_m", c_w)
+        D = olculer.get("govde_D_m", 0.14)
+        L = olculer.get("govde_L_m", 1.56)
         R = 0.5 * D
-        b_flap = min(1.0, b_w)
+        b_flap = olculer.get("b_flap_m", min(1.0, b_w))
         flap_ic = R if args.flap_baslangic == "govde_kenari" else 0.0
         for durum, oran in (("flapsiz", 0.0), ("flapli", b_flap / max(b_w, 1e-9))):
             for yontem in yontemler:
@@ -2511,6 +2865,40 @@ def _govde_test_modu(
     return 0
 
 
+def _vlm_siralama_cikti_yolu(cikti: str, analitik: bool) -> Path:
+    yol = Path(cikti)
+    if analitik:
+        if yol.name.lower() == "vlm_nihai_ucak_siralamasi.csv":
+            yol = yol.with_name("vlm_analitik_siralama.csv")
+        elif yol.name.lower() != "vlm_analitik_siralama.csv" and not yol.stem.lower().endswith("_analitik"):
+            yol = yol.with_name(f"{yol.stem}_analitik{yol.suffix or '.csv'}")
+    return yol if yol.is_absolute() else SCRIPT_DIR / yol
+
+
+def _vlm_calisma_durumunu_yaz(
+    cikti: Path, yontem: str, hata: Optional[VLMPerformansHatasi] = None,
+) -> Path:
+    yol = cikti.with_name(f"{cikti.name}.durum.json")
+    durum: Dict[str, Any] = {
+        "durum": "basarili" if hata is None else "basarisiz",
+        "zaman_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "performans_hesap_yontemi": yontem,
+        "nihai_csv_yolu": str(cikti.resolve()),
+        "nihai_csv_yazildi": hata is None,
+    }
+    if hata is not None:
+        durum.update(
+            faz=hata.faz, hata_turu=hata.hata_turu,
+            hata_mesaji=hata.mesaj, cikis_kodu=hata.cikis_kodu,
+        )
+    yol.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="vlm_durum_", dir=yol.parent) as gecici:
+        dosya = Path(gecici) / yol.name
+        dosya.write_text(json.dumps(durum, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        dosya.replace(yol)
+    return yol
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = argumanlari_coz(argv)
 
@@ -2564,9 +2952,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("[HATA] İlk 500 aday listesi boş!")
         return 1
 
+    # Kütle tablosu tüm çözücüler için kuyruk ve gövde geometrisini tamamlar.
+    try:
+        kutle_satirlari = _vlm_kutle_satirlarini_oku(args.kutle, ilk_500)
+    except VLMKutleEslesmeHatasi as exc:
+        print(f"[HATA] {exc}", file=sys.stderr)
+        return 1
+
     hedef_uclu_geometriler: Set[Tuple[str, float, float]] = set()
     for r in ilk_500:
-        gk = _geometri_anahtari(r)
+        gk = _kanat_anahtari(r)
         if gk[0] and gk[1] > 0.0:
             hedef_uclu_geometriler.add((gk[0], round(gk[1], 3), round(gk[2], 3)))
 
@@ -2582,10 +2977,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     llt_flapli_satirlar = _hedef_geometriler_icin_csv_oku(args.llt_flapli, hedef_uclu_geometriler)
     drag_polar_flapli_satirlar = _hedef_geometriler_icin_csv_oku(args.drag_polar_flapli, hedef_uclu_geometriler)
     drag_ozet_flapli_satirlar = _hedef_geometriler_icin_csv_oku(args.drag_ozet_flapli, hedef_uclu_geometriler)
-
-    # [DEĞİŞİKLİK 2026-11-18 | Görev A] Kuyruk kolu / kuyruk profili için kütle tablosu (yalnızca VSPAERO kullanır)
-    _kutle_yolu = dosya_yolu_coz(args.kutle)
-    kutle_satirlari = csv_oku(_kutle_yolu) if _kutle_yolu.is_file() else []
 
     # [DEĞİŞİKLİK 2026-11-18 | Görev A] Hızlı test modu: ilk N geometriyi seçilen çözücü + NumPy ile çöz, karşılaştır, çık.
     if args.vlm_test > 0:
@@ -2647,7 +3038,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         drag_ozet_flapli_satirlar=drag_ozet_flapli_satirlar,
     )
 
-    vlm_dosya_yollari = {
+    tablo_yollari = {
         "llt_flapsiz": vlm_klasoru / "vlm_flapsiz_coklu_re.csv",
         "drag_polar_flapsiz": vlm_klasoru / "vlm_flapsiz_polar_detay.csv",
         "drag_ozet_flapsiz": vlm_klasoru / "vlm_flapsiz_aday_ozet.csv",
@@ -2656,31 +3047,51 @@ def main(argv: Optional[List[str]] = None) -> int:
         "drag_ozet_flapli": vlm_klasoru / "vlm_flapli_aday_ozet.csv",
     }
 
-    for anahtar, yol in vlm_dosya_yollari.items():
+    vlm_dosya_yollari = {}
+    for anahtar, yol in tablo_yollari.items():
         if guncel_tablolar.get(anahtar):
             csv_yaz(guncel_tablolar[anahtar], yol)
+            vlm_dosya_yollari[anahtar] = yol
             print(f"[VLM] Güncellenmiş tablo yazıldı ({len(guncel_tablolar[anahtar])} satır): {yol}")
 
-    # 3. Performans Modüllerini Baştan Çalıştır ve Nihai Puanlamayı Üret
-    nihai_sirali = vlm_adaylarini_yeniden_puanla(
-        ilk_500_satirlar=ilk_500,
-        vlm_haritasi=vlm_haritasi,
-        args=args,
-        vlm_klasoru=vlm_klasoru,
-        vlm_dosya_yollari=vlm_dosya_yollari,
-    )
+    # 3. Yalnız seçilen performans yöntemiyle puanla.
+    cikti_yolu = _vlm_siralama_cikti_yolu(args.cikti, args.analitik_olcekleme)
+    hesap_yontemi = "analitik_olcekleme" if args.analitik_olcekleme else "faz_yeniden_hesaplama"
+    try:
+        nihai_sirali = vlm_adaylarini_yeniden_puanla(
+            ilk_500_satirlar=ilk_500,
+            vlm_haritasi=vlm_haritasi,
+            args=args,
+            vlm_klasoru=vlm_klasoru,
+            vlm_dosya_yollari=vlm_dosya_yollari,
+            secilen_kutle_satirlari=kutle_satirlari,
+        )
+        if not nihai_sirali:
+            raise VLMPerformansHatasi("aday_siralama", "eksik_cikti", "Nihai aday listesi boş.")
+        cikti_yolu.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="vlm_siralama_", dir=cikti_yolu.parent) as gecici:
+            gecici_cikti = Path(gecici) / cikti_yolu.name
+            csv_yaz(nihai_sirali, gecici_cikti)
+            gecici_cikti.replace(cikti_yolu)
+    except Exception as exc:
+        if isinstance(exc, VLMPerformansHatasi):
+            hata = exc
+        else:
+            faz = "kutle_eslesmesi" if isinstance(exc, VLMKutleEslesmeHatasi) else "yeniden_puanlama"
+            hata = VLMPerformansHatasi(faz, type(exc).__name__, str(exc))
+        print(f"[HATA] {hata}", file=sys.stderr)
+        durum_yolu = _vlm_calisma_durumunu_yaz(cikti_yolu, hesap_yontemi, hata)
+        print(f"[VLM] Çalışma durumu: {durum_yolu}", file=sys.stderr)
+        return 1
 
-    cikti_yolu = Path(args.cikti)
-    if not cikti_yolu.is_absolute():
-        cikti_yolu = SCRIPT_DIR / cikti_yolu
-    csv_yaz(nihai_sirali, cikti_yolu)
-
+    _vlm_calisma_durumunu_yaz(cikti_yolu, hesap_yontemi)
     uygun_vlm = sum(1 for r in nihai_sirali if r.get("tum_fazlar_uygun_vlm"))
     print(f"VLM sonrası tüm fazları uygun aday  : {uygun_vlm}")
     print(f"Nihai VLM sıralama çıktısı          : {cikti_yolu}")
 
     if nihai_sirali:
         lider = nihai_sirali[0]
+        tuketim_alani = "tahmini_toplam_tuketim_mAh_vlm" if args.analitik_olcekleme else "gercek_toplam_tuketim_mAh_vlm"
         print(
             "\nVLM Sonrası En İyi 1. Uçak:\n"
             f"  vlm_nihai_sira (Önceki) : {lider.get('vlm_nihai_sira')} "
@@ -2694,7 +3105,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"(LLT Öncesi: {sayi_al(lider, 'llt_onc_toplam_puan', varsayilan=0.0):.4f}, "
             f"Fark: {sayi_al(lider, 'puan_farki_vlm_eksi_llt', varsayilan=0.0):+.4f})\n"
             f"  vlm_mission2_400_puani  : {sayi_al(lider, 'vlm_sonrasi_mission2_400_puani', 'mission2_400_puani', varsayilan=0.0):.4f}\n"
-            f"  toplam_tuketim_vlm      : {sayi_al(lider, 'gercek_toplam_tuketim_mAh_vlm', 'gercek_toplam_tuketim_mAh', varsayilan=0.0):.2f} mAh "
+            f"  toplam_tuketim_vlm      : {sayi_al(lider, tuketim_alani, varsayilan=0.0):.2f} mAh "
             f"(Kalan: %{sayi_al(lider, 'kalan_batarya_yuzde_vlm', 'kalan_batarya_yuzde', varsayilan=0.0):.2f})"
         )
     return 0

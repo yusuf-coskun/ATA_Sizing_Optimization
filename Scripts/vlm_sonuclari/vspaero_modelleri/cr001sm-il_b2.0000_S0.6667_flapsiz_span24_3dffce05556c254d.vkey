@@ -1,0 +1,13 @@
+# VSPGEOM v3 Tag Key File
+C:\Users\yusuf\OneDrive\Desktop\ATA_Sizing_Optimization\Scripts\vlm_sonuclari\vspaero_modelleri\cr001sm-il_b2.0000_S0.6667_flapsiz_span24_3dffce05556c254d.vspgeom
+2
+
+# part#,geom#,surf#,gname,gid,thick,plate,copy#,geomcopy#
+1,0,0,Kanat_C,BMPOGGAIIP,0,3,1,1
+2,0,1,Kanat_C,BMPOGGAIIP,0,3,2,1
+
+2
+
+# tag#,part#,ssname1,ssname2,...,ssid1,ssid2,...
+1,1
+2,2
