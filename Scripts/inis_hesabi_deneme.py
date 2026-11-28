@@ -33,6 +33,7 @@ if str(PROJE_KLASORU) not in sys.path:
 
 from aday_pervane import csv_yaz, kimlik_alanlari, performans_adaylarini_hazirla
 from llt_csv_okuyucu import LLTError, LLTTable
+from tirmanis_hesabi import ModelError as TirmanisModelError
 from tirmanis_hesabi import calc_cd0, find_drag, wing_key
 
 MAX_AIRSPEED_40KTS_MS = 40.0 * 0.514444  # Kural T2.6.1: 40 kts = 20.5778 m/s
@@ -419,7 +420,7 @@ def calculate(mass_rows: list[dict], args) -> list[dict]:
             if base_id not in base_landing_cache:
                 try:
                     base_landing_cache[base_id] = solve_landing_for_mass(m_susuz, mass, args, llt_cache)
-                except (ModelError, LLTError, KeyError, FileNotFoundError) as exc:
+                except (ModelError, TirmanisModelError, LLTError, KeyError, FileNotFoundError) as exc:
                     base_landing_cache[base_id] = exc
             cached = base_landing_cache[base_id]
             if isinstance(cached, Exception):
@@ -476,7 +477,7 @@ def calculate(mass_rows: list[dict], args) -> list[dict]:
                 ),
             )
             out.update(res["llt_meta"])
-        except (ModelError, LLTError, KeyError, FileNotFoundError) as exc:
+        except (ModelError, TirmanisModelError, LLTError, KeyError, FileNotFoundError) as exc:
             status = getattr(exc, "status", "veri_hatasi")
             out["durum"], out["aciklama"] = status, str(exc)
         output.append(out)
