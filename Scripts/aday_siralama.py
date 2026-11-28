@@ -137,6 +137,34 @@ def sayi_al(row: Optional[Dict[str, Any]], *anahtarlar: str, varsayilan: Optiona
     return varsayilan
 
 
+def inis_butcesi_argumani(deger: str) -> float:
+    butce = sayi_al({"butce": deger}, "butce")
+    if butce is None or butce < 0:
+        raise argparse.ArgumentTypeError("İniş/yaklaşma bütçesi sonlu ve negatif olmayan bir sayı olmalı.")
+    return butce
+
+
+def gorev_enerji_butcesini_hesapla(
+    faz_enerjileri: Dict[str, Tuple[Optional[float], Optional[float]]],
+    inis_ek_butce_mah: Optional[float],
+) -> Tuple[Optional[float], Optional[float], List[str]]:
+    """Her fazın mAh ve Wh çifti tam olduğunda görev bütçesini döndür."""
+    eksik_fazlar = [
+        faz for faz, degerler in faz_enerjileri.items()
+        if any(deger is None or not math.isfinite(deger) or deger < 0 for deger in degerler)
+    ]
+    if inis_ek_butce_mah is None or not math.isfinite(inis_ek_butce_mah) or inis_ek_butce_mah < 0:
+        eksik_fazlar.append("inis_yaklasma")
+    if eksik_fazlar:
+        return None, None, eksik_fazlar
+
+    toplam_mah = sum(mah for mah, _ in faz_enerjileri.values()) + inis_ek_butce_mah
+    toplam_wh = sum(wh for _, wh in faz_enerjileri.values()) + inis_ek_butce_mah / 1000.0 * GERILIM_V
+    if not math.isfinite(toplam_mah) or not math.isfinite(toplam_wh):
+        return None, None, ["toplam"]
+    return round(toplam_mah, 3), round(toplam_wh, 4), []
+
+
 def bool_al(row: Optional[Dict[str, Any]], *anahtarlar: str, varsayilan: bool = False) -> bool:
     """Sözlükten boolean değer çözümler."""
     if not row:
@@ -274,6 +302,8 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
     if performans_adaylarini_hazirla is None or faz_sonuclarini_dogrula is None:
         raise RuntimeError("Aday kimliği doğrulama modülü yüklenemedi.")
     kutle_satirlari = performans_adaylarini_hazirla(csv_oku(kutle_yolu))
+    if not kutle_satirlari:
+        raise ValueError(f"Kütle tablosunda aday kaydı yok: {kutle_yolu}")
     kutle_indeks = indeks_olustur(kutle_satirlari, kaynak=kutle_yolu)
 
     faz_girdileri = {
@@ -283,15 +313,32 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
         "yuk": (yuk_birakma_yolu, csv_oku(yuk_birakma_yolu)),
         "inis": (inis_yolu, csv_oku(inis_yolu)),
     }
-    for yol, satirlar in faz_girdileri.values():
+    faz_indeksleri = {}
+    eksik_faz_kayitlari = []
+    beklenen_kimlikler = kutle_indeks[0].keys()
+    for faz, (yol, satirlar) in faz_girdileri.items():
         faz_sonuclarini_dogrula(kutle_satirlari, satirlar, yol)
+        indeks = indeks_olustur(satirlar, kaynak=yol)
+        faz_indeksleri[faz] = indeks
+        eksik_kimlikler = sorted(beklenen_kimlikler - indeks[0].keys())
+        if eksik_kimlikler:
+            ornekler = ", ".join(eksik_kimlikler[:5])
+            if len(eksik_kimlikler) > 5:
+                ornekler += f" (+{len(eksik_kimlikler) - 5} diğer)"
+            eksik_faz_kayitlari.append(
+                f"{yol}: {len(eksik_kimlikler)}/{len(beklenen_kimlikler)} aday kaydı eksik. {ornekler}"
+            )
+    if eksik_faz_kayitlari:
+        raise ValueError(
+            f"Faz sonuçları kütle tablosunun tamamını kapsamıyor ({kutle_yolu}).\n  - "
+            + "\n  - ".join(eksik_faz_kayitlari)
+        )
 
     seyir_satirlari = kimlikleri_hazirla(faz_girdileri["seyir"][1])
-    indeks_olustur(seyir_satirlari, kaynak=seyir_yolu)
-    kalkis_indeks = indeks_olustur(faz_girdileri["kalkis"][1], kaynak=kalkis_yolu)
-    tirmanis_indeks = indeks_olustur(faz_girdileri["tirmanis"][1], kaynak=tirmanis_yolu)
-    yuk_indeks = indeks_olustur(faz_girdileri["yuk"][1], kaynak=yuk_birakma_yolu)
-    inis_indeks = indeks_olustur(faz_girdileri["inis"][1], kaynak=inis_yolu)
+    kalkis_indeks = faz_indeksleri["kalkis"]
+    tirmanis_indeks = faz_indeksleri["tirmanis"]
+    yuk_indeks = faz_indeksleri["yuk"]
+    inis_indeks = faz_indeksleri["inis"]
 
     birlestirilmis: List[Dict[str, Any]] = []
 
@@ -390,12 +437,15 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
         eksik_kalkis_alanlari = [ad for ad, deger in kalkis_olcumleri.items() if deger is None]
 
         tirmanis_sure_s = sayi_al(tirmanis, "sure_s", varsayilan=sayi_al(seyir, "tirmanis_sure_sn", varsayilan=0.0))
-        tirmanis_mah = sayi_al(tirmanis, "tuketim_mAh", varsayilan=sayi_al(seyir, "tirmanis_tuketim_mah", varsayilan=0.0))
-        tirmanis_wh = sayi_al(tirmanis, "enerji_Wh", varsayilan=sayi_al(seyir, "tirmanis_enerji_Wh", varsayilan=0.0))
+        tirmanis_mah = sayi_al(tirmanis, "tuketim_mAh")
+        tirmanis_wh = sayi_al(tirmanis, "enerji_Wh")
 
         seyir_nav_sure_s = sayi_al(seyir, "navigasyon_suresi_sn", varsayilan=0.0)
-        seyir_mah = sayi_al(seyir, "seyir_tuketim_mah", varsayilan=0.0)
-        seyir_wh = sayi_al(seyir, "seyir_enerji_Wh", varsayilan=0.0)
+        seyir_mah = sayi_al(seyir, "seyir_tuketim_mah")
+        seyir_wh = sayi_al(seyir, "seyir_enerji_Wh")
+        inis_ek_butce_mah = args.inis_ek_butce_mah
+        if inis_ek_butce_mah is None:
+            inis_ek_butce_mah = sayi_al(seyir, "inis_yaklasma_ek_butce_mah")
 
         dalis_sure_s = sayi_al(yuk, "dalis_sure_s", varsayilan=0.0)
         birakma_sure_s = sayi_al(yuk, "birakma_sure_s", varsayilan=0.0)
@@ -432,24 +482,20 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
                 3,
             )
 
-        gercek_toplam_tuketim_mah = None
+        faz_enerjileri = {
+            "kalkis": (kalkis_mah, kalkis_wh),
+            "tirmanis": (tirmanis_mah, tirmanis_wh),
+            "seyir": (seyir_mah, seyir_wh),
+            "yuk_birakma": (yuk_mah, yuk_wh),
+        }
+        gercek_toplam_tuketim_mah, gercek_toplam_enerji_wh, eksik_enerji_fazlari = (
+            gorev_enerji_butcesini_hesapla(faz_enerjileri, inis_ek_butce_mah)
+        )
         kalan_batarya_yuzde = None
-        if kalkis_mah is not None and yuk_mah is not None:
-            gercek_toplam_tuketim_mah = round(
-                kalkis_mah + tirmanis_mah + seyir_mah + yuk_mah + args.inis_ek_butce_mah,
-                3,
-            )
+        if gercek_toplam_tuketim_mah is not None:
             kalan_batarya_yuzde = round(
-                100.0 * (BATARYA_KAPASITE_MAH - gercek_toplam_tuketim_mah) / BATARYA_KAPASITE_MAH,
+                100.0 * (1.0 - gercek_toplam_tuketim_mah / BATARYA_KAPASITE_MAH),
                 2,
-            )
-
-        gercek_toplam_enerji_wh = None
-        if kalkis_wh is not None and yuk_wh is not None:
-            gercek_toplam_enerji_wh = round(
-                kalkis_wh + tirmanis_wh + seyir_wh + yuk_wh
-                + args.inis_ek_butce_mah * GERILIM_V / 1000.0,
-                4,
             )
 
         # 4. Faz Bazlı Fizibilite (Uygunluk) Kontrolleri
@@ -519,6 +565,7 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
         batarya_uygun = False
         if gercek_toplam_tuketim_mah is None:
             batarya_durum = "belirsiz"
+            uygunsuzluklar.append("enerji_verisi_eksik_veya_gecersiz:" + ",".join(eksik_enerji_fazlari))
         elif gercek_toplam_tuketim_mah > KULLANILABILIR_MAH:
             batarya_durum = "uygun_degil"
             uygunsuzluklar.append("batarya_9600mAh_asimi")
@@ -607,6 +654,11 @@ def adaylari_degerlendir_ve_sirala(args: argparse.Namespace) -> Tuple[List[Dict[
             "tirmanis_tuketim_mAh": tirmanis_mah,
             "seyir_tuketim_mAh": seyir_mah,
             "yuk_birakma_tuketim_mAh": yuk_mah,
+            "kalkis_enerji_Wh": kalkis_wh,
+            "tirmanis_enerji_Wh": tirmanis_wh,
+            "seyir_enerji_Wh": seyir_wh,
+            "yuk_birakma_enerji_Wh": yuk_wh,
+            "inis_yaklasma_ek_butce_mah": inis_ek_butce_mah,
             "gercek_toplam_tuketim_mAh": gercek_toplam_tuketim_mah,
             "kalan_batarya_yuzde": kalan_batarya_yuzde,
             "gercek_toplam_enerji_Wh": gercek_toplam_enerji_wh,
@@ -754,9 +806,8 @@ def argumanlari_coz(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--inis-ek-butce-mah",
         dest="inis_ek_butce_mah",
-        type=float,
-        default=0.0,
-        help="İniş/yaklaşma için toplam tüketime eklenecek ek mAh bütçesi (varsayılan: 0.0)",
+        type=inis_butcesi_argumani,
+        help="İniş/yaklaşma bütçesini mAh olarak değiştir (varsayılan: seyir CSV'deki değer).",
     )
     return parser.parse_args(argv)
 
@@ -765,7 +816,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = argumanlari_coz(argv)
     try:
         tum_sirali, vlm_ilk_n = adaylari_degerlendir_ve_sirala(args)
-    except YinelenenAdayKaydi as exc:
+    except ValueError as exc:
         print(f"HATA: {exc}", file=sys.stderr)
         return 2
 
@@ -788,6 +839,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if tum_sirali:
         en_iyi = tum_sirali[0]
+        tuketim_ozeti = "belirsiz"
+        if en_iyi["gercek_toplam_tuketim_mAh"] is not None:
+            tuketim_ozeti = (
+                f"{en_iyi['gercek_toplam_tuketim_mAh']} mAh "
+                f"(Kalan: %{en_iyi['kalan_batarya_yuzde']})"
+            )
         print(
             "\nEn İyi 1. Aday Özeti:\n"
             f"  konfigurasyon_id        : {en_iyi['konfigurasyon_id']}\n"
@@ -797,8 +854,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"Enerji: {en_iyi['puan_enerji_60']}, Yük: {en_iyi['puan_yuk_birakma_120']}, "
             f"İniş: {en_iyi['resmi_inis_puani_140']})\n"
             f"  mission2_400_puani      : {en_iyi['mission2_400_puani']}\n"
-            f"  toplam_tuketim / süre   : {en_iyi['gercek_toplam_tuketim_mAh']} mAh "
-            f"(Kalan: %{en_iyi['kalan_batarya_yuzde']}) / {en_iyi['gercek_toplam_sure_sn']} s" +
+            f"  toplam_tuketim / süre   : {tuketim_ozeti} / {en_iyi['gercek_toplam_sure_sn']} s" +
             f"\n  batarya_durum / enerji  : {en_iyi['batarya_durum']} / {en_iyi['enerji_butcesi_durum']}"
         )
 

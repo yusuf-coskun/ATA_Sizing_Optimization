@@ -45,6 +45,7 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
+from functools import cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
@@ -56,7 +57,6 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from aday_siralama import (
     BATARYA_KAPASITE_MAH,
-    GERILIM_V,
     KULLANILABILIR_MAH,
     MAX_GOREV_SURESI_SN,
     adaylari_degerlendir_ve_sirala,
@@ -65,6 +65,8 @@ from aday_siralama import (
     csv_oku,
     csv_yaz,
     dosya_yolu_coz,
+    gorev_enerji_butcesini_hesapla,
+    inis_butcesi_argumani,
     metin_al as _ham_metin_al,
     sayi_al as _ham_sayi_al,
 )
@@ -75,7 +77,7 @@ from vspaero_cozucu import vspaero_api_coz, vspaero_hazir_mi
 from vspaero_cozucu import vspaero_api_coz_richardson  # [DEĞİŞİKLİK 2026-11-19 v8 | iz e + Richardson]
 from lifting_line_cozucu import (
     POLAR_KLASORU, FLAP_POLAR_KLASORU, polar_klasorunu_indeksle,
-    profil_re_haritasi_al,
+    profil_re_haritasi_al, SEYIR_ALPHA_DEG,
 )
 
 # [DEĞİŞİKLİK 2026-11-18 | Görev A] VSPAERO davranış ayarları (main() içinde komut satırından doldurulur).
@@ -1395,6 +1397,7 @@ def _tek_mod_tablolari_guncelle(
         return linear + correction
 
     yeni_llt: List[Dict[str, Any]] = []
+    guncellenen_llt: List[Tuple[Dict[str, Any], GeometriAnahtari, float]] = []
     egri_indeksi: Dict[GeometriAnahtari, Dict[float, Dict[float, float]]] = {}
     for row in llt_satirlar:
         eslesme = eslesme_bul(row)
@@ -1406,7 +1409,8 @@ def _tek_mod_tablolari_guncelle(
         g_key, vlm = eslesme
         r_copy = dict(row)
         _vlm_geometri_alanlarini_yaz(r_copy, vlm)
-        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
+        re = sayi_al(row, "Re_aday")
+        vlm = _re_vlm_sonucu(vlm, re, flapli_mi)
         r_copy["e_oswald"] = f"{float(vlm[e_key]):.6f}"
         r_copy["CL_alpha_3d_per_deg"] = f"{float(vlm[cl_alpha_key]):.6f}"
         if "CL_alpha_3d_kanat_per_deg" in r_copy:
@@ -1428,23 +1432,25 @@ def _tek_mod_tablolari_guncelle(
         for alan in ("CL_flapsiz_kisim", "CL_flapli_kisim", "CL_kanat"):
             r_copy.pop(alan, None)
         yeni_llt.append(r_copy)
+        guncellenen_llt.append((r_copy, g_key, re))
         if str(r_copy.get("CL", "")).strip():
-            curve = egri_indeksi.setdefault(g_key, {}).setdefault(float(r_copy["Re_aday"]), {})
+            curve = egri_indeksi.setdefault(g_key, {}).setdefault(re, {})
             alpha = float(r_copy["alpha_deg"])
             cl = float(r_copy["CL"])
             if alpha in curve and not math.isclose(curve[alpha], cl, abs_tol=2e-6):
                 raise ValueError("Aynı geometri/Re/alpha için çelişen VLM CL eğrileri.")
             curve[alpha] = cl
 
-    # Drag polarları eşleşen geometrinin LLT eğrisinden hesaplanır.
-    def _polar_cl(row: Dict[str, Any], g_key: GeometriAnahtari) -> float:
+    # LLT ve drag özetleri, yayımlanan VLM eğrisinin aynı değerini kullanır.
+    @cache
+    def _polar_cl(g_key: GeometriAnahtari, re: float, alpha: float) -> float:
         nodes = egri_indeksi.get(g_key)
         if not nodes:
             raise ValueError(f"Drag polar için VLM LLT eğrisi yok: {g_key}")
-        re = sayi_al(row, "Re_aday")
-        alpha = sayi_al(row, "alpha_deg")
         def at(re_node: float) -> float:
             curve = nodes[re_node]
+            if alpha in curve:
+                return curve[alpha]
             angles = sorted(curve)
             if not angles[0] <= alpha <= angles[-1]:
                 raise ValueError(f"Drag polar alpha aralık dışında: {alpha}")
@@ -1452,11 +1458,14 @@ def _tek_mod_tablolari_guncelle(
         reynolds = sorted(nodes)
         if not reynolds[0] <= re <= reynolds[-1]:
             raise ValueError(f"Drag polar Re, LLT eğri aralığı dışında: {re}")
-        if re == reynolds[0] or re == reynolds[-1]:
+        if re in nodes:
             return at(re)
         upper = next(i for i, value in enumerate(reynolds) if value >= re)
         lo, hi = reynolds[upper - 1], reynolds[upper]
         return at(lo) + (at(hi) - at(lo)) * (re - lo) / (hi - lo)
+
+    for row, g_key, re in guncellenen_llt:
+        row["CL_seyir"] = f"{_polar_cl(g_key, re, SEYIR_ALPHA_DEG):.6f}"
 
     yeni_drag_polar: List[Dict[str, Any]] = []
     for row in drag_polar_satirlar:
@@ -1469,12 +1478,13 @@ def _tek_mod_tablolari_guncelle(
         g_key, vlm = eslesme
         r_copy = dict(row)
         _vlm_geometri_alanlarini_yaz(r_copy, vlm)
-        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
+        re = sayi_al(row, "Re_aday")
+        vlm = _re_vlm_sonucu(vlm, re, flapli_mi)
         ar_w = sayi_al(r_copy, "AR_w", varsayilan=(g_key[1] ** 2) / max(g_key[2], 1e-6))
         if ar_w <= 0.0:
             ar_w = 6.0
         cd0 = sayi_al(r_copy, "CD_0", "CD0_toplam", varsayilan=0.025)
-        cl_yeni = _polar_cl(r_copy, g_key)
+        cl_yeni = _polar_cl(g_key, re, sayi_al(row, "alpha_deg"))
         cdi_yeni = (cl_yeni ** 2) / max(math.pi * ar_w * float(vlm[e_key]), 1e-6)
         cd_yeni = cd0 + cdi_yeni
         ld_yeni = cl_yeni / max(cd_yeni, 1e-6)
@@ -1506,15 +1516,16 @@ def _tek_mod_tablolari_guncelle(
         g_key, vlm = eslesme
         r_copy = dict(row)
         _vlm_geometri_alanlarini_yaz(r_copy, vlm)
-        vlm = _re_vlm_sonucu(vlm, sayi_al(row, "Re_aday"), flapli_mi)
+        re = sayi_al(row, "Re_aday")
+        vlm = _re_vlm_sonucu(vlm, re, flapli_mi)
         ar_w = sayi_al(r_copy, "AR_w", varsayilan=(g_key[1] ** 2) / max(g_key[2], 1e-6))
         if ar_w <= 0.0:
             ar_w = 6.0
         cd0 = sayi_al(r_copy, "CD_0_seyir", "CD0_toplam", "CD_0", varsayilan=0.025)
-        # CL_seyir görev yükünden gelen hedef taşıma katsayısıdır; eğim oranıyla değişmez.
-        cl_seyir = sayi_al(r_copy, "CL_seyir", varsayilan=0.55)
+        # CL_seyir, drag özetinin Reynolds sayısında 0° referans değeridir.
+        cl_seyir = _polar_cl(g_key, re, SEYIR_ALPHA_DEG)
         if cl_seyir > float(vlm[cl_max_key]) + 1e-6:
-            raise ValueError(f"Seyir hedef CL, VLM CLmax sınırını aşıyor: {g_key}")
+            raise ValueError(f"0° referans CL, VLM CLmax sınırını aşıyor: {g_key}")
         cdi_seyir = (cl_seyir ** 2) / max(math.pi * ar_w * float(vlm[e_key]), 1e-6)
         cd_seyir = cd0 + cdi_seyir
         ld_seyir = cl_seyir / max(cd_seyir, 1e-6)
@@ -1525,8 +1536,7 @@ def _tek_mod_tablolari_guncelle(
         r_copy["CL_max_3d_tahmini"] = f"{float(vlm[cl_max_key]):.6f}"
         r_copy["aero_modeli"] = "vlm_tek_egri_v1"
         r_copy.update(vlm.get("csv_polar_kaynagi", {}))
-        if "CL_seyir" in r_copy:
-            r_copy["CL_seyir"] = f"{cl_seyir:.6f}"
+        r_copy["CL_seyir"] = f"{cl_seyir:.6f}"
         if "CD_i_seyir" in r_copy:
             r_copy["CD_i_seyir"] = f"{cdi_seyir:.6f}"
         if "CD_seyir" in r_copy:
@@ -1572,10 +1582,12 @@ def _flapsizdan_flapli_llt_olustur(
         r_copy.update(vlm.get("csv_polar_kaynagi", {}))
         if "CL" in r_copy and str(r_copy["CL"]).strip() != "":
             alpha_deg = sayi_al(r_copy, "alpha_deg", varsayilan=0.0)
-            cl_yeni = min(float(vlm["CL_max_3d_flapli_tahmini"]), float(vlm["CL_alpha_3d_flapli_per_deg"]) * (
-                alpha_deg - float(vlm["alpha_L0_flapli_deg"])
-            ))
+            cl_max = float(vlm["CL_max_3d_flapli_tahmini"])
+            egim = float(vlm["CL_alpha_3d_flapli_per_deg"])
+            alpha_l0 = float(vlm["alpha_L0_flapli_deg"])
+            cl_yeni = min(cl_max, egim * (alpha_deg - alpha_l0))
             r_copy["CL"] = f"{cl_yeni:.6f}"
+            r_copy["CL_seyir"] = f"{min(cl_max, egim * (SEYIR_ALPHA_DEG - alpha_l0)):.6f}"
         for alan in ("CL_flapsiz_kisim", "CL_flapli_kisim", "CL_kanat"):
             r_copy.pop(alan, None)
         uretilen.append(r_copy)
@@ -2053,16 +2065,35 @@ def _analitik_vlm_yeniden_puanla(
             puan_inis_m2_60_vlm = 40.0 if puan_inis_m2_60_llt >= 40.0 else puan_inis_m2_60_llt
             puan_inis_140_vlm = 100.0 if puan_inis_140_llt >= 100.0 else puan_inis_140_llt
 
-        kalkis_mah = sayi_al(row, "kalkis_tuketim_mAh", varsayilan=0.0) / max(cl_max_flap_orani, 0.7)
-        tirmanis_mah = sayi_al(row, "tirmanis_tuketim_mAh", varsayilan=0.0) * (0.75 + 0.25 * toplam_drag_carpani)
-        seyir_mah = sayi_al(row, "seyir_tuketim_mAh", varsayilan=0.0) * toplam_drag_carpani
-        yuk_mah = sayi_al(row, "yuk_birakma_tuketim_mAh", varsayilan=0.0) * (0.75 + 0.25 * toplam_drag_carpani)
+        tirmanis_drag_carpani = 0.75 + 0.25 * toplam_drag_carpani
+        faz_carpanlari = {
+            "kalkis": 1.0 / max(cl_max_flap_orani, 0.7),
+            "tirmanis": tirmanis_drag_carpani,
+            "seyir": toplam_drag_carpani,
+            "yuk_birakma": tirmanis_drag_carpani,
+        }
+        faz_enerjileri = {}
+        for faz, carpan in faz_carpanlari.items():
+            mah = _ham_sayi_al(row, f"{faz}_tuketim_mAh")
+            wh = _ham_sayi_al(row, f"{faz}_enerji_Wh")
+            if mah is None or wh is None or mah < 0 or wh < 0:
+                faz_enerjileri[faz] = (None, None)
+            else:
+                faz_enerjileri[faz] = (mah * carpan, wh * carpan)
 
-        toplam_mah_vlm = round(kalkis_mah + tirmanis_mah + seyir_mah + yuk_mah + float(args.inis_ek_butce_mah), 3)
-        toplam_enerji_wh_vlm = round(toplam_mah_vlm * GERILIM_V / 1000.0, 4)
-        kalan_batarya_vlm = round(100.0 * (BATARYA_KAPASITE_MAH - toplam_mah_vlm) / BATARYA_KAPASITE_MAH, 2)
-
-        batarya_uygun_vlm = toplam_mah_vlm <= KULLANILABILIR_MAH
+        inis_ek_butce_mah = args.inis_ek_butce_mah
+        if inis_ek_butce_mah is None:
+            inis_ek_butce_mah = _ham_sayi_al(row, "inis_yaklasma_ek_butce_mah")
+        toplam_mah_vlm, toplam_enerji_wh_vlm, eksik_enerji_fazlari = (
+            gorev_enerji_butcesini_hesapla(faz_enerjileri, inis_ek_butce_mah)
+        )
+        kalan_batarya_vlm = None
+        batarya_uygun_vlm = False
+        batarya_durum_vlm = "belirsiz"
+        if toplam_mah_vlm is not None:
+            kalan_batarya_vlm = round(100.0 * (1.0 - toplam_mah_vlm / BATARYA_KAPASITE_MAH), 2)
+            batarya_uygun_vlm = toplam_mah_vlm <= KULLANILABILIR_MAH
+            batarya_durum_vlm = "kosullu_uygun" if batarya_uygun_vlm else "uygun_degil"
         kalkis_uygun_vlm = bool_al(row, "kalkis_uygun", varsayilan=True) and (
             kalkis_20m_vlm if args.kalkis_20m_zorunlu else True
         )
@@ -2080,11 +2111,13 @@ def _analitik_vlm_yeniden_puanla(
         )
 
         su_kg = sayi_al(row, "su_kutlesi_kg", varsayilan=0.0)
-        ham_enerji_endeksi_vlm = (
-            (su_kg * 20.0) / max(toplam_enerji_wh_vlm, 1e-6)
-            if su_kg > 0.0
-            else sayi_al(row, "ham_enerji_endeksi", varsayilan=0.0) / max(toplam_drag_carpani, 0.5)
-        )
+        ham_enerji_endeksi_vlm = None
+        if toplam_enerji_wh_vlm is not None:
+            ham_enerji_endeksi_vlm = (
+                round((su_kg * 20.0) / max(toplam_enerji_wh_vlm, 1e-6), 6)
+                if su_kg > 0.0
+                else round(sayi_al(row, "ham_enerji_endeksi", varsayilan=0.0) / max(toplam_drag_carpani, 0.5), 6)
+            )
 
         kopya.update(
             {
@@ -2111,40 +2144,42 @@ def _analitik_vlm_yeniden_puanla(
                 "tahmini_toplam_tuketim_mAh_vlm": toplam_mah_vlm,
                 "kalan_batarya_yuzde_vlm": kalan_batarya_vlm,
                 "tahmini_toplam_enerji_Wh_vlm": toplam_enerji_wh_vlm,
+                "inis_yaklasma_ek_butce_mAh_vlm": inis_ek_butce_mah,
+                "batarya_durum_vlm": batarya_durum_vlm,
+                "enerji_butcesi_durum_vlm": "eksik" if eksik_enerji_fazlari else "kosullu_tahmin",
+                "eksik_enerji_fazlari_vlm": ",".join(eksik_enerji_fazlari),
                 "tum_fazlar_uygun_vlm": tum_fazlar_uygun_vlm,
                 "resmi_kalkis_puani_60_vlm": round(puan_kalkis_60_vlm, 4),
                 "puan_M2_yuklu_kalkis_20_vlm": round(puan_kalkis_m2_20_vlm, 4),
                 "resmi_inis_puani_140_vlm": round(puan_inis_140_vlm, 4),
                 "puan_M2_inis_60_vlm": round(puan_inis_m2_60_vlm, 4),
-                "ham_enerji_endeksi_vlm": round(ham_enerji_endeksi_vlm, 6),
+                "ham_enerji_endeksi_vlm": ham_enerji_endeksi_vlm,
                 "llt_onc_toplam_puan": eski_toplam_puan,
                 "llt_onc_mission2_400_puani": eski_m2_puan,
             }
         )
         yeniden_hesaplanan.append(kopya)
 
+    enerji_puanli_satirlar = [
+        r for r in yeniden_hesaplanan if (r["ham_enerji_endeksi_vlm"] or 0.0) > 0.0
+    ]
     uygun_endeksler = [
-        float(r["ham_enerji_endeksi_vlm"])
-        for r in yeniden_hesaplanan
-        if r["tum_fazlar_uygun_vlm"] and float(r["ham_enerji_endeksi_vlm"]) > 0.0
+        r["ham_enerji_endeksi_vlm"] for r in enerji_puanli_satirlar if r["tum_fazlar_uygun_vlm"]
     ]
     if not uygun_endeksler:
-        uygun_endeksler = [
-            float(r["ham_enerji_endeksi_vlm"])
-            for r in yeniden_hesaplanan
-            if float(r["ham_enerji_endeksi_vlm"]) > 0.0
-        ]
+        uygun_endeksler = [r["ham_enerji_endeksi_vlm"] for r in enerji_puanli_satirlar]
     best_index_vlm = max(uygun_endeksler) if uygun_endeksler else 1.0
 
     for r in yeniden_hesaplanan:
-        puan_enerji_vlm = round(60.0 * float(r["ham_enerji_endeksi_vlm"]) / max(best_index_vlm, 1e-9), 4)
+        endeks = r["ham_enerji_endeksi_vlm"]
+        puan_enerji_vlm = None if endeks is None else round(60.0 * endeks / max(best_index_vlm, 1e-9), 4)
         puan_nav = sayi_al(r, "puan_navigasyon_140", "puan_navigasyon", varsayilan=0.0)
         puan_yuk = sayi_al(r, "puan_yuk_birakma_120", varsayilan=0.0)
 
         toplam_puan_vlm = round(
             float(r["resmi_kalkis_puani_60_vlm"])
             + puan_nav
-            + puan_enerji_vlm
+            + (puan_enerji_vlm or 0.0)
             + puan_yuk
             + float(r["resmi_inis_puani_140_vlm"]),
             4,
@@ -2152,7 +2187,7 @@ def _analitik_vlm_yeniden_puanla(
         mission2_puan_vlm = round(
             float(r["puan_M2_yuklu_kalkis_20_vlm"])
             + puan_nav
-            + puan_enerji_vlm
+            + (puan_enerji_vlm or 0.0)
             + puan_yuk
             + float(r["puan_M2_inis_60_vlm"]),
             4,
@@ -2173,7 +2208,7 @@ def _analitik_vlm_yeniden_puanla(
             0 if r["tum_fazlar_uygun_vlm"] else 1,
             -float(r.get(puan_anahtari, 0.0) or 0.0),
             -sayi_al(r, "tasarim_kalkis_puani_100", varsayilan=0.0),
-            float(r.get("tahmini_toplam_enerji_Wh_vlm", 1e9) or 1e9),
+            sayi_al(r, "tahmini_toplam_enerji_Wh_vlm", varsayilan=math.inf),
             sayi_al(r, "toplam_kutle_kg", varsayilan=99.0),
         )
     )
@@ -2238,8 +2273,9 @@ def vlm_adaylarini_yeniden_puanla(
         "--kutle", str(modul_ciktilari["kutle"]),
         "--ilk-n", str(len(ilk_500_satirlar) or 500),
         "--siralama-puani", str(args.siralama_puani),
-        "--inis-ek-butce-mah", str(args.inis_ek_butce_mah),
     ]
+    if args.inis_ek_butce_mah is not None:
+        siralama_argv.extend(["--inis-ek-butce-mah", str(args.inis_ek_butce_mah)])
     if args.kalkis_20m_zorunlu:
         siralama_argv.append("--kalkis-20m-zorunlu")
     if args.inis_20m_zorunlu:
@@ -2264,9 +2300,6 @@ def vlm_adaylarini_yeniden_puanla(
 
         yeni_toplam_puan = sayi_al(row, "toplam_performans_puani", varsayilan=0.0)
         yeni_m2_puan = sayi_al(row, "mission2_400_puani", varsayilan=0.0)
-        toplam_mah_vlm = sayi_al(row, "gercek_toplam_tuketim_mAh", varsayilan=0.0)
-        kalan_batarya_vlm = sayi_al(row, "kalan_batarya_yuzde", varsayilan=0.0)
-        toplam_wh_vlm = sayi_al(row, "gercek_toplam_enerji_Wh", varsayilan=0.0)
         tum_uygun_vlm = bool_al(row, "tum_fazlar_uygun", varsayilan=False)
 
         r_copy = dict(row)
@@ -2305,9 +2338,12 @@ def vlm_adaylarini_yeniden_puanla(
                 "alpha_L0_flapli_vlm": vlm.get("alpha_L0_flapli_deg", ""),
                 "e_oswald_flapli_vlm": vlm.get("e_oswald_flapli", ""),
                 "CL_max_3d_flapli_vlm": vlm.get("CL_max_3d_flapli_tahmini", ""),
-                "gercek_toplam_tuketim_mAh_vlm": round(toplam_mah_vlm, 3),
-                "kalan_batarya_yuzde_vlm": round(kalan_batarya_vlm, 2),
-                "gercek_toplam_enerji_Wh_vlm": round(toplam_wh_vlm, 4),
+                "gercek_toplam_tuketim_mAh_vlm": row["gercek_toplam_tuketim_mAh"],
+                "kalan_batarya_yuzde_vlm": row["kalan_batarya_yuzde"],
+                "gercek_toplam_enerji_Wh_vlm": row["gercek_toplam_enerji_Wh"],
+                "inis_yaklasma_ek_butce_mAh_vlm": row["inis_yaklasma_ek_butce_mah"],
+                "batarya_durum_vlm": row["batarya_durum"],
+                "enerji_butcesi_durum_vlm": row["enerji_butcesi_durum"],
                 "tum_fazlar_uygun_vlm": tum_uygun_vlm,
                 "vlm_sonrasi_toplam_puan": round(yeni_toplam_puan, 4),
                 "vlm_sonrasi_mission2_400_puani": round(yeni_m2_puan, 4),
@@ -2438,9 +2474,8 @@ def argumanlari_coz(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--inis-ek-butce-mah",
         dest="inis_ek_butce_mah",
-        type=float,
-        default=0.0,
-        help="İniş fazı için ek batarya tüketim bütçesi (mAh)",
+        type=inis_butcesi_argumani,
+        help="İniş/yaklaşma bütçesini mAh olarak değiştir (varsayılan: girdi CSV'sindeki değer).",
     )
     # [DEĞİŞİKLİK 2026-11-18 | Görev A] Görev A için yeni komut satırı seçenekleri
     parser.add_argument(
@@ -2940,7 +2975,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     girdi_yolu = dosya_yolu_coz(args.girdi)
     if not girdi_yolu.is_file():
         print(f"[VLM] '{args.girdi}' bulunamadı; 'aday_siralama.py' üzerinden ilk 500 aday üretiliyor...")
-        siralama_args = siralama_argumanlari_coz(["--vlm-cikti", args.girdi])
+        siralama_argv = ["--vlm-cikti", args.girdi]
+        if args.inis_ek_butce_mah is not None:
+            siralama_argv.extend(["--inis-ek-butce-mah", str(args.inis_ek_butce_mah)])
+        siralama_args = siralama_argumanlari_coz(siralama_argv)
         tum_sirali, ilk_500 = adaylari_degerlendir_ve_sirala(siralama_args)
         girdi_yolu = SCRIPT_DIR / args.girdi
         csv_yaz(tum_sirali, SCRIPT_DIR / siralama_args.cikti)
@@ -3092,6 +3130,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if nihai_sirali:
         lider = nihai_sirali[0]
         tuketim_alani = "tahmini_toplam_tuketim_mAh_vlm" if args.analitik_olcekleme else "gercek_toplam_tuketim_mAh_vlm"
+        tuketim_mah = _ham_sayi_al(lider, tuketim_alani)
+        kalan_batarya = _ham_sayi_al(lider, "kalan_batarya_yuzde_vlm")
+        tuketim_ozeti = "belirsiz"
+        if tuketim_mah is not None and kalan_batarya is not None:
+            tuketim_ozeti = f"{tuketim_mah:.2f} mAh (Kalan: %{kalan_batarya:.2f})"
         print(
             "\nVLM Sonrası En İyi 1. Uçak:\n"
             f"  vlm_nihai_sira (Önceki) : {lider.get('vlm_nihai_sira')} "
@@ -3105,8 +3148,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"(LLT Öncesi: {sayi_al(lider, 'llt_onc_toplam_puan', varsayilan=0.0):.4f}, "
             f"Fark: {sayi_al(lider, 'puan_farki_vlm_eksi_llt', varsayilan=0.0):+.4f})\n"
             f"  vlm_mission2_400_puani  : {sayi_al(lider, 'vlm_sonrasi_mission2_400_puani', 'mission2_400_puani', varsayilan=0.0):.4f}\n"
-            f"  toplam_tuketim_vlm      : {sayi_al(lider, tuketim_alani, varsayilan=0.0):.2f} mAh "
-            f"(Kalan: %{sayi_al(lider, 'kalan_batarya_yuzde_vlm', 'kalan_batarya_yuzde', varsayilan=0.0):.2f})"
+            f"  toplam_tuketim_vlm      : {tuketim_ozeti}"
         )
     return 0
 

@@ -37,7 +37,7 @@ SEYIR_HIZI_MS = 20.0        # Flapsız referans seyir hızı (m/s)
 KALKIS_HIZI_MS = 12.0       # Flaplı referans kalkış hızı (m/s)
 RHO = 1.175                 # Hava yoğunluğu (kg/m^3)
 MU = 1.789e-5               # Havanın dinamik viskozitesi (Pa.s)
-SEYIR_ALPHA_DEG = 0.0       # CL_seyir referans hücum açısı (0 derece)
+SEYIR_ALPHA_DEG = 0.0       # CL_seyir özet alanının referans açısı. Uçuş açısı ayrıca çözülür.
 
 ALPHA_MIN = -5.0
 ALPHA_MAX = 20.0
@@ -480,9 +480,6 @@ def yuzey_coklu_aci_coz(
     cl_a, e, k_clmax_llt = llt_dikdortgen_kanat(ar, prof["a0_rad"])
     cl_a_deg = float(np.deg2rad(cl_a))
 
-    alfa_0_rad = np.deg2rad(SEYIR_ALPHA_DEG)
-    cl_0deg = float(cl_a * (alfa_0_rad - prof["alpha_L0_rad"]))
-
     # 1) Analitik LLT sirkülasyon dağılımından 2B -> 3B CL_max dönüşümü:
     cl_max_3d = float(k_clmax_llt * prof["cl_max_2d"])
     # 2) 3B sonlu kanatta downwash (indüklenmiş hücum açısı) etkisiyle geometrik stall açısı:
@@ -506,7 +503,7 @@ def yuzey_coklu_aci_coz(
         "alpha_stall_2d_deg": float(alpha_stall_3d_deg),
         "CL_alpha_3d_per_deg": cl_a_deg,
         "e_oswald": float(e),
-        "CL_seyir": cl_0deg,
+        "CL_seyir": float(np.interp(SEYIR_ALPHA_DEG, alfa_dizisi_deg, cl_dizisi)),
         "CL_max_3d_tahmini": float(cl_max_3d),
         "alfa_dizisi_deg": alfa_dizisi_deg,
         "CL_dizisi": cl_dizisi,
@@ -652,10 +649,6 @@ def flapli_kanat_coz_re(
         sol_flapsiz = yuzey_coklu_aci_coz(ar_w, p_flapsiz, r_pol)
         sol_flapli = yuzey_coklu_aci_coz(ar_w, p_flapli, r_pol)
 
-        cl_0deg_birl = (
-            sol_flapli["CL_seyir"] * oran_flap
-            + sol_flapsiz["CL_seyir"] * oran_flapsiz
-        )
         cl_a_birl = (
             sol_flapli["CL_alpha_3d_per_deg"] * oran_flap
             + sol_flapsiz["CL_alpha_3d_per_deg"] * oran_flapsiz
@@ -664,7 +657,14 @@ def flapli_kanat_coz_re(
             sol_flapli["e_oswald"] * oran_flap
             + sol_flapsiz["e_oswald"] * oran_flapsiz
         )
-        alpha_l0_birl = -cl_0deg_birl / cl_a_birl if cl_a_birl > 0 else 0.0
+        # Sıfır taşıma açısı doğrusal kolların kesişiminden gelir.
+        alpha_l0_birl = (
+            (
+                sol_flapli["CL_alpha_3d_per_deg"] * sol_flapli["alpha_L0_deg"] * oran_flap
+                + sol_flapsiz["CL_alpha_3d_per_deg"] * sol_flapsiz["alpha_L0_deg"] * oran_flapsiz
+            ) / cl_a_birl
+            if cl_a_birl > 0 else 0.0
+        )
 
         cl_dizisi_flapsiz = sol_flapsiz["CL_dizisi"]
         cl_dizisi_flapli = sol_flapli["CL_dizisi"]
@@ -703,7 +703,7 @@ def flapli_kanat_coz_re(
             "CL_alpha_3d_per_deg": cl_a_birl,
             "e_oswald_kanat": e_birl,
             "e_oswald": e_birl,
-            "CL_seyir": cl_0deg_birl,
+            "CL_seyir": float(np.interp(SEYIR_ALPHA_DEG, ALFA_DIZISI_DEG, cl_dizisi_birl)),
             "CL_max_3d_tahmini": cl_max_birl,
             "CL_dizisi_flapsiz": cl_dizisi_flapsiz,
             "CL_dizisi_flapli": cl_dizisi_flapli,
